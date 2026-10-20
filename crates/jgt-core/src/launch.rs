@@ -55,6 +55,21 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
     let prompt = prompt.map(str::to_owned);
 
     match (session.harness, mode) {
+        (Harness::ClaudeCode, ReconnectMode::Background) if session.is_worker() => {
+            // A worker answers one message headless, then exits again (it never listens).
+            let role = session.role.clone().unwrap_or_default();
+            let title = session.title.clone().unwrap_or_else(|| role.clone());
+            agent_args.extend(["-p".into(), "--resume".into(), ext]);
+            agent_args.push(prompt.unwrap_or_else(|| DEFAULT_PROMPT.into()));
+            agent_args.extend(["--output-format".into(), "json".into()]);
+            agent_args.extend(crate::team::session_args(&crate::team::files_dir(), &title, config));
+            let mut env = vec![(crate::team::ROLE_ENV.into(), role)];
+            if let Some(parent) = &session.parent_id {
+                env.push((crate::team::PARENT_ENV.into(), parent.clone()));
+            }
+            let log = crate::paths::data_dir().join("logs").join(format!("{}.log", session.id));
+            Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: false, log: Some(log), env })
+        }
         (Harness::ClaudeCode, ReconnectMode::Background) => {
             let mut env = vec![];
             let restore = session.is_coordinator() && !crate::team::has_saved_options(&ext);

@@ -112,13 +112,14 @@ pub async fn reconnect(session: Session, mode: ReconnectMode) -> Result<String, 
     jgt_core::launch::reconnect(&client(), &session, mode).await
 }
 
-/// Sends a message; a sleeping Coordinator is woken so it reads it right away.
+/// Sends a message; a sleeping Coordinator or a finished worker is woken so it reads it right away.
 pub async fn send_and_wake(session: Session, text: String) -> Result<Message, String> {
     let message = send(session.id.clone(), text).await?;
-    if session.is_coordinator() && session.status == SessionStatus::Disconnected {
+    if session.role.is_some() && session.status == SessionStatus::Disconnected {
+        let who = if session.is_coordinator() { "the Coordinator" } else { "the worker" };
         reconnect(session, ReconnectMode::Background)
             .await
-            .map_err(|e| format!("sent, but waking the Coordinator failed: {e}"))?;
+            .map_err(|e| format!("sent, but waking {who} failed: {e}"))?;
     }
     Ok(message)
 }

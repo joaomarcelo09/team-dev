@@ -24,7 +24,14 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   and skills. It listens for 50 minutes (`[timeouts] listen_secs`), then its process stops; your
   next message wakes it with its context intact.
 
-Next is Phase 2: workers (`claude -p "/jg-team-dev:<skill> <brief>"`).
+- **Phase 2** (workers): the Coordinator runs `jg-team-dev worker <skill> --task … --brief-file …`
+  (planner, coder, reviewer, tester, git-coder). It returns at once; a detached process runs
+  `claude -p "/jg-team-dev:<skill> <brief>"` and relays the result JSON to the Coordinator
+  through the hub, waking it if needed. Workers get their own chats under their Coordinator;
+  messaging a finished worker resumes it for one reply, and the Coordinator gets a summary.
+  `jg-team-dev workers` lists them (the Coordinator keeps at most 3 running).
+
+Next is Phase 3: git worktrees per coder, `jg-team-dev reset` with task summaries.
 
 Team sessions use `[team]` in `config.toml`:
 
@@ -42,6 +49,7 @@ cargo build                       # jg-team-dev, jg-team-dev-hub, jg-team-dev-de
 cargo test --workspace
 ./target/debug/jg-team-dev-hub    # run the hub in the foreground (RUST_LOG=jgt_hub=debug)
 ./target/debug/jg-team-dev start ~/my-app  # start (or wake) the Coordinator for a folder
+./target/debug/jg-team-dev worker reviewer --task "review calc.py" --parent <id> "Review calc.py for bugs"
 ./target/debug/jg-team-dev settings        # hooks for `claude --settings`
 ./target/debug/jg-team-dev settings --mcp  # MCP server for `claude --mcp-config`
 ```

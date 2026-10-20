@@ -15,7 +15,14 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Skills bundled into the binary and written to the plugin folder at start.
-const SKILLS: &[(&str, &str)] = &[("coordinator", include_str!("../../../skills/coordinator/SKILL.md"))];
+const SKILLS: &[(&str, &str)] = &[
+    ("coordinator", include_str!("../../../skills/coordinator/SKILL.md")),
+    ("planner", include_str!("../../../skills/planner/SKILL.md")),
+    ("coder", include_str!("../../../skills/coder/SKILL.md")),
+    ("reviewer", include_str!("../../../skills/reviewer/SKILL.md")),
+    ("tester", include_str!("../../../skills/tester/SKILL.md")),
+    ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),
+];
 
 /// Writes the plugin (manifest + skills) into `dir`, replacing what an older version wrote.
 pub fn write_plugin(dir: &Path) -> Result<()> {
@@ -33,6 +40,19 @@ pub fn write_plugin(dir: &Path) -> Result<()> {
         std::fs::write(skill.join("SKILL.md"), text)?;
     }
     Ok(())
+}
+
+/// Writes the settings, MCP config and plugin that team sessions load; returns their folder.
+/// Rewritten on every launch, so an upgraded binary's hooks and skills take effect.
+pub fn prepare_files() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("locating the jg-team-dev executable")?;
+    let exe = exe.canonicalize().unwrap_or(exe);
+    let files = team::files_dir();
+    std::fs::create_dir_all(&files)?;
+    std::fs::write(files.join("settings.json"), serde_json::to_string_pretty(&settings::claude_settings(&exe))?)?;
+    std::fs::write(files.join("mcp.json"), serde_json::to_string_pretty(&settings::mcp_config(&exe))?)?;
+    write_plugin(&files.join("plugin"))?;
+    Ok(files)
 }
 
 /// Marks `folder` trusted in Claude Code's `~/.claude.json`, which `claude --bg` requires.
@@ -120,13 +140,7 @@ pub async fn start(folder: Option<PathBuf>) -> Result<()> {
     if trust(&paths::home_dir().join(".claude.json"), &folder)? {
         println!("Marked {} as trusted in ~/.claude.json", folder.display());
     }
-    let exe = std::env::current_exe().context("locating the jg-team-dev executable")?;
-    let exe = exe.canonicalize().unwrap_or(exe);
-    let files = team::files_dir();
-    std::fs::create_dir_all(&files)?;
-    std::fs::write(files.join("settings.json"), serde_json::to_string_pretty(&settings::claude_settings(&exe))?)?;
-    std::fs::write(files.join("mcp.json"), serde_json::to_string_pretty(&settings::mcp_config(&exe))?)?;
-    write_plugin(&files.join("plugin"))?;
+    let files = prepare_files()?;
 
     let config = Config::load();
     let claude = launch::find_program("claude", config.commands.claude.as_deref()).map_err(anyhow::Error::msg)?;

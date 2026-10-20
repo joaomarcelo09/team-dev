@@ -59,6 +59,7 @@ pub fn router(hub: SharedHub) -> Router {
         .route("/v1/sessions/{id}/end", post(end_session))
         .route("/v1/sessions/{id}/messages", get(list_messages).post(agent_message))
         .route("/v1/sessions/{id}/send", post(send))
+        .route("/v1/sessions/{id}/relay", post(relay))
         .route("/v1/sessions/{id}/take", post(take))
         .route("/v1/sessions/{id}/wait", get(wait))
         .route("/v1/sessions/{id}/read", post(read))
@@ -186,6 +187,14 @@ async fn send(
     Json(req): Json<SendRequest>,
 ) -> ApiResult<jgt_core::Message> {
     Ok(Json(hub.send_from_user(&id, &req.text)?))
+}
+
+async fn relay(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Json(req): Json<RelayRequest>,
+) -> ApiResult<jgt_core::Message> {
+    Ok(Json(hub.relay(&id, &req)?))
 }
 
 async fn take(State(hub): State<SharedHub>, Path(id): Path<String>) -> ApiResult<MessagesResponse> {

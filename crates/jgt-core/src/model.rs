@@ -178,6 +178,9 @@ pub struct Session {
     /// The team role a session was started with (`coordinator`, or a worker skill), if any.
     #[serde(default)]
     pub role: Option<String>,
+    /// For a worker: the hub id of the Coordinator that started it.
+    #[serde(default)]
+    pub parent_id: Option<String>,
 }
 
 /// Role of the session that talks to the user and runs the team.
@@ -186,6 +189,11 @@ pub const COORDINATOR: &str = "coordinator";
 impl Session {
     pub fn is_coordinator(&self) -> bool {
         self.role.as_deref() == Some(COORDINATOR)
+    }
+
+    /// A session started by a Coordinator with one skill.
+    pub fn is_worker(&self) -> bool {
+        self.role.is_some() && !self.is_coordinator()
     }
 
     /// A human-friendly name: the title, else the project folder, else the id.

@@ -8,7 +8,7 @@ use jgt_core::{
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{path::Path, sync::Mutex};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -32,6 +32,7 @@ CREATE TABLE sessions (
     updated_at      INTEGER NOT NULL,
     last_seen_at    INTEGER NOT NULL,
     role            TEXT,
+    parent_id       TEXT,
     UNIQUE (harness, external_id)
 );
 CREATE INDEX sessions_pid ON sessions (pid);
@@ -68,7 +69,10 @@ CREATE INDEX questions_message ON questions (message_id);
 "#;
 
 /// Upgrades from each older schema version, applied in order.
-const MIGRATIONS: &[(i64, &str)] = &[(2, "ALTER TABLE sessions ADD COLUMN role TEXT;")];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (2, "ALTER TABLE sessions ADD COLUMN role TEXT;"),
+    (3, "ALTER TABLE sessions ADD COLUMN parent_id TEXT;"),
+];
 
 /// Columns selected for a `Session`, including the computed counters.
 const SESSION_COLUMNS: &str = r#"
@@ -82,7 +86,7 @@ const SESSION_COLUMNS: &str = r#"
     (SELECT m.body FROM messages m WHERE m.session_id = s.id AND m.kind != 'event'
         ORDER BY m.id DESC LIMIT 1) AS last_message,
     (SELECT m.created_at FROM messages m WHERE m.session_id = s.id ORDER BY m.id DESC LIMIT 1) AS last_message_at,
-    s.role
+    s.role, s.parent_id
 "#;
 
 const MESSAGE_COLUMNS: &str =
@@ -106,6 +110,7 @@ pub struct Registration<'a> {
     pub transcript_path: Option<&'a str>,
     pub status: SessionStatus,
     pub role: Option<&'a str>,
+    pub parent_id: Option<&'a str>,
 }
 
 fn parse<T: std::str::FromStr<Err = String>>(idx: usize, value: String) -> rusqlite::Result<T> {
@@ -140,6 +145,7 @@ fn session_from_row(row: &Row) -> rusqlite::Result<Session> {
         last_message: last_message.map(|m| preview(&m)),
         last_message_at: row.get(21)?,
         role: row.get(22)?,
+        parent_id: row.get(23)?,
     })
 }
 
@@ -292,9 +298,20 @@ impl Db {
                             pid_start = CASE WHEN ?4 IS NOT NULL THEN ?5 ELSE pid_start END,
                             transcript_path = COALESCE(?6, transcript_path),
                             status = ?7, ended_reason = NULL, updated_at = ?8, last_seen_at = ?8,
-                            role = COALESCE(?9, role)
+                            role = COALESCE(?9, role), parent_id = COALESCE(?10, parent_id)
                          WHERE id = ?1",
-                        params![s.id, r.cwd, r.title, r.pid, r.pid_start, r.transcript_path, r.status.as_str(), now, r.role],
+                        params![
+                            s.id,
+                            r.cwd,
+                            r.title,
+                            r.pid,
+                            r.pid_start,
+                            r.transcript_path,
+                            r.status.as_str(),
+                            now,
+                            r.role,
+                            r.parent_id
+                        ],
                     )
                 })?;
                 s.id.clone()
@@ -304,8 +321,8 @@ impl Db {
                 self.with(|c| {
                     c.execute(
                         "INSERT INTO sessions (id, harness, external_id, title, cwd, transcript_path, pid,
-                            pid_start, status, created_at, updated_at, last_seen_at, role)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, ?11)",
+                            pid_start, status, created_at, updated_at, last_seen_at, role, parent_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10, ?10, ?11, ?12)",
                         params![
                             id,
                             r.harness.as_str(),
@@ -317,7 +334,8 @@ impl Db {
                             r.pid_start,
                             r.status.as_str(),
                             now,
-                            r.role
+                            r.role,
+                            r.parent_id
                         ],
                     )
                 })?;

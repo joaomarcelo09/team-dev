@@ -10,6 +10,12 @@ pub const PLUGIN_NAME: &str = "jg-team-dev";
 /// Set on the sessions jg-team-dev launches; their hooks inherit it.
 pub const ROLE_ENV: &str = "JGT_ROLE";
 
+/// Hub id of the Coordinator, set on the workers it starts.
+pub const PARENT_ENV: &str = "JGT_PARENT";
+
+/// Worker skills a Coordinator can start (`jg-team-dev worker <skill>`).
+pub const WORKER_SKILLS: &[&str] = &["planner", "coder", "reviewer", "tester", "git-coder"];
+
 /// Where `settings.json`, `mcp.json` and `plugin/` for team sessions are written.
 pub fn files_dir() -> PathBuf {
     paths::data_dir().join("claude")
@@ -18,6 +24,16 @@ pub fn files_dir() -> PathBuf {
 /// Claude Code flags for a Coordinator in `folder`, without `--bg` and the prompt.
 pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<String> {
     let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
+    session_args(files, &format!("{COORDINATOR} · {name}"), config)
+}
+
+/// Chat title of a worker: `<skill> · <task>`.
+pub fn worker_title(skill: &str, task: &str) -> String {
+    format!("{skill} · {}", task.trim())
+}
+
+/// Claude Code flags for a team session titled `title`, without `--bg`/`-p` and the prompt.
+pub fn session_args(files: &Path, title: &str, config: &Config) -> Vec<String> {
     let file = |n: &str| files.join(n).to_string_lossy().into_owned();
     vec![
         "--model".into(),
@@ -37,7 +53,7 @@ pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<Str
         "--plugin-dir".into(),
         file("plugin"),
         "-n".into(),
-        format!("{COORDINATOR} · {name}"),
+        title.to_string(),
     ]
 }
 
@@ -50,6 +66,25 @@ pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<Str
 pub fn has_saved_options(external_id: &str) -> bool {
     let short = crate::model::short_id(external_id);
     paths::home_dir().join(".claude").join("jobs").join(short).join("state.json").is_file()
+}
+
+/// Queues `text` for the session `to` (a worker reporting to its Coordinator) and wakes `to`
+/// when it is a sleeping Coordinator, so the message is read right away.
+pub async fn relay(client: &crate::HubClient, to: &str, from: Option<&str>, text: &str) -> Result<(), String> {
+    use crate::api::RelayRequest;
+
+    let _: crate::Message = client
+        .post(
+            &format!("/v1/sessions/{to}/relay"),
+            &RelayRequest { from_session: from.map(str::to_owned), text: text.to_string() },
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    let target: crate::Session = client.get(&format!("/v1/sessions/{to}")).await.map_err(|e| e.to_string())?;
+    if target.is_coordinator() && target.status == crate::SessionStatus::Disconnected {
+        crate::launch::reconnect(client, &target, crate::ReconnectMode::Background).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

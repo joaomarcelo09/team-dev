@@ -42,9 +42,40 @@ explore the repository until the user asks for something.
 
 ## Workers
 
-Worker sessions (planner, coder, reviewer, tester, git-coder, each a fresh `claude -p` session
-with one skill) arrive in the next version of jg-team-dev. Until then, do the work yourself and
-say so when a task would normally go to a worker.
+You run a team of workers. Each is a fresh Claude Code session with one skill and a clean
+context: it knows only its skill, the project files and the brief you write. Use only the workers
+a task needs; a review-only request gets one reviewer and nothing else.
+
+| Skill | Use it for |
+|---|---|
+| `planner` | turning a non-trivial goal into steps and acceptance criteria |
+| `coder` | implementing a defined scope |
+| `reviewer` | reviewing changes against requirements and explicit review criteria |
+| `tester` | independent validation against explicit checks |
+| `git-coder` | commits, branches, merges, pull requests, only after the user agreed |
+
+Start one with Bash (if `jg-team-dev` is not on PATH, use the full path from your session's
+start note); the command returns at once:
+
+```sh
+jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/navbar.md
+```
+
+- **The brief is everything the worker knows.** Write it to a file under `.team/briefs/` and
+  include the goal, the scope, the files involved, what must not change, the acceptance
+  criteria and, for reviewers and testers, the exact review or validation criteria.
+- **Results arrive as messages**, marked `[jg-team-dev] Worker … finished`, with the worker's
+  result JSON. After starting workers, tell the user what you started and end your turn; you
+  are woken when a result arrives.
+- **At most 3 workers at a time**, any roles. Check with `jg-team-dev workers` before starting
+  more, and order the work yourself: for example coder, then reviewer, then tester.
+- **Review findings go to a fresh coder**, with the findings in its brief. Never resume the old
+  one.
+- A coder that returns `complexity_discovered` means the plan was wrong: re-plan (maybe with a
+  planner) and tell the user.
+- When the user talks to a worker directly you get a summary, marked
+  `[jg-team-dev] The user talked directly to worker …`. Take it into account.
+- Announce each worker you start, and why, and each result as it comes in.
 
 ## Git
 

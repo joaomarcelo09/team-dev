@@ -8,7 +8,7 @@ use jgt_core::{
     client::encode_query,
     config::Config,
     format_for_agent, launch, procs, short_id,
-    team::ROLE_ENV,
+    team::{self, PARENT_ENV, ROLE_ENV},
 };
 use serde_json::{Value, json};
 use std::{io::Read, time::Duration};
@@ -64,7 +64,9 @@ impl HookEvent {
 const CONNECTED_NOTE: &str = "This session is connected to jg-team-dev, the user's desktop messenger for AI agents; it \
 has its own chat box there. To reach the user use the `jg-team-dev` MCP tools: chat_send for messages, chat_notify when \
 you finish something important or need attention, chat_ask to ask and wait for an answer, chat_status for a short \
-status line. Messages the user writes in jg-team-dev reach you automatically, marked [jg-team-dev]; reply normally.";
+status line. Messages the user writes in jg-team-dev reach you automatically, marked [jg-team-dev]; reply normally. A message that \
+arrives while you wait between turns is shown twice (as Stop hook feedback and as a hook blocking error): it is one \
+message, not an error.";
 
 pub async fn run(event: HookEvent) -> anyhow::Result<()> {
     let mut raw = String::new();
@@ -103,6 +105,7 @@ impl Hook {
             transcript_path: self.str("transcript_path").map(str::to_owned),
             source: source.map(str::to_owned),
             role: std::env::var(ROLE_ENV).ok().filter(|r| !r.is_empty()),
+            parent: std::env::var(PARENT_ENV).ok().filter(|p| !p.is_empty()),
         };
         Ok(self.client.post("/v1/sessions/register", &req).await?)
     }
@@ -152,9 +155,18 @@ impl Hook {
     async fn handle(&self, event: HookEvent) -> anyhow::Result<Option<Value>> {
         match event {
             HookEvent::SessionStart => {
-                self.register(self.str("source")).await?;
+                let session = self.register(self.str("source")).await?;
+                let mut note = CONNECTED_NOTE.to_string();
+                if session.is_coordinator()
+                    && let Ok(exe) = std::env::current_exe()
+                {
+                    note.push_str(&format!(
+                        " You are the Coordinator: run `jg-team-dev worker` and `jg-team-dev workers` as `{}`.",
+                        exe.canonicalize().unwrap_or(exe).display()
+                    ));
+                }
                 Ok(Some(json!({
-                    "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": CONNECTED_NOTE }
+                    "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": note }
                 })))
             }
             HookEvent::UserPromptSubmit => {
@@ -192,7 +204,11 @@ impl Hook {
                 let Some(session) = self.known().await?.filter(|s| s.status.is_connected()) else {
                     return Ok(None);
                 };
-                let reason = self.str("reason").unwrap_or("exit").replace('_', " ");
+                let reason = if session.is_worker() {
+                    "finished".to_string()
+                } else {
+                    self.str("reason").unwrap_or("exit").replace('_', " ")
+                };
                 let _: Session = self
                     .client
                     .post(&format!("/v1/sessions/{}/end", session.id), &EndRequest { reason, gone: false })
@@ -206,7 +222,23 @@ impl Hook {
     async fn stop(&self) -> anyhow::Result<Option<Value>> {
         let session = self.session().await?;
         let reply = self.str("last_assistant_message").map(str::to_owned);
-        let session = self.set_state(&session, SessionStatus::Idle, reply).await?;
+        // Read before the reply is mirrored: what the user wrote to this worker directly.
+        let direct = if session.is_worker() && session.awaiting_reply {
+            self.direct_messages(&session).await.unwrap_or_default()
+        } else {
+            vec![]
+        };
+        let session = self.set_state(&session, SessionStatus::Idle, reply.clone()).await?;
+        if let (false, Some(parent)) = (direct.is_empty(), session.parent_id.as_deref()) {
+            let quote = |t: &str| t.trim().lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+            let text = format!(
+                "[jg-team-dev] The user talked directly to worker **{}**.\n\nThey wrote:\n{}\n\nThe worker replied:\n{}",
+                session.display_name(),
+                direct.iter().map(|m| quote(m)).collect::<Vec<_>>().join("\n>\n"),
+                quote(reply.as_deref().unwrap_or("(no reply)")),
+            );
+            team::relay(&self.client, parent, Some(&session.id), &text).await.map_err(anyhow::Error::msg)?;
+        }
 
         let mut messages = self.take(&session).await?;
         if messages.is_empty() && session.listen {
@@ -245,6 +277,17 @@ impl Hook {
         }
         self.set_state(&session, SessionStatus::Active, None).await?;
         Ok(Some(json!({ "decision": "block", "reason": format_for_agent(&messages) })))
+    }
+
+    /// The user's messages since the worker's last mirrored reply (relays from other agents excluded).
+    async fn direct_messages(&self, session: &Session) -> anyhow::Result<Vec<String>> {
+        let r: MessagesResponse = self.client.get(&format!("/v1/sessions/{}/messages?limit=30", session.id)).await?;
+        let since = r.messages.iter().rposition(|m| m.kind == MessageKind::Reply).map_or(0, |i| i + 1);
+        Ok(r.messages[since..]
+            .iter()
+            .filter(|m| m.direction == jgt_core::Direction::ToAgent && m.meta_str("relay_from").is_none())
+            .map(|m| m.body.clone())
+            .collect())
     }
 
     /// After a listen period with no message the Coordinator's process stops; the user's next

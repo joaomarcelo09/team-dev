@@ -6,7 +6,7 @@ use crate::{
 };
 use chrono::{Datelike, Local, TimeZone};
 use iced::{
-    Alignment, Color, Element, Fill, Font, Shrink, Theme,
+    Alignment, Color, Element, Fill, Font, Padding, Shrink, Theme,
     font::Weight,
     widget::{
         Space, button, column, container, markdown, row, rule, scrollable, space, stack, text, text_editor,
@@ -251,7 +251,16 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
         if *label == "ARCHIVED" && !app.show_archived {
             continue;
         }
-        let items: Vec<&&Session> = visible.iter().filter(|s| include(s)).collect();
+        // Workers sit right under their Coordinator, whatever their own state; only a worker whose
+        // Coordinator is not listed is grouped by its own state.
+        let parent_listed = |w: &Session| visible.iter().any(|p| Some(p.id.as_str()) == w.parent_id.as_deref());
+        let mut items: Vec<&&Session> = Vec::new();
+        for s in visible.iter().filter(|s| include(s) && !(s.is_worker() && parent_listed(s))) {
+            items.push(s);
+            if !s.is_worker() {
+                items.extend(visible.iter().filter(|w| w.is_worker() && w.parent_id.as_deref() == Some(s.id.as_str())));
+            }
+        }
         if items.is_empty() {
             continue;
         }
@@ -260,7 +269,8 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
             container(muted(format!("{label} · {}", items.len())).size(style::fs(11)).font(bold())).padding([10, 8]),
         );
         for s in items {
-            list = list.push(session_item(s, app.selected.as_deref() == Some(s.id.as_str()), theme));
+            let item = session_item(s, app.selected.as_deref() == Some(s.id.as_str()), theme);
+            list = list.push(if s.is_worker() { container(item).padding(Padding::ZERO.left(16)).into() } else { item });
         }
     }
     if !any {
@@ -332,7 +342,11 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
 fn session_item<'a>(s: &'a Session, selected: bool, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
     let time = s.last_message_at.unwrap_or(s.updated_at);
-    let role = if s.is_coordinator() { "Coordinator" } else { s.harness.label() };
+    let role = match s.role.as_deref() {
+        Some(jgt_core::COORDINATOR) => "Coordinator".to_string(),
+        Some(skill) => format!("↳ {skill}"),
+        None => s.harness.label().to_string(),
+    };
     let mut meta = row![dot(style::status_color(theme, s.status), 7.0), muted(role).size(style::fs(11))]
         .spacing(6)
         .align_y(Alignment::Center);

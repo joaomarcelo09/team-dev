@@ -116,15 +116,16 @@ pub async fn send(query: &str, text: &str) -> Result<()> {
     let session = find(query).await?;
     let m: Message = client().post(&format!("/v1/sessions/{}/send", session.id), &SendRequest { text: text.into() }).await?;
     let note = match session.status {
-        SessionStatus::Disconnected if session.is_coordinator() => "",
+        SessionStatus::Disconnected if session.role.is_some() => "",
         SessionStatus::Disconnected => " — the session is disconnected; `jg-team-dev reconnect` delivers it",
         SessionStatus::Idle if session.harness == Harness::ClaudeCode => " — delivered on the session's next turn",
         _ => "",
     };
     println!("queued message #{}{note}", m.id);
-    if session.is_coordinator() && session.status == SessionStatus::Disconnected {
+    if session.role.is_some() && session.status == SessionStatus::Disconnected {
         let output = launch::reconnect(&client(), &session, ReconnectMode::Background).await.map_err(anyhow::Error::msg)?;
-        println!("waking the Coordinator: {output}");
+        let who = if session.is_coordinator() { "the Coordinator" } else { "the worker" };
+        println!("waking {who}: {output}");
     }
     Ok(())
 }
@@ -215,6 +216,7 @@ pub async fn agent(cmd: AgentCommand) -> Result<()> {
                         transcript_path: None,
                         source: None,
                         role: None,
+                        parent: None,
                     },
                 )
                 .await?;

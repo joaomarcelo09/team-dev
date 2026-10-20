@@ -17,6 +17,9 @@ pub struct RegisterRequest {
     /// Team role from the `JGT_ROLE` environment variable set by `jg-team-dev start`.
     #[serde(default)]
     pub role: Option<String>,
+    /// Hub id of the Coordinator that started this worker (`JGT_PARENT`).
+    #[serde(default)]
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +82,13 @@ pub struct PendingSession {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PendingResponse {
     pub sessions: Vec<PendingSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayRequest {
+    /// The session the message comes from (a worker).
+    pub from_session: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

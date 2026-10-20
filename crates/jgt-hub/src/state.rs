@@ -156,6 +156,7 @@ impl Hub {
             transcript_path: req.transcript_path.as_deref(),
             status: SessionStatus::Idle,
             role: req.role.as_deref(),
+            parent_id: req.parent.as_deref(),
         })?;
         // The Coordinator runs in the background and only hears the user through the app.
         if session.is_coordinator() && !session.listen {
@@ -308,6 +309,24 @@ impl Hub {
             Delivery::Queued,
         )?;
         self.db.mark_read(id)?;
+        self.bump();
+        self.emit_message(&message);
+        self.emit_session(id);
+        Ok(message)
+    }
+
+    /// Queues a message from one agent to another (a worker's result for its Coordinator).
+    /// It reaches the agent like the user's own messages, but does not mark the chat read.
+    pub fn relay(&self, id: &str, req: &RelayRequest) -> HubResult<Message> {
+        let session = self.session(id)?;
+        if !session.status.accepts_messages() {
+            return Err(HubError::Gone("this session has ended; its context is gone".into()));
+        }
+        if req.text.trim().is_empty() {
+            return Err(HubError::BadRequest("message is empty".into()));
+        }
+        let meta = serde_json::json!({ "relay_from": req.from_session });
+        let message = self.db.insert_message(id, Direction::ToAgent, MessageKind::Text, &req.text, &meta, Delivery::Queued)?;
         self.bump();
         self.emit_message(&message);
         self.emit_session(id);
@@ -485,7 +504,7 @@ impl Hub {
         if !session.harness.can_reconnect() {
             return Err(HubError::BadRequest(format!("{} sessions cannot be restarted by jg-team-dev", session.harness)));
         }
-        if req.mode == jgt_core::ReconnectMode::Background {
+        if req.mode == jgt_core::ReconnectMode::Background && !session.is_worker() {
             // Without a terminal the user can only reach it through jg-team-dev, so keep it listening.
             self.db.patch_session(id, None, false, None, Some(true), None, None)?;
         }

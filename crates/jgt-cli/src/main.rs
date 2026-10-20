@@ -6,6 +6,7 @@ mod hooks;
 mod mcp;
 mod settings;
 mod team;
+mod workers;
 
 use clap::{Parser, Subcommand};
 use jgt_core::Harness;
@@ -21,6 +22,18 @@ struct Cli {
 enum Command {
     /// Start (or wake) the Coordinator for a project folder (the current folder when omitted).
     Start { folder: Option<std::path::PathBuf> },
+    /// Start a worker for the Coordinator running this command; returns at once and the result
+    /// reaches the Coordinator as a message.
+    Worker(workers::WorkerArgs),
+    /// List the workers of the Coordinator running this command.
+    Workers {
+        /// Coordinator session id (default: the Coordinator running this command).
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// Runs a worker and relays its result (started by `worker`).
+    #[command(hide = true)]
+    WorkerRun(workers::WorkerRunArgs),
     /// Print the Claude Code settings (hooks) that jg-team-dev sessions load with `--settings`.
     Settings {
         /// Print the MCP config for `--mcp-config` instead.
@@ -86,6 +99,9 @@ async fn main() {
         Command::Mcp { harness } => mcp::run(harness).await,
         Command::Hook { event } => hooks::run(event).await,
         Command::Start { folder } => team::start(folder).await,
+        Command::Worker(args) => workers::start(args).await,
+        Command::Workers { parent } => workers::list(parent).await,
+        Command::WorkerRun(args) => workers::run(args).await,
         Command::Settings { mcp } => settings::print(mcp),
         Command::Status => commands::status().await,
         Command::Sessions { all } => commands::sessions(all).await,

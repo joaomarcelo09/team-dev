@@ -25,6 +25,7 @@ fn register(hub: &Hub, harness: Harness, ext: &str, pid: Option<i64>) -> jgt_cor
         transcript_path: None,
         source: Some("startup".into()),
         role: None,
+        parent: None,
     })
     .unwrap()
 }
@@ -258,6 +259,7 @@ fn coordinators_listen_from_the_start() {
         transcript_path: None,
         source: Some("startup".into()),
         role: role.map(str::to_owned),
+        parent: None,
     };
     let coordinator = hub.register(&req("coord", Some(jgt_core::COORDINATOR))).unwrap();
     assert!(coordinator.is_coordinator());
@@ -280,7 +282,8 @@ fn schema_1_databases_are_upgraded() {
     let _ = std::fs::remove_file(&path);
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        conn.execute_batch(&crate::db::SCHEMA.replace("    role            TEXT,\n", "")).unwrap();
+        let v1 = crate::db::SCHEMA.replace("    role            TEXT,\n", "").replace("    parent_id       TEXT,\n", "");
+        conn.execute_batch(&v1).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
         conn.execute(
             "INSERT INTO sessions (id, harness, external_id, status, created_at, updated_at, last_seen_at)
@@ -292,11 +295,46 @@ fn schema_1_databases_are_upgraded() {
     let db = Db::open(&path).unwrap();
     let session = db.session("s1").unwrap().unwrap();
     assert_eq!(session.role, None);
+    assert_eq!(session.parent_id, None);
     let version: i64 = rusqlite::Connection::open(&path)
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn workers_link_to_their_coordinator_and_relay_results() {
+    let hub = hub();
+    let req = |ext: &str, role: &str, parent: Option<String>| RegisterRequest {
+        harness: Harness::ClaudeCode,
+        external_id: ext.into(),
+        cwd: Some("/tmp/project".into()),
+        title: None,
+        pid: None,
+        transcript_path: None,
+        source: Some("startup".into()),
+        role: Some(role.into()),
+        parent,
+    };
+    let coordinator = hub.register(&req("coord", jgt_core::COORDINATOR, None)).unwrap();
+    let worker = hub.register(&req("w1", "coder", Some(coordinator.id.clone()))).unwrap();
+    assert!(worker.is_worker());
+    assert!(!worker.listen, "workers never listen");
+    assert_eq!(worker.parent_id.as_deref(), Some(coordinator.id.as_str()));
+
+    say(&hub, &coordinator.id, MessageKind::Text, "unread greeting");
+    let relayed = hub
+        .relay(&coordinator.id, &RelayRequest { from_session: Some(worker.id.clone()), text: "Worker finished".into() })
+        .unwrap();
+    assert_eq!(relayed.direction, Direction::ToAgent);
+    assert_eq!(relayed.meta_str("relay_from"), Some(worker.id.as_str()));
+    assert_eq!(hub.session(&coordinator.id).unwrap().unread, 1, "a relay does not mark the chat read");
+
+    let taken = hub.take(&coordinator.id).unwrap();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].body, "Worker finished");
+    assert!(hub.relay(&coordinator.id, &RelayRequest { from_session: None, text: "  ".into() }).is_err());
 }
