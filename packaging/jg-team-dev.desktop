@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=jg-team-dev
+GenericName=AI Team Chat
+Comment=Chat with a Coordinator that runs your AI dev team
+Exec=jg-team-dev-desktop
+Icon=jg-team-dev
+Terminal=false
+Categories=Network;InstantMessaging;Development;
+Keywords=ai;agent;claude;team;chat;coordinator;
+StartupWMClass=jg-team-dev
+StartupNotify=true

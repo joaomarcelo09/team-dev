@@ -1,0 +1,22 @@
+[package]
+name = "jgt-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "jg-team-dev command line: MCP server, agent hooks and connectors"
+
+[[bin]]
+name = "jg-team-dev"
+path = "src/main.rs"
+
+[dependencies]
+jgt-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+clap.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+chrono.workspace = true
+libc.workspace = true

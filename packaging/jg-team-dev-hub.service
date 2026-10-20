@@ -1,0 +1,18 @@
+[Unit]
+Description=jg-team-dev hub (routes messages between you and your AI agents)
+Documentation=file:///usr/share/doc/jg-team-dev/README.md
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/jg-team-dev-hub
+Restart=on-failure
+RestartSec=2
+# Agents and windows started from the hub (e.g. by clicking a notification) must outlive it.
+KillMode=process
+# The hub stops within ~2 s; never let a stuck stop block `systemctl restart` for long.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
