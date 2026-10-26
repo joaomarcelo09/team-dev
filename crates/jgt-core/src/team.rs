@@ -1,7 +1,11 @@
 //! What team sessions are started with. Shared by `jg-team-dev start` and the reconnect launcher,
 //! so a Coordinator always comes back with the same hooks, MCP server and skills.
 
-use crate::{config::Config, model::COORDINATOR, paths};
+use crate::{
+    config::{Config, SessionSettings},
+    model::COORDINATOR,
+    paths,
+};
 use std::path::{Path, PathBuf};
 
 /// Plugin name; its skills are invoked as `/jg-team-dev:<skill>`.
@@ -24,7 +28,7 @@ pub fn files_dir() -> PathBuf {
 /// Claude Code flags for a Coordinator in `folder`, without `--bg` and the prompt.
 pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<String> {
     let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
-    session_args(files, &format!("{COORDINATOR} · {name}"), config)
+    session_args(files, &format!("{COORDINATOR} · {name}"), &config.team.for_skill(COORDINATOR, folder))
 }
 
 /// Chat title of a worker: `<skill> · <task>`.
@@ -33,15 +37,16 @@ pub fn worker_title(skill: &str, task: &str) -> String {
 }
 
 /// Claude Code flags for a team session titled `title`, without `--bg`/`-p` and the prompt.
-pub fn session_args(files: &Path, title: &str, config: &Config) -> Vec<String> {
+/// `settings` come from `config.team.for_skill(<skill>, <folder>)`.
+pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Vec<String> {
     let file = |n: &str| files.join(n).to_string_lossy().into_owned();
-    vec![
+    let mut args: Vec<String> = vec![
         "--model".into(),
-        config.team.model.clone(),
+        settings.model.clone(),
         "--effort".into(),
-        config.team.effort.clone(),
+        settings.effort.clone(),
         "--permission-mode".into(),
-        config.team.permission_mode.clone(),
+        settings.permission_mode.clone(),
         "--settings".into(),
         file("settings.json"),
         "--mcp-config".into(),
@@ -54,7 +59,15 @@ pub fn session_args(files: &Path, title: &str, config: &Config) -> Vec<String> {
         file("plugin"),
         "-n".into(),
         title.to_string(),
-    ]
+    ];
+    // One flag per tool: the options take several values, and a pattern may hold spaces.
+    for tool in &settings.allowed_tools {
+        args.extend(["--allowedTools".into(), tool.clone()]);
+    }
+    for tool in &settings.disallowed_tools {
+        args.extend(["--disallowedTools".into(), tool.clone()]);
+    }
+    args
 }
 
 /// Whether Claude Code still keeps the background session's saved options. A plain
@@ -113,5 +126,15 @@ mod tests {
         assert!(args.contains("--settings /data/claude/settings.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
         assert!(args.contains("--setting-sources project,local --plugin-dir /data/claude/plugin"));
         assert!(args.ends_with("-n coordinator · app"));
+    }
+
+    #[test]
+    fn tool_lists_become_one_flag_per_tool() {
+        let mut settings = Config::default().team.for_skill("tester", Path::new("/nonexistent"));
+        settings.allowed_tools = vec!["Bash(cargo test:*)".into(), "Read".into()];
+        settings.disallowed_tools = vec!["WebFetch".into()];
+        let args = session_args(Path::new("/f"), "t", &settings);
+        let tail = &args[args.len() - 6..];
+        assert_eq!(tail, ["--allowedTools", "Bash(cargo test:*)", "--allowedTools", "Read", "--disallowedTools", "WebFetch"]);
     }
 }

@@ -8,7 +8,7 @@ use jgt_core::{
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{path::Path, sync::Mutex};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -33,6 +33,8 @@ CREATE TABLE sessions (
     last_seen_at    INTEGER NOT NULL,
     role            TEXT,
     parent_id       TEXT,
+    cost_usd        REAL,
+    run_secs        INTEGER,
     UNIQUE (harness, external_id)
 );
 CREATE INDEX sessions_pid ON sessions (pid);
@@ -72,6 +74,7 @@ CREATE INDEX questions_message ON questions (message_id);
 const MIGRATIONS: &[(i64, &str)] = &[
     (2, "ALTER TABLE sessions ADD COLUMN role TEXT;"),
     (3, "ALTER TABLE sessions ADD COLUMN parent_id TEXT;"),
+    (4, "ALTER TABLE sessions ADD COLUMN cost_usd REAL; ALTER TABLE sessions ADD COLUMN run_secs INTEGER;"),
 ];
 
 /// Columns selected for a `Session`, including the computed counters.
@@ -86,7 +89,7 @@ const SESSION_COLUMNS: &str = r#"
     (SELECT m.body FROM messages m WHERE m.session_id = s.id AND m.kind != 'event'
         ORDER BY m.id DESC LIMIT 1) AS last_message,
     (SELECT m.created_at FROM messages m WHERE m.session_id = s.id ORDER BY m.id DESC LIMIT 1) AS last_message_at,
-    s.role, s.parent_id
+    s.role, s.parent_id, s.cost_usd, s.run_secs
 "#;
 
 const MESSAGE_COLUMNS: &str =
@@ -146,6 +149,8 @@ fn session_from_row(row: &Row) -> rusqlite::Result<Session> {
         last_message_at: row.get(21)?,
         role: row.get(22)?,
         parent_id: row.get(23)?,
+        cost_usd: row.get(24)?,
+        run_secs: row.get(25)?,
     })
 }
 
@@ -387,6 +392,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn patch_session(
         &self,
         id: &str,
@@ -396,6 +402,7 @@ impl Db {
         listen: Option<bool>,
         mirror: Option<bool>,
         archived: Option<bool>,
+        run: Option<(Option<f64>, i64)>,
     ) -> Result<()> {
         let now = now_ms();
         self.with(|c| {
@@ -422,6 +429,9 @@ impl Db {
             }
             if let Some(v) = archived {
                 c.execute("UPDATE sessions SET archived = ?2 WHERE id = ?1", params![id, v])?;
+            }
+            if let Some((cost, secs)) = run {
+                c.execute("UPDATE sessions SET cost_usd = ?2, run_secs = ?3 WHERE id = ?1", params![id, cost, secs])?;
             }
             c.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![id, now])
         })?;

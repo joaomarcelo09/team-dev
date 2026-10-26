@@ -40,6 +40,13 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   writes `.team/tasks/task-<date>-<slug>.md`, and runs `jg-team-dev reset --summary <file>`: a
   fresh Coordinator takes over the folder and the old chat is archived, read-only.
 
+- **Phase 4** (polish): each request with workers is a *run*. `jg-team-dev run start` writes
+  `.team/runs/<run-id>/request.md`; workers append to `events.jsonl` and save their result in
+  `worker-results/`; `jg-team-dev run finish` writes `final-report.md` and archives the run's
+  worker chats. `jg-team-dev run list` shows a project's runs. A Coordinator's chat has a **Team**
+  panel: each worker's state, time and cost; click one to open its chat. Model, effort,
+  permission mode and tools can be set per skill and per project (below).
+
 Team sessions use `[team]` in `config.toml`:
 
 ```toml
@@ -47,7 +54,16 @@ Team sessions use `[team]` in `config.toml`:
 model = "opus"            # claude --model
 effort = "medium"         # claude --effort
 permission_mode = "auto"  # only prompts auto mode can't settle reach the app
+
+[team.skills.coder]       # per skill: coordinator, planner, coder, reviewer, tester, git-coder
+model = "sonnet"
+allowed_tools = ["Bash(cargo test:*)"]   # claude --allowedTools
+disallowed_tools = ["WebFetch"]          # claude --disallowedTools
 ```
+
+A project can override these in `.team/config.toml`, with the same `[team]` and
+`[team.skills.<skill>]` tables. The most specific setting wins: project skill, project, user
+skill, user.
 
 ## Development
 

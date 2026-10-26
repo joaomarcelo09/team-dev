@@ -5,7 +5,7 @@
 //! the result reaches the Coordinator even while it waits for the user in listen mode, and wakes
 //! it when it went to sleep.
 
-use crate::{team::prepare_files, worktree};
+use crate::{runs, team::prepare_files, worktree};
 use anyhow::{Context, Result, bail};
 use jgt_core::{
     Harness, HubClient, Session, SessionStatus,
@@ -50,6 +50,9 @@ pub struct WorkerArgs {
     /// Coordinator session id (default: the Coordinator running this command).
     #[arg(long)]
     pub parent: Option<String>,
+    /// Record the worker in this run (default: the Coordinator's open run, or a new one).
+    #[arg(long)]
+    pub run: Option<String>,
     /// The brief.
     pub brief: Vec<String>,
 }
@@ -68,6 +71,8 @@ pub struct WorkerRunArgs {
     pub parent: String,
     #[arg(long)]
     pub session_id: String,
+    #[arg(long)]
+    pub run_dir: PathBuf,
 }
 
 /// A random version 4 UUID, used as the worker's Claude Code session id.
@@ -81,7 +86,7 @@ fn new_uuid() -> Result<String> {
 }
 
 /// The Coordinator that runs this command: the hub session of the Claude Code process above us.
-async fn coordinator(client: &HubClient, explicit: Option<String>) -> Result<Session> {
+pub(crate) async fn coordinator(client: &HubClient, explicit: Option<String>) -> Result<Session> {
     let session: Session = match explicit {
         Some(id) => client.get(&format!("/v1/sessions/{id}")).await?,
         None => {
@@ -138,6 +143,26 @@ pub async fn start(args: WorkerArgs) -> Result<()> {
         None => cwd,
     };
 
+    let project = runs::project_dir(&parent)?;
+    let run = match &args.run {
+        Some(id) => {
+            let run = runs::open(&project, id)?;
+            if run.finished {
+                bail!("run {} is finished; open a new one with `jg-team-dev run start`", run.id);
+            }
+            run
+        }
+        None => match runs::current(&project, &parent.id) {
+            Some(run) => run,
+            None => runs::create(
+                &project,
+                &args.task,
+                &format!("(Opened by the first worker; no `jg-team-dev run start`.)\n\n{brief}"),
+                &parent.id,
+            )?,
+        },
+    };
+
     let id = new_uuid()?;
     let briefs = paths::data_dir().join("briefs");
     std::fs::create_dir_all(&briefs)?;
@@ -155,19 +180,23 @@ pub async fn start(args: WorkerArgs) -> Result<()> {
         .arg(&brief_file)
         .arg("--cwd")
         .arg(&cwd)
+        .arg("--run-dir")
+        .arg(&run.dir)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     // Its own process group: it outlives this command and the Coordinator's Bash call.
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     cmd.spawn().context("starting the worker")?;
+    runs::worker_started(&run.dir, &id, &args.skill, &args.task, &cwd)?;
 
     println!(
-        "Started {} worker {} for \"{}\". It reports progress in its own chat; its result will reach you \
-         as a message.",
+        "Started {} worker {} for \"{}\" in run {}. It reports progress in its own chat; its result will \
+         reach you as a message.",
         args.skill,
         jgt_core::short_id(&id),
-        args.task.trim()
+        args.task.trim(),
+        run.id
     );
     Ok(())
 }
@@ -208,7 +237,7 @@ pub async fn run(args: WorkerRunArgs) -> Result<()> {
         .arg("-p")
         .arg(&prompt)
         .args(["--session-id", &args.session_id, "--output-format", "json"])
-        .args(team::session_args(&files, &title, &config))
+        .args(team::session_args(&files, &title, &config.team.for_skill(&args.skill, &args.cwd)))
         .current_dir(&args.cwd)
         .env(ROLE_ENV, &args.skill)
         .env(PARENT_ENV, &args.parent)
@@ -244,6 +273,24 @@ pub async fn run(args: WorkerRunArgs) -> Result<()> {
             )
             .await;
     }
+    let detail = if ok || !result.is_empty() { result.clone() } else { tail(&stderr, 20) };
+    if let Err(e) =
+        runs::worker_finished(&args.run_dir, &args.session_id, &args.skill, &args.task, ok, elapsed, cost, &detail)
+    {
+        eprintln!("jg-team-dev: recording the result in {}: {e:#}", args.run_dir.display());
+    }
+    if let Some(w) = &worker {
+        let _: Result<Session, _> = client
+            .patch(
+                &format!("/v1/sessions/{}?source=agent", w.id),
+                &jgt_core::api::PatchSessionRequest {
+                    run_secs: Some(elapsed as i64),
+                    cost_usd: cost,
+                    ..Default::default()
+                },
+            )
+            .await;
+    }
     let cost = cost.map(|c| format!(", ${c:.2}")).unwrap_or_default();
     let text = if ok {
         format!(
@@ -252,13 +299,18 @@ pub async fn run(args: WorkerRunArgs) -> Result<()> {
             elapsed % 60
         )
     } else {
-        let detail = if result.is_empty() { tail(&stderr, 20) } else { result };
         format!("[jg-team-dev] Worker **{title}** failed after {}m{:02}s ({}).\n\n{detail}", elapsed / 60, elapsed % 60, out.status)
     };
     team::relay(&client, &args.parent, worker.as_ref().map(|w| w.id.as_str()), &text)
         .await
         .map_err(anyhow::Error::msg)?;
     let _ = std::fs::remove_file(&args.brief_file);
+    // The Coordinator closed the run while this worker ran: hide its chat like the others.
+    if let (Some(w), Some(run)) = (&worker, runs::load(&args.run_dir))
+        && run.finished
+    {
+        let _ = runs::archive(&client, w).await;
+    }
     Ok(())
 }
 
@@ -316,6 +368,7 @@ mod tests {
             worktree: None,
             main_worktree: false,
             parent: None,
+            run: None,
             brief: vec!["fix".into(), "it".into()],
         };
         assert_eq!(read_brief(&args).unwrap(), "fix it");

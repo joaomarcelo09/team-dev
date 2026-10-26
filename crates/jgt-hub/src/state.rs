@@ -160,7 +160,7 @@ impl Hub {
         })?;
         // The Coordinator runs in the background and only hears the user through the app.
         if session.is_coordinator() && !session.listen {
-            self.db.patch_session(&session.id, None, false, None, Some(true), None, None)?;
+            self.db.patch_session(&session.id, None, false, None, Some(true), None, None, None)?;
         }
         self.reconnecting.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id);
         match previous {
@@ -261,6 +261,7 @@ impl Hub {
             req.listen,
             req.mirror,
             req.archived,
+            req.run_secs.map(|secs| (req.cost_usd, secs)),
         )?;
         self.bump();
         self.emit_session(id);
@@ -506,7 +507,7 @@ impl Hub {
         }
         if req.mode == jgt_core::ReconnectMode::Background && !session.is_worker() {
             // Without a terminal the user can only reach it through jg-team-dev, so keep it listening.
-            self.db.patch_session(id, None, false, None, Some(true), None, None)?;
+            self.db.patch_session(id, None, false, None, Some(true), None, None, None)?;
         }
         let queued = self.db.queued(id)?.len();
         let prompt = (queued > 0).then(|| {

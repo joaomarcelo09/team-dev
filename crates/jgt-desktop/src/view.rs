@@ -514,7 +514,81 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
     if let Some(banner) = status_banner(app, s, theme) {
         col = col.push(banner);
     }
+    if let Some(team) = team_panel(app, s, theme) {
+        col = col.push(team);
+    }
     container(col).padding([12, 18]).width(Fill).style(style::header).into()
+}
+
+/// `1m05s`, `2h03m`.
+fn duration(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs >= 3600 { format!("{}h{:02}m", secs / 3600, secs % 3600 / 60) } else { format!("{}m{:02}s", secs / 60, secs % 60) }
+}
+
+/// A Coordinator's workers: what each is doing, for how long, and what it cost.
+fn team_panel<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element<'a, Msg>> {
+    if !s.is_coordinator() {
+        return None;
+    }
+    let workers: Vec<&Session> = app.sessions.iter().filter(|w| w.parent_id.as_deref() == Some(s.id.as_str())).collect();
+    if workers.is_empty() {
+        return None;
+    }
+    let now = jgt_core::now_ms();
+    let shown: Vec<&&Session> = workers.iter().filter(|w| !w.archived || app.show_archived).collect();
+    let archived = workers.iter().filter(|w| w.archived).count();
+    let working = workers.iter().filter(|w| w.status.is_connected()).count();
+    let cost: f64 = workers.iter().filter_map(|w| w.cost_usd).sum();
+
+    let mut summary = row![
+        muted("TEAM").size(style::fs(11)).font(bold()),
+        muted(format!("{working} working · {} done · ${cost:.2}", workers.len() - working)).size(style::fs(11)),
+        space::horizontal(),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    if archived > 0 {
+        let label = if app.show_archived { "Hide archived".to_string() } else { format!("{archived} archived") };
+        summary = summary.push(
+            tip(
+                button(text(label).size(style::fs(11))).on_press(Msg::ToggleArchived).style(style::ghost).padding([1, 6]),
+                "Worker chats of finished runs are archived: kept, but hidden",
+            ),
+        );
+    }
+
+    let mut list = column![summary].spacing(2);
+    for w in shown {
+        let (state, secs) = match w.status {
+            SessionStatus::Active => ("working", (now - w.created_at) / 1000),
+            SessionStatus::Idle | SessionStatus::Listening => ("idle", (now - w.created_at) / 1000),
+            _ => (
+                if w.status == SessionStatus::Ended { "ended" } else { "done" },
+                w.run_secs.unwrap_or((w.updated_at - w.created_at) / 1000),
+            ),
+        };
+        let detail = if w.status.is_connected() { w.status_text.clone().unwrap_or_default() } else { String::new() };
+        let cost = w.cost_usd.map(|c| format!("${c:.2}")).unwrap_or_default();
+        let line = row![
+            dot(style::status_color(theme, w.status), 7.0),
+            text(w.display_name()).size(style::fs(12)).wrapping(text::Wrapping::None).width(Fill),
+            muted(detail).size(style::fs(11)).wrapping(text::Wrapping::None),
+            muted(state).size(style::fs(11)).width(56),
+            muted(duration(secs)).size(style::fs(11)).width(56),
+            muted(cost).size(style::fs(11)).width(48),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        list = list.push(
+            button(container(line).clip(true))
+                .on_press(Msg::Select(w.id.clone()))
+                .style(style::session_item(false))
+                .width(Fill)
+                .padding([3, 8]),
+        );
+    }
+    Some(container(list).padding([6, 8]).width(Fill).style(style::pill).into())
 }
 
 fn status_banner<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element<'a, Msg>> {

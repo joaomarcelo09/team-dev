@@ -220,7 +220,8 @@ impl App {
             iced::system::theme_changes().map(Msg::SystemTheme),
             keyboard::listen().map(Msg::Key),
         ];
-        if self.toast.is_some() {
+        // The Team panel counts running workers' time.
+        if self.toast.is_some() || self.sessions.iter().any(|s| s.is_worker() && s.status.is_connected()) {
             subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Msg::Tick));
         }
         Subscription::batch(subs)

@@ -181,6 +181,12 @@ pub struct Session {
     /// For a worker: the hub id of the Coordinator that started it.
     #[serde(default)]
     pub parent_id: Option<String>,
+    /// For a finished worker: the cost of its run in USD, when Claude Code reported it.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
+    /// For a finished worker: how long its run took.
+    #[serde(default)]
+    pub run_secs: Option<i64>,
 }
 
 /// Role of the session that talks to the user and runs the team.

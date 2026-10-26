@@ -1,7 +1,10 @@
 //! `~/.config/jg-team-dev/config.toml`, shared by the hub, the CLI and the app.
 
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -23,11 +26,110 @@ pub struct Team {
     pub effort: String,
     /// Permission mode (`claude --permission-mode`); only prompts it can't settle reach the app.
     pub permission_mode: String,
+    /// Per-skill settings (`[team.skills.coder]`, `[team.skills.coordinator]`, …).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, SkillSettings>,
 }
 
 impl Default for Team {
     fn default() -> Self {
-        Self { model: "opus".into(), effort: "medium".into(), permission_mode: "auto".into() }
+        Self { model: "opus".into(), effort: "medium".into(), permission_mode: "auto".into(), skills: BTreeMap::new() }
+    }
+}
+
+/// Settings that override the team defaults, for one skill or for one project.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SkillSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    /// Tools allowed without asking (`claude --allowedTools`), e.g. `["Bash(cargo test:*)"]`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed_tools: Option<Vec<String>>,
+    /// Tools the session may not use (`claude --disallowedTools`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disallowed_tools: Option<Vec<String>>,
+}
+
+impl SkillSettings {
+    /// Fills what `self` leaves unset from `other`.
+    fn or(self, other: &SkillSettings) -> SkillSettings {
+        SkillSettings {
+            model: self.model.or_else(|| other.model.clone()),
+            effort: self.effort.or_else(|| other.effort.clone()),
+            permission_mode: self.permission_mode.or_else(|| other.permission_mode.clone()),
+            allowed_tools: self.allowed_tools.or_else(|| other.allowed_tools.clone()),
+            disallowed_tools: self.disallowed_tools.or_else(|| other.disallowed_tools.clone()),
+        }
+    }
+}
+
+/// `.team/config.toml` in a project: the same `[team]` table as the user config, applied on top.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct ProjectConfig {
+    team: ProjectTeam,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct ProjectTeam {
+    #[serde(flatten)]
+    defaults: SkillSettings,
+    skills: BTreeMap<String, SkillSettings>,
+}
+
+/// What a team session with one skill is started with.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSettings {
+    pub model: String,
+    pub effort: String,
+    pub permission_mode: String,
+    pub allowed_tools: Vec<String>,
+    pub disallowed_tools: Vec<String>,
+}
+
+/// The project config file that applies to `folder`: the nearest `.team/config.toml` above it.
+/// Found from a coder's worktree too, since worktrees live in `.team/worktrees/`.
+pub fn project_config_path(folder: &Path) -> Option<PathBuf> {
+    folder.ancestors().map(|d| d.join(".team").join("config.toml")).find(|p| p.is_file())
+}
+
+impl Team {
+    /// Settings for `skill` in `folder`. The most specific wins: the project's `[team.skills.<skill>]`,
+    /// the project's `[team]`, the user's `[team.skills.<skill>]`, then the user's `[team]`.
+    pub fn for_skill(&self, skill: &str, folder: &Path) -> SessionSettings {
+        let project = project_config_path(folder)
+            .and_then(|path| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                toml::from_str::<ProjectConfig>(&text)
+                    .map_err(|e| eprintln!("jg-team-dev: ignoring invalid {}: {e}", path.display()))
+                    .ok()
+            })
+            .unwrap_or_default();
+        self.resolve(skill, &project.team)
+    }
+
+    fn resolve(&self, skill: &str, project: &ProjectTeam) -> SessionSettings {
+        let none = SkillSettings::default();
+        let merged = project
+            .skills
+            .get(skill)
+            .cloned()
+            .unwrap_or_default()
+            .or(&project.defaults)
+            .or(self.skills.get(skill).unwrap_or(&none));
+        SessionSettings {
+            model: merged.model.unwrap_or_else(|| self.model.clone()),
+            effort: merged.effort.unwrap_or_else(|| self.effort.clone()),
+            permission_mode: merged.permission_mode.unwrap_or_else(|| self.permission_mode.clone()),
+            allowed_tools: merged.allowed_tools.unwrap_or_default(),
+            disallowed_tools: merged.disallowed_tools.unwrap_or_default(),
+        }
     }
 }
 
@@ -138,5 +240,54 @@ impl Config {
         }
         let text = toml::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_most_specific_setting_wins() {
+        let user: Config = toml::from_str(
+            r#"
+            [team]
+            model = "opus"
+            [team.skills.coder]
+            model = "sonnet"
+            effort = "high"
+            [team.skills.tester]
+            allowed_tools = ["Bash(cargo test:*)"]
+            "#,
+        )
+        .unwrap();
+        let project: ProjectConfig = toml::from_str(
+            r#"
+            [team]
+            effort = "low"
+            [team.skills.coder]
+            model = "haiku"
+            "#,
+        )
+        .unwrap();
+        let coder = user.team.resolve("coder", &project.team);
+        assert_eq!((coder.model.as_str(), coder.effort.as_str()), ("haiku", "low"));
+        let tester = user.team.resolve("tester", &ProjectTeam::default());
+        assert_eq!((tester.model.as_str(), tester.effort.as_str()), ("opus", "medium"));
+        assert_eq!(tester.allowed_tools, ["Bash(cargo test:*)"]);
+        assert_eq!(tester.permission_mode, "auto");
+    }
+
+    #[test]
+    fn the_project_file_is_found_from_a_worktree() {
+        let root = std::env::temp_dir().join(format!("jgt-cfg-{}", std::process::id()));
+        let wt = root.join(".team/worktrees/fix");
+        std::fs::create_dir_all(&wt).unwrap();
+        assert_eq!(project_config_path(&wt), None);
+        std::fs::write(root.join(".team/config.toml"), "[team.skills.coder]\nmodel = \"sonnet\"\n").unwrap();
+        assert_eq!(project_config_path(&wt), Some(root.join(".team/config.toml")));
+        assert_eq!(Config::default().team.for_skill("coder", &wt).model, "sonnet");
+        assert_eq!(Config::default().team.for_skill("planner", &wt).model, "opus");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

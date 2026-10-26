@@ -162,8 +162,8 @@ impl Hook {
                     && let Ok(exe) = std::env::current_exe()
                 {
                     note.push_str(&format!(
-                        " You are the Coordinator: run `jg-team-dev worker`, `jg-team-dev workers` and \
-                         `jg-team-dev reset` as `{}`.",
+                        " You are the Coordinator: run `jg-team-dev worker`, `jg-team-dev workers`, \
+                         `jg-team-dev run` and `jg-team-dev reset` as `{}`.",
                         exe.canonicalize().unwrap_or(exe).display()
                     ));
                 }

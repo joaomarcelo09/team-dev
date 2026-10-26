@@ -4,6 +4,7 @@
 mod commands;
 mod hooks;
 mod mcp;
+mod runs;
 mod settings;
 mod team;
 mod workers;
@@ -32,6 +33,9 @@ enum Command {
         #[arg(long)]
         parent: Option<String>,
     },
+    /// Run records under .team/runs/: open one per request, close it with a final report.
+    #[command(subcommand)]
+    Run(runs::RunCommand),
     /// Runs a worker and relays its result (started by `worker`).
     #[command(hide = true)]
     WorkerRun(workers::WorkerRunArgs),
@@ -110,6 +114,7 @@ async fn main() {
         Command::Worker(args) => workers::start(args).await,
         Command::Workers { parent } => workers::list(parent).await,
         Command::WorkerRun(args) => workers::run(args).await,
+        Command::Run(cmd) => runs::command(cmd).await,
         Command::Reset { summary } => team::reset(summary).await,
         Command::Settings { mcp } => settings::print(mcp),
         Command::Status => commands::status().await,

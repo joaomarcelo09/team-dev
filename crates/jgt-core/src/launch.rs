@@ -62,7 +62,8 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
             agent_args.extend(["-p".into(), "--resume".into(), ext]);
             agent_args.push(prompt.unwrap_or_else(|| DEFAULT_PROMPT.into()));
             agent_args.extend(["--output-format".into(), "json".into()]);
-            agent_args.extend(crate::team::session_args(&crate::team::files_dir(), &title, config));
+            let settings = config.team.for_skill(&role, cwd.as_deref().unwrap_or(Path::new(".")));
+            agent_args.extend(crate::team::session_args(&crate::team::files_dir(), &title, &settings));
             let mut env = vec![(crate::team::ROLE_ENV.into(), role)];
             if let Some(parent) = &session.parent_id {
                 env.push((crate::team::PARENT_ENV.into(), parent.clone()));

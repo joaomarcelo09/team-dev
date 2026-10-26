@@ -282,7 +282,9 @@ fn schema_1_databases_are_upgraded() {
     let _ = std::fs::remove_file(&path);
     {
         let conn = rusqlite::Connection::open(&path).unwrap();
-        let v1 = crate::db::SCHEMA.replace("    role            TEXT,\n", "").replace("    parent_id       TEXT,\n", "");
+        let v1 = crate::db::SCHEMA.replace("    role            TEXT,\n", "").replace("    parent_id       TEXT,\n", "")
+            .replace("    cost_usd        REAL,\n", "")
+            .replace("    run_secs        INTEGER,\n", "");
         conn.execute_batch(&v1).unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
         conn.execute(
@@ -300,7 +302,8 @@ fn schema_1_databases_are_upgraded() {
         .unwrap()
         .pragma_query_value(None, "user_version", |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
+    assert_eq!((session.cost_usd, session.run_secs), (None, None));
     drop(db);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -365,4 +368,17 @@ fn a_reset_retires_the_old_coordinator() {
     let other = register(&hub, Harness::ClaudeCode, "plain", None);
     let ended = hub.end(&other.id, &EndRequest { reason: "transcript deleted".into(), gone: true }).unwrap();
     assert!(!ended.is_retired());
+}
+
+#[test]
+fn a_finished_run_records_cost_and_duration() {
+    let hub = hub();
+    let worker = register(&hub, Harness::ClaudeCode, "w", None);
+    let patched = hub
+        .patch(&worker.id, &PatchSessionRequest { run_secs: Some(95), cost_usd: Some(0.42), ..Default::default() }, false)
+        .unwrap();
+    assert_eq!((patched.cost_usd, patched.run_secs), (Some(0.42), Some(95)));
+    // Other patches leave them alone.
+    let patched = hub.patch(&worker.id, &PatchSessionRequest { archived: Some(true), ..Default::default() }, false).unwrap();
+    assert_eq!((patched.cost_usd, patched.run_secs, patched.archived), (Some(0.42), Some(95), true));
 }

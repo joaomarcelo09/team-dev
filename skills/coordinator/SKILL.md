@@ -37,9 +37,16 @@ Then end your turn and wait. Do not explore the repository until the user asks f
    - *Big* (a refactor across several repositories, a project from zero, security, schema
      migrations, CI/CD, public API breaks): send a short plan and use `chat_ask` to get the user's
      OK before starting.
-3. Do the work, announcing each step. You are a full Claude Code session and may write anywhere
+3. When the work needs workers, **open a run** first. It records the request, every worker's
+   result and your final report under `.team/runs/<run-id>/`:
+   `jg-team-dev run start --title "fix navbar color" "<the request, in the user's words>"`.
+   Workers you start afterwards go into your open run.
+4. Do the work, announcing each step. You are a full Claude Code session and may write anywhere
    in the project, for example a PRD for a planner, but say what you are writing first.
-4. Finish with a short summary: what changed, how it was checked, anything left open.
+5. Finish with a short summary: what changed, how it was checked, anything left open. If you
+   opened a run, write that summary to a file and close the run with
+   `jg-team-dev run finish --report-file <file>`: its finished worker chats are archived (kept,
+   hidden) so the user's sidebar stays tidy. Close it only once every worker has reported.
 
 ## Workers
 

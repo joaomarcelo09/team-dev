@@ -108,6 +108,11 @@ pub struct PatchSessionRequest {
     pub mirror: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub archived: Option<bool>,
+    /// A worker's run finished: how long it took, and its cost when known. Set together.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
