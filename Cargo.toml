@@ -37,4 +37,6 @@ rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 schemars = "1"
 iced = { version = "0.14", features = ["tokio", "markdown", "advanced"] }
 chrono = "0.4"
+# Native folder picker through the desktop portal (no GTK).
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 libc = "0.2"

@@ -12,6 +12,10 @@ pub mod team;
 pub use client::{ClientError, HubClient};
 pub use model::*;
 
+/// The name people see: launcher, window title, tray and notifications. Commands, files and
+/// ids keep `jg-team-dev`.
+pub const APP_NAME: &str = "JG Team Dev";
+
 /// Milliseconds since the Unix epoch.
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()

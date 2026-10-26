@@ -194,12 +194,12 @@ fn settings(app: &App) -> Element<'_, Msg> {
 fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
     let (conn_color, conn_label) = match &app.conn {
-        Conn::Connected => (p.success.base.color, "Connected to the jg-team-dev hub".to_string()),
+        Conn::Connected => (p.success.base.color, "Connected to the JG Team Dev hub".to_string()),
         Conn::Connecting => (p.warning.base.color, "Connecting to the hub…".to_string()),
         Conn::Offline(e) => (p.danger.base.color, format!("Hub not running: {e}")),
     };
     let header = row![
-        text("jg-team-dev").size(style::fs(17)).font(bold()),
+        text(jgt_core::APP_NAME).size(style::fs(17)).font(bold()),
         tooltip(
             dot(conn_color, 8.0),
             container(text(conn_label).size(style::fs(12))).padding([6, 10]).style(container::rounded_box),
@@ -301,14 +301,37 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
                 .style(style::ghost)
                 .padding([6, 10])
                 .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamCancel));
-            container(
-                column![
-                    muted("New team session: the Coordinator works in this folder").size(style::fs(11)),
-                    input,
-                    row![space::horizontal(), cancel, start].spacing(6),
-                ]
-                .spacing(6),
-            )
+            let browse = button(text("Choose folder…").size(style::fs(12)))
+                .style(style::pill_button)
+                .padding([6, 10])
+                .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamBrowse));
+            let mut form = column![
+                muted("New team session: the Coordinator works in this folder").size(style::fs(11)),
+                input,
+                row![browse, space::horizontal(), cancel, start].spacing(6),
+            ]
+            .spacing(6);
+            let recent = app.recent_folders();
+            if !recent.is_empty() {
+                form = form.push(muted("Recent").size(style::fs(11)).font(bold()));
+                let home = jgt_core::paths::home_dir().display().to_string();
+                for folder in recent {
+                    // `~/font/app` reads better than the full path in a narrow sidebar.
+                    let label = match folder.strip_prefix(&home) {
+                        Some(rest) => format!("~{rest}"),
+                        None => folder.to_string(),
+                    };
+                    let picked = folder == folder_value(app);
+                    form = form.push(
+                        button(text(label).size(style::fs(12)).wrapping(text::Wrapping::None))
+                            .on_press_maybe((!app.starting_team).then(|| Msg::NewTeamInput(folder.to_string())))
+                            .style(style::session_item(picked))
+                            .width(Fill)
+                            .padding([4, 8]),
+                    );
+                }
+            }
+            container(form)
             .padding([0, 12])
             .into()
         }
@@ -337,6 +360,11 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     .height(Fill)
     .style(style::sidebar)
     .into()
+}
+
+/// The folder typed or picked in the New team form.
+fn folder_value(app: &App) -> &str {
+    app.new_team.as_deref().unwrap_or("").trim_end_matches('/')
 }
 
 fn session_item<'a>(s: &'a Session, selected: bool, theme: &Theme) -> Element<'a, Msg> {
@@ -421,7 +449,7 @@ fn welcome(app: &App) -> Element<'_, Msg> {
     .spacing(6);
     container(
         column![
-            text("jg-team-dev").size(style::fs(34)).font(bold()),
+            text(jgt_core::APP_NAME).size(style::fs(34)).font(bold()),
             muted("Talk to a Coordinator; it runs your AI dev team.").size(style::fs(16)),
             Space::new().height(12),
             steps,
@@ -485,7 +513,7 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
     );
     let mirror = tip(
         toggler(s.mirror).label("All replies").text_size(style::fs(13)).size(16).on_toggle(Msg::SetMirror),
-        "Show every final reply here, not only replies to messages you sent from jg-team-dev",
+        "Show every final reply here, not only replies to messages you sent from JG Team Dev",
     );
     let archive = button(text(if s.archived { "Unarchive" } else { "Archive" }).size(style::fs(13)))
         .on_press(Msg::SetArchived(!s.archived))
@@ -609,7 +637,7 @@ fn status_banner<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Elem
                             .on_press_maybe(enabled.then_some(Msg::Reconnect(ReconnectMode::Background)))
                             .style(style::primary_button)
                             .padding([6, 12]),
-                        "Resume the session in the background; it stays reachable from jg-team-dev",
+                        "Resume the session in the background; it stays reachable from JG Team Dev",
                     ),
                     tip(
                         button(text("Open in terminal").size(style::fs(13)))

@@ -18,3 +18,4 @@ tokio.workspace = true
 futures.workspace = true
 iced.workspace = true
 chrono.workspace = true
+rfd.workspace = true

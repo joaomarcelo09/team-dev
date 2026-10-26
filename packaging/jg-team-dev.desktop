@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=jg-team-dev
+Name=JG Team Dev
 GenericName=AI Team Chat
 Comment=Chat with a Coordinator that runs your AI dev team
 Exec=jg-team-dev-desktop

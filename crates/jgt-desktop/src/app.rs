@@ -128,6 +128,8 @@ pub enum Msg {
     Reconnected(Result<String, String>),
     NewTeamOpen,
     NewTeamInput(String),
+    NewTeamBrowse,
+    NewTeamPicked(Option<String>),
     NewTeamStart,
     NewTeamCancel,
     TeamStarted(Result<String, String>),
@@ -201,7 +203,7 @@ impl App {
 
     pub fn title(&self) -> String {
         let unread: i64 = self.sessions.iter().filter(|s| !s.archived).map(|s| s.unread).sum();
-        if unread > 0 { format!("({unread}) jg-team-dev") } else { "jg-team-dev".into() }
+        if unread > 0 { format!("({unread}) {}", jgt_core::APP_NAME) } else { jgt_core::APP_NAME.into() }
     }
 
     pub fn theme(&self) -> Theme {
@@ -229,6 +231,20 @@ impl App {
 
     pub fn scale_factor(&self) -> f32 {
         self.zoom
+    }
+
+    /// Folders that had a Coordinator, newest first: quick picks for New team.
+    pub fn recent_folders(&self) -> Vec<&str> {
+        let mut coordinators: Vec<&Session> = self.sessions.iter().filter(|s| s.is_coordinator()).collect();
+        coordinators.sort_by_key(|s| std::cmp::Reverse(s.last_message_at.unwrap_or(s.updated_at)));
+        let mut folders: Vec<&str> = Vec::new();
+        for cwd in coordinators.iter().filter_map(|s| s.cwd.as_deref()) {
+            if !folders.contains(&cwd) && std::path::Path::new(cwd).is_dir() {
+                folders.push(cwd);
+            }
+        }
+        folders.truncate(5);
+        folders
     }
 
     pub fn selected_session(&self) -> Option<&Session> {
@@ -444,6 +460,31 @@ impl App {
             }
             Msg::NewTeamInput(folder) => {
                 self.new_team = Some(folder);
+                Task::none()
+            }
+            Msg::NewTeamBrowse => {
+                let start = self
+                    .new_team
+                    .as_deref()
+                    .map(std::path::PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .unwrap_or_else(jgt_core::paths::home_dir);
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Project folder for the new team")
+                            .set_directory(start)
+                            .pick_folder()
+                            .await
+                            .map(|f| f.path().display().to_string())
+                    },
+                    Msg::NewTeamPicked,
+                )
+            }
+            Msg::NewTeamPicked(folder) => {
+                if let Some(folder) = folder {
+                    self.new_team = Some(folder);
+                }
                 Task::none()
             }
             Msg::NewTeamCancel => {

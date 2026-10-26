@@ -69,7 +69,7 @@ fn show(hub: SharedHub, job: Job) {
     let body = truncate(&message.body, 300);
 
     let mut n = Notification::new();
-    n.appname("jg-team-dev")
+    n.appname(jgt_core::APP_NAME)
         .summary(&summary)
         .body(&body)
         .icon("jg-team-dev")

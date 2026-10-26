@@ -42,7 +42,7 @@ impl Tray for JgtTray {
     }
 
     fn title(&self) -> String {
-        "jg-team-dev".into()
+        jgt_core::APP_NAME.into()
     }
 
     fn category(&self) -> ksni::Category {
@@ -61,7 +61,7 @@ impl Tray for JgtTray {
                 format!("{n} unread · {}", chats.join(", "))
             }
         };
-        ToolTip { title: "jg-team-dev".into(), description, ..Default::default() }
+        ToolTip { title: jgt_core::APP_NAME.into(), description, ..Default::default() }
     }
 
     fn activate(&mut self, _x: i32, _y: i32) {
@@ -72,7 +72,7 @@ impl Tray for JgtTray {
     fn menu(&self) -> Vec<MenuItem<Self>> {
         let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
-                label: "Open jg-team-dev".into(),
+                label: format!("Open {}", jgt_core::APP_NAME),
                 icon_name: "jg-team-dev".into(),
                 activate: Box::new(|this: &mut Self| notifier::open_app(&this.hub, None)),
                 ..Default::default()
