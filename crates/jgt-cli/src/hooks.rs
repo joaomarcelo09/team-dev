@@ -134,6 +134,7 @@ impl Hook {
         );
         match self.client.get::<Session>(&path).await {
             Ok(s) if s.status.is_connected() => Ok(s),
+            Ok(s) if s.is_retired() => anyhow::bail!("this Coordinator was replaced by `jg-team-dev reset`"),
             Ok(_) => self.register(None).await,
             Err(e) if e.is_not_found() => self.register(None).await,
             Err(e) => Err(e.into()),
@@ -161,7 +162,8 @@ impl Hook {
                     && let Ok(exe) = std::env::current_exe()
                 {
                     note.push_str(&format!(
-                        " You are the Coordinator: run `jg-team-dev worker` and `jg-team-dev workers` as `{}`.",
+                        " You are the Coordinator: run `jg-team-dev worker`, `jg-team-dev workers` and \
+                         `jg-team-dev reset` as `{}`.",
                         exe.canonicalize().unwrap_or(exe).display()
                     ));
                 }

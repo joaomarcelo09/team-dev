@@ -136,6 +136,13 @@ pub fn spawn(plan: &LaunchPlan) -> Result<String, String> {
         let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
         if out.status.success() {
             Ok(text.trim().to_string())
+        } else if text.contains("unknown option") {
+            Err(format!(
+                "{} is too old for jg-team-dev ({}). Update Claude Code, or point [commands] claude in \
+                 ~/.config/jg-team-dev/config.toml at a newer install.",
+                plan.program.display(),
+                text.trim()
+            ))
         } else {
             Err(format!("{} exited with {}: {}", plan.program.display(), out.status, text.trim()))
         }
@@ -211,21 +218,29 @@ fn detect_terminal(cwd: &str) -> Option<Vec<String>> {
 }
 
 /// Finds an agent program: the configured path, then PATH, then common install folders.
+/// Finds an agent program: the configured path, then the user's own installs, then PATH.
+///
+/// User installs come before PATH because apps started from a desktop launcher get a short
+/// PATH, where an older system package (e.g. `/usr/bin/claude` from a distribution package)
+/// can shadow the up-to-date native install in `~/.local/bin`.
 pub fn find_program(name: &str, configured: Option<&str>) -> Result<PathBuf, String> {
+    find_program_in(&crate::paths::home_dir(), name, configured)
+}
+
+fn find_program_in(home: &Path, name: &str, configured: Option<&str>) -> Result<PathBuf, String> {
     if let Some(path) = configured.map(PathBuf::from).filter(|p| p.is_file()) {
         return Ok(path);
     }
-    if let Some(path) = which(name) {
-        return Ok(path);
-    }
-    let home = crate::paths::home_dir();
-    for dir in [".local/bin", ".bun/bin", ".opencode/bin", ".npm-global/bin", ".cargo/bin"] {
+    for dir in [".local/bin", ".claude/local", ".bun/bin", ".opencode/bin", ".npm-global/bin", ".cargo/bin"] {
         let path = home.join(dir).join(name);
         if path.is_file() {
             return Ok(path);
         }
     }
-    Err(format!("`{name}` not found; run `jg-team-dev connect` again from a terminal where `{name}` works"))
+    if let Some(path) = which(name) {
+        return Ok(path);
+    }
+    Err(format!("`{name}` not found; set its path under [commands] in ~/.config/jg-team-dev/config.toml"))
 }
 
 pub fn which(name: &str) -> Option<PathBuf> {
@@ -258,4 +273,27 @@ pub async fn reconnect(client: &crate::HubClient, session: &Session, mode: Recon
     let shown = plan.display();
     let output = tokio::task::spawn_blocking(move || spawn(&plan)).await.map_err(|e| e.to_string())??;
     Ok(if output.is_empty() { shown } else { format!("{shown}\n{output}") })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_installs_win_over_path() {
+        let home = std::env::temp_dir().join(format!("jgt-find-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join(".local/bin")).unwrap();
+        // `sh` is on PATH everywhere; a user install of the same name must be preferred.
+        let mine = home.join(".local/bin/sh");
+        std::fs::write(&mine, "").unwrap();
+        assert_eq!(find_program_in(&home, "sh", None).unwrap(), mine);
+        // An explicit path in the config wins over everything.
+        assert_eq!(find_program_in(&home, "sh", Some("/bin/sh")).unwrap(), PathBuf::from("/bin/sh"));
+        // Without a user install, PATH is used.
+        std::fs::remove_file(&mine).unwrap();
+        assert_ne!(find_program_in(&home, "sh", None).unwrap(), mine);
+        assert!(find_program_in(&home, "no-such-program-jgt", None).is_err());
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }

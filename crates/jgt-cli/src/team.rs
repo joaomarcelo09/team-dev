@@ -4,15 +4,18 @@
 use crate::settings;
 use anyhow::{Context, Result, bail};
 use jgt_core::{
-    COORDINATOR, HubClient, ReconnectMode, Session, SessionStatus,
-    api::{HealthResponse, SessionsResponse},
+    COORDINATOR, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, procs, short_id,
+    api::{EndRequest, HealthResponse, PatchSessionRequest, SessionsResponse},
     config::Config,
     launch::{self, LaunchPlan},
     paths,
     team::{self, PLUGIN_NAME, ROLE_ENV},
 };
 use serde_json::{Value, json};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 /// Skills bundled into the binary and written to the plugin folder at start.
 const SKILLS: &[(&str, &str)] = &[
@@ -89,9 +92,14 @@ pub fn trust(claude_json: &Path, folder: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// The `claude --bg` command that starts a Coordinator in `folder`.
-pub fn coordinator_plan(claude: PathBuf, folder: &Path, files: &Path, config: &Config) -> LaunchPlan {
-    let mut args = vec!["--bg".to_string(), format!("/{PLUGIN_NAME}:{COORDINATOR}")];
+/// The `claude --bg` command that starts a Coordinator in `folder`. `handover` follows the skill
+/// in the first prompt when a fresh Coordinator replaces one that reset.
+pub fn coordinator_plan(claude: PathBuf, folder: &Path, files: &Path, config: &Config, handover: Option<&str>) -> LaunchPlan {
+    let prompt = match handover {
+        Some(text) => format!("/{PLUGIN_NAME}:{COORDINATOR} {text}"),
+        None => format!("/{PLUGIN_NAME}:{COORDINATOR}"),
+    };
+    let mut args = vec!["--bg".to_string(), prompt];
     args.extend(team::coordinator_args(files, folder, config));
     LaunchPlan {
         path_prepend: claude.parent().map(Path::to_path_buf),
@@ -144,9 +152,80 @@ pub async fn start(folder: Option<PathBuf>) -> Result<()> {
 
     let config = Config::load();
     let claude = launch::find_program("claude", config.commands.claude.as_deref()).map_err(anyhow::Error::msg)?;
-    let plan = coordinator_plan(claude, &folder, &files, &config);
+    let plan = coordinator_plan(claude, &folder, &files, &config, None);
     let output = tokio::task::spawn_blocking(move || launch::spawn(&plan)).await?.map_err(anyhow::Error::msg)?;
     println!("Started the Coordinator for {}: {output}", folder.display());
+    Ok(())
+}
+
+/// The first prompt's tail for a Coordinator that takes over after a reset.
+pub fn handover_note(summary: Option<&Path>) -> String {
+    let summary = summary.map(|p| format!(" Its summary of the last topic is `{}`.", p.display())).unwrap_or_default();
+    format!(
+        "You take over from the previous Coordinator of this folder, which reset after a topic change.{summary} \
+         Earlier task summaries are in `.team/tasks/`. Greet the user as the fresh Coordinator and say in one line \
+         which summary you can pick up from."
+    )
+}
+
+/// `jg-team-dev reset` (run by a Coordinator): a fresh Coordinator takes over the folder; this one
+/// is retired (its chat archived and read-only) and its process stops shortly after.
+pub async fn reset(summary: Option<PathBuf>) -> Result<()> {
+    let client = HubClient::default();
+    let pid = procs::harness_pid().context("run `jg-team-dev reset` from the Coordinator's session")?;
+    let old: Session = client
+        .get(&format!("/v1/resolve?pid={pid}"))
+        .await
+        .context("this Claude Code session is not a jg-team-dev Coordinator")?;
+    if !old.is_coordinator() {
+        bail!("only a Coordinator can reset");
+    }
+    let folder = PathBuf::from(old.cwd.clone().context("the Coordinator has no folder")?);
+    let summary = match summary {
+        Some(p) => {
+            let p = if p.is_absolute() { p } else { folder.join(p) };
+            if !p.is_file() {
+                bail!("summary {} does not exist; write it first", p.display());
+            }
+            Some(p.strip_prefix(&folder).map(Path::to_path_buf).unwrap_or(p))
+        }
+        None => None,
+    };
+
+    // Start the fresh Coordinator first: if that fails, the current one stays in charge.
+    let files = prepare_files()?;
+    let config = Config::load();
+    let claude = launch::find_program("claude", config.commands.claude.as_deref()).map_err(anyhow::Error::msg)?;
+    let plan = coordinator_plan(claude.clone(), &folder, &files, &config, Some(&handover_note(summary.as_deref())));
+    let output = tokio::task::spawn_blocking(move || launch::spawn(&plan)).await?.map_err(anyhow::Error::msg)?;
+
+    let _: Session = client
+        .post(
+            &format!("/v1/sessions/{}/end", old.id),
+            &EndRequest { reason: format!("{RETIRED}: a fresh Coordinator took over"), gone: true },
+        )
+        .await?;
+    let _: Session = client
+        .patch(&format!("/v1/sessions/{}", old.id), &PatchSessionRequest { archived: Some(true), ..Default::default() })
+        .await?;
+    // Stop this session once it has finished its turn, and drop Claude Code's record of it:
+    // a retired Coordinator is never woken again.
+    let mut stop = Command::new("sh");
+    stop.args(["-c", "sleep 15; \"$0\" stop \"$1\"; sleep 3; exec \"$0\" rm \"$1\""])
+        .arg(&claude)
+        .arg(short_id(&old.external_id))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    std::os::unix::process::CommandExt::process_group(&mut stop, 0);
+    stop.spawn()?;
+
+    println!(
+        "A fresh Coordinator is starting for {} ({}). This session is retired and stops in about 15 seconds: \
+         end your turn now without further messages; the new Coordinator greets the user.",
+        folder.display(),
+        output.lines().next().unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -198,9 +277,20 @@ mod tests {
     }
 
     #[test]
+    fn handover_points_at_the_summary() {
+        let note = handover_note(Some(Path::new(".team/tasks/task-1-css.md")));
+        assert!(note.contains("`.team/tasks/task-1-css.md`"));
+        assert!(note.contains("Earlier task summaries are in `.team/tasks/`"));
+        let config = Config::default();
+        let plan = coordinator_plan(PathBuf::from("claude"), Path::new("/w"), Path::new("/d"), &config, Some("Hi."));
+        assert_eq!(plan.args[1], "/jg-team-dev:coordinator Hi.");
+    }
+
+    #[test]
     fn coordinator_plan_isolates_the_session() {
         let config = Config::default();
-        let plan = coordinator_plan(PathBuf::from("/usr/bin/claude"), Path::new("/work/app"), Path::new("/data/claude"), &config);
+        let plan =
+            coordinator_plan(PathBuf::from("/usr/bin/claude"), Path::new("/work/app"), Path::new("/data/claude"), &config, None);
         let args = plan.args.join(" ");
         assert!(args.starts_with("--bg /jg-team-dev:coordinator "));
         assert!(args.contains("--model opus --effort medium --permission-mode auto"));

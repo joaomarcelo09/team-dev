@@ -7,6 +7,7 @@ mod mcp;
 mod settings;
 mod team;
 mod workers;
+mod worktree;
 
 use clap::{Parser, Subcommand};
 use jgt_core::Harness;
@@ -34,6 +35,13 @@ enum Command {
     /// Runs a worker and relays its result (started by `worker`).
     #[command(hide = true)]
     WorkerRun(workers::WorkerRunArgs),
+    /// Hand the Coordinator's folder to a fresh Coordinator (run by the Coordinator after the user
+    /// agreed); this one is retired.
+    Reset {
+        /// The task summary the fresh Coordinator should pick up from (under .team/tasks/).
+        #[arg(long)]
+        summary: Option<std::path::PathBuf>,
+    },
     /// Print the Claude Code settings (hooks) that jg-team-dev sessions load with `--settings`.
     Settings {
         /// Print the MCP config for `--mcp-config` instead.
@@ -102,6 +110,7 @@ async fn main() {
         Command::Worker(args) => workers::start(args).await,
         Command::Workers { parent } => workers::list(parent).await,
         Command::WorkerRun(args) => workers::run(args).await,
+        Command::Reset { summary } => team::reset(summary).await,
         Command::Settings { mcp } => settings::print(mcp),
         Command::Status => commands::status().await,
         Command::Sessions { all } => commands::sessions(all).await,

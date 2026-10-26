@@ -186,9 +186,18 @@ pub struct Session {
 /// Role of the session that talks to the user and runs the team.
 pub const COORDINATOR: &str = "coordinator";
 
+/// `ended_reason` prefix of a Coordinator replaced by `jg-team-dev reset`. Its process may still
+/// run for a moment; hooks must not register it again.
+pub const RETIRED: &str = "retired";
+
 impl Session {
     pub fn is_coordinator(&self) -> bool {
         self.role.as_deref() == Some(COORDINATOR)
+    }
+
+    /// A Coordinator that handed over to a fresh one with `jg-team-dev reset`.
+    pub fn is_retired(&self) -> bool {
+        self.status == SessionStatus::Ended && self.ended_reason.as_deref().is_some_and(|r| r.starts_with(RETIRED))
     }
 
     /// A session started by a Coordinator with one skill.

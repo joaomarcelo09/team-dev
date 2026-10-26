@@ -31,7 +31,14 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   messaging a finished worker resumes it for one reply, and the Coordinator gets a summary.
   `jg-team-dev workers` lists them (the Coordinator keeps at most 3 running).
 
-Next is Phase 3: git worktrees per coder, `jg-team-dev reset` with task summaries.
+- **Phase 3** (git and memory): coders work in `.team/worktrees/<name>` on branch `jgt/<name>`
+  (`jg-team-dev worker coder --worktree <name>`; reviewers and testers can point at the same
+  worktree). In a git repository a coder without a worktree is refused unless the Coordinator
+  passes `--main-worktree` after warning you. `.team/` is kept out of `git status` through the
+  repository's local exclude file. The git-coder merges into the main worktree only after a
+  review, a test and your OK, then removes the worktree. On a topic change the Coordinator asks,
+  writes `.team/tasks/task-<date>-<slug>.md`, and runs `jg-team-dev reset --summary <file>`: a
+  fresh Coordinator takes over the folder and the old chat is archived, read-only.
 
 Team sessions use `[team]` in `config.toml`:
 
@@ -49,7 +56,7 @@ cargo build                       # jg-team-dev, jg-team-dev-hub, jg-team-dev-de
 cargo test --workspace
 ./target/debug/jg-team-dev-hub    # run the hub in the foreground (RUST_LOG=jgt_hub=debug)
 ./target/debug/jg-team-dev start ~/my-app  # start (or wake) the Coordinator for a folder
-./target/debug/jg-team-dev worker reviewer --task "review calc.py" --parent <id> "Review calc.py for bugs"
+./target/debug/jg-team-dev worker coder --task "fix average" --worktree fix-average --parent <id> "Remove the - 1"
 ./target/debug/jg-team-dev settings        # hooks for `claude --settings`
 ./target/debug/jg-team-dev settings --mcp  # MCP server for `claude --mcp-config`
 ```

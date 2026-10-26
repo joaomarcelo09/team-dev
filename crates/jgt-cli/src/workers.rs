@@ -5,7 +5,7 @@
 //! the result reaches the Coordinator even while it waits for the user in listen mode, and wakes
 //! it when it went to sleep.
 
-use crate::team::prepare_files;
+use crate::{team::prepare_files, worktree};
 use anyhow::{Context, Result, bail};
 use jgt_core::{
     Harness, HubClient, Session, SessionStatus,
@@ -36,9 +36,17 @@ pub struct WorkerArgs {
     /// Read the brief from this file (otherwise from the remaining arguments, or stdin).
     #[arg(long)]
     pub brief_file: Option<PathBuf>,
-    /// Folder the worker works in, e.g. a git worktree (default: the current folder).
+    /// Folder the worker works in (default: the current folder).
     #[arg(long)]
     pub cwd: Option<PathBuf>,
+    /// Work in the git worktree `.team/worktrees/<name>` (branch `jgt/<name>`), created from HEAD
+    /// if it does not exist. Coders need this in a git repository; reviewers and testers can
+    /// point at a coder's worktree with the same name.
+    #[arg(long, conflicts_with = "cwd")]
+    pub worktree: Option<String>,
+    /// Let a coder write the main worktree directly (only after warning the user).
+    #[arg(long, conflicts_with = "worktree")]
+    pub main_worktree: bool,
     /// Coordinator session id (default: the Coordinator running this command).
     #[arg(long)]
     pub parent: Option<String>,
@@ -121,6 +129,14 @@ pub async fn start(args: WorkerArgs) -> Result<()> {
         None => std::env::current_dir()?,
     };
     let cwd = cwd.canonicalize().with_context(|| format!("{} does not exist", cwd.display()))?;
+    let cwd = match &args.worktree {
+        Some(name) => worktree::ensure(&cwd, name)?,
+        None if args.skill == "coder" && !args.main_worktree && worktree::repo_root(&cwd).is_some() => bail!(
+            "coders work in a git worktree: pass --worktree <name>. To write the main worktree \
+             directly, warn the user first, then pass --main-worktree."
+        ),
+        None => cwd,
+    };
 
     let id = new_uuid()?;
     let briefs = paths::data_dir().join("briefs");
@@ -297,6 +313,8 @@ mod tests {
             task: "t".into(),
             brief_file: None,
             cwd: None,
+            worktree: None,
+            main_worktree: false,
             parent: None,
             brief: vec!["fix".into(), "it".into()],
         };

@@ -338,3 +338,31 @@ fn workers_link_to_their_coordinator_and_relay_results() {
     assert_eq!(taken[0].body, "Worker finished");
     assert!(hub.relay(&coordinator.id, &RelayRequest { from_session: None, text: "  ".into() }).is_err());
 }
+
+#[test]
+fn a_reset_retires_the_old_coordinator() {
+    let hub = hub();
+    let old = hub
+        .register(&RegisterRequest {
+            harness: Harness::ClaudeCode,
+            external_id: "old".into(),
+            cwd: Some("/tmp/project".into()),
+            title: None,
+            pid: None,
+            transcript_path: None,
+            source: Some("startup".into()),
+            role: Some(jgt_core::COORDINATOR.into()),
+            parent: None,
+        })
+        .unwrap();
+    assert!(!old.is_retired());
+    let retired = hub
+        .end(&old.id, &EndRequest { reason: format!("{}: a fresh Coordinator took over", jgt_core::RETIRED), gone: true })
+        .unwrap();
+    assert!(retired.is_retired());
+    assert_eq!(retired.status, SessionStatus::Ended);
+    // A plain end is not a retirement.
+    let other = register(&hub, Harness::ClaudeCode, "plain", None);
+    let ended = hub.end(&other.id, &EndRequest { reason: "transcript deleted".into(), gone: true }).unwrap();
+    assert!(!ended.is_retired());
+}

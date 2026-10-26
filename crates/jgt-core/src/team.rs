@@ -71,8 +71,23 @@ pub fn has_saved_options(external_id: &str) -> bool {
 /// Queues `text` for the session `to` (a worker reporting to its Coordinator) and wakes `to`
 /// when it is a sleeping Coordinator, so the message is read right away.
 pub async fn relay(client: &crate::HubClient, to: &str, from: Option<&str>, text: &str) -> Result<(), String> {
-    use crate::api::RelayRequest;
+    use crate::api::{RelayRequest, SessionsResponse};
 
+    // A result for a Coordinator that has since reset goes to the folder's current Coordinator.
+    let mut to = to.to_string();
+    let first: crate::Session = client.get(&format!("/v1/sessions/{to}")).await.map_err(|e| e.to_string())?;
+    if first.is_retired() {
+        let all: SessionsResponse = client.get("/v1/sessions?archived=true").await.map_err(|e| e.to_string())?;
+        if let Some(current) = all
+            .sessions
+            .into_iter()
+            .filter(|s| s.is_coordinator() && s.status != crate::SessionStatus::Ended && s.cwd == first.cwd)
+            .max_by_key(|s| s.created_at)
+        {
+            to = current.id;
+        }
+    }
+    let to = to.as_str();
     let _: crate::Message = client
         .post(
             &format!("/v1/sessions/{to}/relay"),
