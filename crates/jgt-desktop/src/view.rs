@@ -515,14 +515,26 @@ fn main<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     .into()
 }
 
+/// The number of Coordinators that are not archived and not ended.
+pub fn count_coordinators(sessions: &[Session]) -> usize {
+    sessions
+        .iter()
+        .filter(|s| s.is_coordinator() && !s.archived && s.status != SessionStatus::Ended)
+        .count()
+}
+
 fn welcome(app: &App) -> Element<'_, Msg> {
     let status = match &app.conn {
-        Conn::Connected => format!(
-            "{} session{} · {} online",
-            app.sessions.len(),
-            if app.sessions.len() == 1 { "" } else { "s" },
-            app.sessions.iter().filter(|s| s.status.is_connected()).count()
-        ),
+        Conn::Connected => {
+            let coordinators = count_coordinators(&app.sessions);
+            format!(
+                "{} session{} · {} Coordinator{}",
+                app.sessions.len(),
+                if app.sessions.len() == 1 { "" } else { "s" },
+                coordinators,
+                if coordinators == 1 { "" } else { "s" },
+            )
+        }
         Conn::Connecting => "Connecting to the hub…".into(),
         Conn::Offline(_) => "The hub is not running. Start it with: systemctl --user enable --now jg-team-dev-hub".into(),
     };
@@ -1560,5 +1572,46 @@ mod tests {
         assert_eq!(shown.len(), 1);
         assert_eq!(shown[0].id, "w1");
         assert_eq!(hidden, 2);
+    }
+
+    #[test]
+    fn count_coordinators_filters_correctly() {
+        assert_eq!(count_coordinators(&[]), 0);
+
+        let active_coord1 = test_session("c1", Some(jgt_core::COORDINATOR), None, SessionStatus::Active, false);
+        let idle_coord2 = test_session("c2", Some(jgt_core::COORDINATOR), None, SessionStatus::Idle, false);
+        let ended_coord = test_session("c3", Some(jgt_core::COORDINATOR), None, SessionStatus::Ended, false);
+        let archived_coord = test_session("c4", Some(jgt_core::COORDINATOR), None, SessionStatus::Active, true);
+        let worker_active = test_session("w1", Some("coder"), Some("c1"), SessionStatus::Active, false);
+        let worker_archived = test_session("w2", Some("tester"), Some("c1"), SessionStatus::Ended, true);
+        let no_role_session = test_session("s1", None, None, SessionStatus::Active, false);
+
+        let excluded = [
+            ended_coord.clone(),
+            archived_coord.clone(),
+            worker_active.clone(),
+            worker_archived.clone(),
+            no_role_session.clone(),
+        ];
+        assert_eq!(count_coordinators(&excluded), 0, "Archived, ended, and non-coordinator sessions are not counted");
+
+        let one_coord = [
+            active_coord1.clone(),
+            ended_coord.clone(),
+            archived_coord.clone(),
+            worker_active.clone(),
+        ];
+        assert_eq!(count_coordinators(&one_coord), 1, "Only 1 non-archived, non-ended coordinator is counted");
+
+        let two_coords = [
+            active_coord1,
+            idle_coord2,
+            ended_coord,
+            archived_coord,
+            worker_active,
+            worker_archived,
+            no_role_session,
+        ];
+        assert_eq!(count_coordinators(&two_coords), 2, "Both active and idle coordinators are counted");
     }
 }
