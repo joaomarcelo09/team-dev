@@ -39,12 +39,23 @@ pub struct Thread {
 }
 
 impl Thread {
-    fn upsert(&mut self, message: Message) {
-        self.markdown.insert(message.id, crate::view::parse_markdown(&message.body));
-        self.editors.insert(message.id, text_editor::Content::with_text(&message.body));
+    pub(crate) fn upsert(&mut self, message: Message) {
         match self.messages.binary_search_by_key(&message.id, |m| m.id) {
-            Ok(i) => self.messages[i] = message,
-            Err(i) => self.messages.insert(i, message),
+            Ok(i) => {
+                if self.messages[i].body != message.body
+                    || !self.editors.contains_key(&message.id)
+                    || !self.markdown.contains_key(&message.id)
+                {
+                    self.markdown.insert(message.id, crate::view::parse_markdown(&message.body));
+                    self.editors.insert(message.id, text_editor::Content::with_text(&message.body));
+                }
+                self.messages[i] = message;
+            }
+            Err(i) => {
+                self.markdown.insert(message.id, crate::view::parse_markdown(&message.body));
+                self.editors.insert(message.id, text_editor::Content::with_text(&message.body));
+                self.messages.insert(i, message);
+            }
         }
     }
 
@@ -354,7 +365,7 @@ impl App {
         self.sessions.iter().find(|s| s.id == id)
     }
 
-    fn toast(&mut self, text: impl Into<String>, error: bool) {
+    pub(crate) fn toast(&mut self, text: impl Into<String>, error: bool) {
         self.toast = Some(Toast { text: text.into(), error, since: Instant::now() });
     }
 
@@ -1261,6 +1272,53 @@ pub(crate) fn apply_popups(config: &mut Config, enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jgt_core::{Delivery, Direction, MessageKind};
+
+    fn test_message(id: i64, body: &str, read_at: Option<i64>) -> Message {
+        Message {
+            id,
+            session_id: "s1".to_string(),
+            direction: Direction::ToAgent,
+            kind: MessageKind::Text,
+            body: body.to_string(),
+            meta: serde_json::Value::Null,
+            delivery: Delivery::Delivered,
+            created_at: 1000,
+            delivered_at: Some(1000),
+            read_at,
+            question: None,
+        }
+    }
+
+    #[test]
+    fn thread_upsert_rebuilds_editor_only_when_body_changes() {
+        let mut thread = Thread::default();
+        let msg = test_message(1, "hello world", None);
+        thread.upsert(msg);
+
+        // Make a selection in the editor.
+        thread.editors.get_mut(&1).unwrap().perform(text_editor::Action::SelectLine);
+        assert_eq!(thread.editors.get(&1).unwrap().selection().as_deref(), Some("hello world"));
+
+        // Upsert with updated status/read_at, same body.
+        let updated_status = test_message(1, "hello world", Some(2000));
+        thread.upsert(updated_status);
+        assert_eq!(thread.messages[0].read_at, Some(2000));
+        // Selection should be preserved!
+        assert_eq!(
+            thread.editors.get(&1).unwrap().selection().as_deref(),
+            Some("hello world"),
+            "Editor must not be recreated on status update when body is unchanged"
+        );
+
+        // Upsert with new body.
+        let updated_body = test_message(1, "goodbye world", Some(3000));
+        thread.upsert(updated_body);
+        assert_eq!(thread.messages[0].body, "goodbye world");
+        // Editor was rebuilt, so old selection is gone and new text is present.
+        assert_eq!(thread.editors.get(&1).unwrap().text().trim(), "goodbye world");
+        assert_eq!(thread.editors.get(&1).unwrap().selection(), None);
+    }
 
     #[test]
     fn applying_popups_toggle_updates_config() {

@@ -83,32 +83,37 @@ pub(crate) fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: &'a str) -> E
 pub fn view(app: &App) -> Element<'_, Msg> {
     let theme = app.theme();
     let body = row![sidebar(app, &theme), rule::vertical(1).style(rule::weak), main(app, &theme)];
-    let base: Element<'_, Msg> = if app.show_settings {
-        stack![container(body).width(Fill).height(Fill), settings(app)].into()
-    } else {
-        container(body).width(Fill).height(Fill).into()
-    };
+    let mut root = stack![container(body).width(Fill).height(Fill)];
 
-    match &app.toast {
-        Some(toast) => {
-            let p = theme.extended_palette();
-            let accent = if toast.error { p.danger.base.color } else { p.success.base.color };
-            let card = container(
-                row![
-                    text(toast.text.clone()).size(style::fs(13)),
-                    button(text("x").size(style::fs(13))).on_press(Msg::DismissToast).style(style::ghost).padding([0, 6])
-                ]
-                .spacing(10)
-                .align_y(Alignment::Center),
-            )
-            .padding([10, 14])
-            .max_width(460)
-            .style(style::banner(accent));
-            stack![base, container(card).padding(18).width(Fill).height(Fill).align_right(Fill).align_bottom(Fill)]
-                .into()
-        }
-        None => base,
+    if app.show_settings {
+        root = root.push(settings(app));
     }
+
+    if let Some(toast) = &app.toast {
+        let p = theme.extended_palette();
+        let accent = if toast.error { p.danger.base.color } else { p.success.base.color };
+        let card = container(
+            row![
+                text(toast.text.clone()).size(style::fs(13)),
+                button(text("x").size(style::fs(13))).on_press(Msg::DismissToast).style(style::ghost).padding([0, 6])
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 14])
+        .max_width(460)
+        .style(style::banner(accent));
+        root = root.push(
+            container(card)
+                .padding(18)
+                .width(Fill)
+                .height(Fill)
+                .align_right(Fill)
+                .align_bottom(Fill),
+        );
+    }
+
+    root.into()
 }
 
 // ── settings ────────────────────────────────────────────────────────────────
@@ -817,11 +822,18 @@ pub fn normalize_indented_code_blocks(body: &str) -> String {
     let mut in_indented = false;
     let mut block_start = 0;
     let mut block_text = String::new();
+    let mut container_depth: usize = 0;
 
     let parser = Parser::new(body).into_offset_iter();
     for (event, range) in parser {
         match event {
-            Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => {
+            Event::Start(Tag::BlockQuote(_) | Tag::List(_) | Tag::Item) => {
+                container_depth += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_) | TagEnd::List(_) | TagEnd::Item) => {
+                container_depth = container_depth.saturating_sub(1);
+            }
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) if container_depth == 0 => {
                 in_indented = true;
                 block_start = range.start;
                 block_text.clear();
@@ -1247,5 +1259,42 @@ mod tests {
     fn handles_empty_message() {
         let blocks = extract_code_blocks("");
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn preserves_indented_blocks_inside_quote_and_list() {
+        let md = "> Quote line 1\n>\n>     let a = 1;\n>\n> Quote line 2\n\n- Item 1\n\n      let b = 2;\n\n- Item 2";
+        let normalized = normalize_indented_code_blocks(md);
+        assert!(!normalized.contains("\n```\nlet a = 1;\n```\n"));
+        assert!(!normalized.contains("\n```\nlet b = 2;\n```\n"));
+
+        let items = parse_markdown(md);
+        let quotes = items.iter().filter(|i| matches!(i, markdown::Item::Quote(_))).count();
+        let lists = items.iter().filter(|i| matches!(i, markdown::Item::List { .. })).count();
+        let top_code_blocks = items.iter().filter(|i| matches!(i, markdown::Item::CodeBlock { .. })).count();
+
+        assert_eq!(quotes, 1, "Quote should remain intact and not split");
+        assert_eq!(lists, 1, "List should remain intact and not split");
+        assert_eq!(top_code_blocks, 0, "Indented blocks inside containers should not become top-level blocks");
+    }
+
+    #[test]
+    fn root_widget_tag_preserved_with_toast() {
+        let (mut app, _) = App::new(None);
+        let tag_without = {
+            let without_toast = view(&app);
+            without_toast.as_widget().tag()
+        };
+
+        app.toast("Copied", false);
+        let tag_with = {
+            let with_toast = view(&app);
+            with_toast.as_widget().tag()
+        };
+
+        assert_eq!(
+            tag_without, tag_with,
+            "Root widget tag must not change when toast is shown, otherwise iced drops the widget tree and resets scroll positions"
+        );
     }
 }
