@@ -397,6 +397,35 @@ impl Db {
         })
     }
 
+    /// A connected Coordinator session in `workspace` (active, idle, or listening).
+    pub fn live_coordinator(&self, workspace: &str) -> Result<Option<Session>> {
+        let ws_norm = jgt_core::team::normalize_folder(workspace);
+        self.with(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.role = 'coordinator'
+                     AND s.status IN ('active', 'idle', 'listening')
+                     AND (s.cwd = ?1 OR s.cwd = ?1 || '/' OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = ?1))
+                     ORDER BY s.created_at DESC LIMIT 1"
+                ),
+                [ws_norm],
+                session_from_row,
+            )
+            .optional()
+        })
+    }
+
+    pub fn set_role(&self, id: &str, role: &str) -> Result<()> {
+        let now = now_ms();
+        self.with(|c| {
+            c.execute(
+                "UPDATE sessions SET role = ?2, updated_at = ?3 WHERE id = ?1",
+                params![id, role, now],
+            )
+        })?;
+        Ok(())
+    }
+
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
         self.with(|c| {
             c.query_row(&format!("SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.id = ?1"), [id], session_from_row)

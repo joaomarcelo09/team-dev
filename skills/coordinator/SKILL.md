@@ -22,6 +22,7 @@ which specialists it needs, run them, and keep the user informed.
 
 ## On start
 
+Run `jg-team-dev workers` to verify your Coordinator role. If it reports that this session has no role, run `jg-team-dev claim-coordinator` and tell the user in one line in your greeting that you claimed the Coordinator role.
 Greet the user in one or two sentences with `chat_send`: say which folder you are coordinating
 and that you are ready. If your first prompt says you take over from a previous Coordinator, say
 so and name the task summary you can pick up from (read it, but do not act on it until asked).

@@ -68,11 +68,11 @@ status line. Messages the user writes in jg-team-dev reach you automatically, ma
 arrives while you wait between turns is shown twice (as Stop hook feedback and as a hook blocking error): it is one \
 message, not an error.";
 
-pub async fn run(event: HookEvent) -> anyhow::Result<()> {
+pub async fn run(event: HookEvent, role: Option<String>) -> anyhow::Result<()> {
     let mut raw = String::new();
     std::io::stdin().read_to_string(&mut raw)?;
     let input: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
-    let hook = Hook { client: HubClient::default().with_timeout(Duration::from_secs(3)), input };
+    let hook = Hook { client: HubClient::default().with_timeout(Duration::from_secs(3)), input, role };
     match hook.handle(event).await {
         Ok(Some(output)) => println!("{output}"),
         Ok(None) => {}
@@ -84,6 +84,7 @@ pub async fn run(event: HookEvent) -> anyhow::Result<()> {
 struct Hook {
     client: HubClient,
     input: Value,
+    role: Option<String>,
 }
 
 impl Hook {
@@ -95,6 +96,10 @@ impl Hook {
         self.str("session_id").ok_or_else(|| anyhow::anyhow!("hook input has no session_id"))
     }
 
+    fn resolve_role(&self) -> Option<String> {
+        self.role.clone().or_else(|| std::env::var(ROLE_ENV).ok()).filter(|r| !r.is_empty())
+    }
+
     async fn register(&self, source: Option<&str>) -> anyhow::Result<Session> {
         let req = RegisterRequest {
             harness: Harness::ClaudeCode,
@@ -104,7 +109,7 @@ impl Hook {
             pid: procs::harness_pid(),
             transcript_path: self.str("transcript_path").map(str::to_owned),
             source: source.map(str::to_owned),
-            role: std::env::var(ROLE_ENV).ok().filter(|r| !r.is_empty()),
+            role: self.resolve_role(),
             parent: std::env::var(PARENT_ENV).ok().filter(|p| !p.is_empty()),
         };
         Ok(self.client.post("/v1/sessions/register", &req).await?)
@@ -419,4 +424,42 @@ pub fn describe_tool(tool: &str, input: &Value) -> String {
     });
     let description = field("description").map(|d| format!("\n\n{d}")).unwrap_or_default();
     format!("Allow **{tool}**?\n\n{detail}{description}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hook_resolves_role_from_arg_first_then_env() {
+        let hook_no_arg = Hook {
+            client: HubClient::default(),
+            input: Value::Null,
+            role: None,
+        };
+        let hook_with_arg = Hook {
+            client: HubClient::default(),
+            input: Value::Null,
+            role: Some("coordinator".into()),
+        };
+
+        // When only arg is set:
+        unsafe { std::env::remove_var(ROLE_ENV); }
+        assert_eq!(hook_with_arg.resolve_role().as_deref(), Some("coordinator"));
+        assert_eq!(hook_no_arg.resolve_role(), None);
+
+        // When only env is set:
+        unsafe { std::env::set_var(ROLE_ENV, "coordinator"); }
+        assert_eq!(hook_no_arg.resolve_role().as_deref(), Some("coordinator"));
+
+        // When both are set, arg wins:
+        let hook_diff_arg = Hook {
+            client: HubClient::default(),
+            input: Value::Null,
+            role: Some("custom-role".into()),
+        };
+        assert_eq!(hook_diff_arg.resolve_role().as_deref(), Some("custom-role"));
+
+        unsafe { std::env::remove_var(ROLE_ENV); }
+    }
 }

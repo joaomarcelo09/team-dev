@@ -33,9 +33,6 @@ to show what you are doing. Messages the user writes in jg-team-dev reach you au
 chat_inbox fetches any that are still waiting and chat_wait waits for the next one. The task_* tools read \
 and (for the Coordinator only) change the folder's Board; a worker reads its task with task_get.";
 
-/// Told to a worker calling a tool that changes the Board (the hub refuses it too, with a 403).
-const WORKERS_READ_ONLY: &str = "Only the Coordinator moves cards and writes to the Board; report to it instead.";
-
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendArgs {
     /// The message, in Markdown.
@@ -492,11 +489,11 @@ impl JgtMcp {
         Ok((session, folder))
     }
 
-    /// The Coordinator's Board; workers get `WORKERS_READ_ONLY` before the hub is asked.
+    /// The Coordinator's Board; non-coordinators get a clear error before the hub is asked.
     async fn coordinator_board(&self, explicit: Option<&str>) -> Result<(ActorRequest, String), String> {
         let (session, workspace) = self.board(explicit).await?;
         if !session.is_coordinator() {
-            return Err(WORKERS_READ_ONLY.into());
+            return Err(session.not_coordinator_error());
         }
         Ok((ActorRequest::Session { session: session.id }, workspace))
     }

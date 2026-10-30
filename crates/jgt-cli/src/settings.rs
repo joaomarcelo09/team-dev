@@ -31,14 +31,20 @@ fn hook_timeout(event: HookEvent) -> u64 {
 
 /// Hooks for every event, plus a rule that lets agents message the user without a prompt.
 pub fn claude_settings(exe: &Path) -> Value {
+    claude_settings_for_role(exe, None)
+}
+
+/// Claude Code settings with an optional role passed to every hook invocation (`jg-team-dev hook --role <role> <event>`).
+pub fn claude_settings_for_role(exe: &Path, role: Option<&str>) -> Value {
     let mut hooks = serde_json::Map::new();
+    let role_flag = role.map(|r| format!(" --role {r}")).unwrap_or_default();
     for event in HookEvent::ALL {
         hooks.insert(
             event.claude_name().into(),
             json!([{
                 "hooks": [{
                     "type": "command",
-                    "command": format!("{} hook {}", quote(exe), event.arg()),
+                    "command": format!("{} hook{role_flag} {}", quote(exe), event.arg()),
                     "timeout": hook_timeout(event),
                 }]
             }]),
@@ -83,6 +89,15 @@ mod tests {
         }
         assert_eq!(s["hooks"]["Stop"][0]["hooks"][0]["timeout"], 3600);
         assert_eq!(s["permissions"]["allow"][0], "mcp__jg-team-dev");
+    }
+
+    #[test]
+    fn settings_for_role_passes_role_flag() {
+        let s = claude_settings_for_role(Path::new("/usr/bin/jg-team-dev"), Some("coordinator"));
+        for event in HookEvent::ALL {
+            let command = s["hooks"][event.claude_name()][0]["hooks"][0]["command"].as_str().unwrap();
+            assert_eq!(command, format!("/usr/bin/jg-team-dev hook --role coordinator {}", event.arg()));
+        }
     }
 
     #[test]

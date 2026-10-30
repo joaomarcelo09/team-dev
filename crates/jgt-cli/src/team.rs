@@ -109,6 +109,7 @@ fn prepare_files_in(files: &Path) -> Result<()> {
     let exe = exe.canonicalize().unwrap_or(exe);
     std::fs::create_dir_all(files)?;
     write_atomic(&files.join("settings.json"), &serde_json::to_string_pretty(&settings::claude_settings(&exe))?)?;
+    write_atomic(&files.join("settings-coordinator.json"), &serde_json::to_string_pretty(&settings::claude_settings_for_role(&exe, Some(jgt_core::model::COORDINATOR)))?)?;
     write_atomic(&files.join("mcp.json"), &serde_json::to_string_pretty(&settings::mcp_config(&exe))?)?;
     write_plugin(&files.join("plugin"))?;
     Ok(())
@@ -423,6 +424,25 @@ pub async fn start(folder: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// `jg-team-dev claim-coordinator`: claims the Coordinator role for this Claude Code session.
+pub async fn claim_coordinator() -> Result<()> {
+    let client = HubClient::default();
+    let pid = procs::harness_pid().context("not started from a Claude Code session")?;
+    let s: Session = client
+        .get(&format!("/v1/resolve?pid={pid}"))
+        .await
+        .context("could not resolve Claude Code session for this process")?;
+    if s.is_worker() {
+        bail!("{}", s.not_coordinator_error());
+    }
+    let updated: Session = client
+        .post(&format!("/v1/sessions/{}/claim-coordinator", s.id), &())
+        .await
+        .context("failed to claim Coordinator role")?;
+    println!("Claimed coordinator role for {}.", updated.display_name());
+    Ok(())
+}
+
 /// The first prompt's tail for a Coordinator that takes over after a reset.
 pub fn handover_note(summary: Option<&Path>) -> String {
     let summary = summary.map(|p| format!(" Its summary of the last topic is `{}`.", p.display())).unwrap_or_default();
@@ -624,7 +644,7 @@ mod tests {
         let args = plan.args.join(" ");
         assert!(args.starts_with("--bg /jg-team-dev:coordinator "));
         assert!(args.contains("--model opus --effort medium --permission-mode auto"));
-        assert!(args.contains("--settings /data/claude/settings.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
+        assert!(args.contains("--settings /data/claude/settings-coordinator.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
         assert!(args.contains("--setting-sources project,local --plugin-dir /data/claude/plugin"));
         assert!(args.ends_with("-n coordinator · app"));
         assert_eq!(plan.cwd.as_deref(), Some(Path::new("/work/app")));

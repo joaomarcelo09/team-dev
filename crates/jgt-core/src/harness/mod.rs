@@ -7,7 +7,7 @@ mod claude_code;
 mod opencode;
 
 pub use antigravity::Antigravity;
-pub use claude_code::{ClaudeCode, session_args};
+pub use claude_code::{ClaudeCode, session_args, session_args_for_role};
 pub use opencode::Opencode;
 
 use crate::{

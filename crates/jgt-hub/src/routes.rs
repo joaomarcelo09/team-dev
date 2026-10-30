@@ -56,6 +56,7 @@ pub fn router(hub: SharedHub) -> Router {
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/register", post(register))
         .route("/v1/sessions/{id}", get(get_session).patch(patch_session).delete(delete_session))
+        .route("/v1/sessions/{id}/claim-coordinator", post(claim_coordinator_handler))
         .route("/v1/sessions/{id}/state", post(set_state))
         .route("/v1/sessions/{id}/end", post(end_session))
         .route("/v1/sessions/{id}/messages", get(list_messages).post(agent_message))
@@ -164,6 +165,13 @@ async fn end_session(
     Json(req): Json<EndRequest>,
 ) -> ApiResult<jgt_core::Session> {
     Ok(Json(hub.end(&id, &req)?))
+}
+
+async fn claim_coordinator_handler(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+) -> ApiResult<jgt_core::Session> {
+    Ok(Json(hub.claim_coordinator(&id)?))
 }
 
 #[derive(Deserialize)]

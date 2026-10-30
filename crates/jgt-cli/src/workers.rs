@@ -185,7 +185,7 @@ pub(crate) async fn coordinator(client: &HubClient, explicit: Option<String>) ->
         }
     };
     if !session.is_coordinator() {
-        bail!("session {} is not a Coordinator", session.display_name());
+        bail!("{}", session.not_coordinator_error());
     }
     Ok(session)
 }
@@ -1093,5 +1093,45 @@ mod tests {
         args.main_worktree = false;
         args.cwd = Some("/elsewhere".into());
         assert_eq!(task_worktree(&args, Some(&task)), None);
+    }
+
+    #[test]
+    fn coordinator_rejects_non_coordinator_sessions() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "harness": "claude-code",
+            "external_id": "ext1",
+            "title": "my-worker",
+            "status": "active",
+            "role": null,
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 0,
+            "updated_at": 0,
+            "last_seen_at": 0,
+        }))
+        .unwrap();
+
+        let check = |sess: &Session| -> Result<Session> {
+            if !sess.is_coordinator() {
+                bail!("{}", sess.not_coordinator_error());
+            }
+            Ok(sess.clone())
+        };
+
+        let err = check(&s).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "this Claude Code session has no jg-team-dev role (JGT_ROLE was not set when it started). Run jg-team-dev claim-coordinator, or restart it with jg-team-dev start."
+        );
+
+        s.role = Some("coder".into());
+        let err = check(&s).unwrap_err().to_string();
+        assert_eq!(err, "session my-worker is a coder worker, not a Coordinator.");
+
+        s.role = Some(jgt_core::COORDINATOR.into());
+        assert!(check(&s).is_ok());
     }
 }

@@ -316,8 +316,13 @@ mod tests {
         let mut config = Config::default();
         config.commands.claude = Some("/bin/sh".into());
         let p_bg = plan(&session, ReconnectMode::Background, None, &config).unwrap();
+        // Background plan preserves JGT_ROLE in env
         assert!(p_bg.env.contains(&(crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into())));
+        // Background plan restore path includes coordinator flags with role settings file
+        assert!(p_bg.args.iter().any(|arg| arg.contains("settings-coordinator")));
+
         let p_term = plan(&session, ReconnectMode::Terminal, None, &config).unwrap();
+        // Terminal plan preserves JGT_ROLE in env
         assert!(p_term.env.contains(&(crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into())));
     }
 }
