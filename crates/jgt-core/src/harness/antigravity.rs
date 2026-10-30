@@ -66,7 +66,13 @@ impl HarnessAdapter for Antigravity {
         let skill = skill_text(w.files, w.skill).map_err(|e| format!("reading the {} skill: {e}", w.skill))?;
         let prompt = format!(
             "{skill}\n\n---\n\nNote: the jg-team-dev chat and task tools (chat_status, chat_send, chat_ask, task_get) \
-             are not available in this session; skip them. Your final reply goes to the Coordinator.\n\n\
+             are not available in this session; skip them. Your final reply goes to the Coordinator. \
+             Stay strictly inside the role and scope of the brief (a coder does not go beyond its brief; \
+             a verifier/tester/reviewer does not implement features). \
+             Before each step write one short plain-text line saying what you are about to do \
+             (these lines appear in the run output). \
+             The final reply starts with a short recap of the steps (3-8 bullets: what was done, \
+             what was checked), then the JSON block the skill requires, still last.\n\n\
              # Your brief\n\n{}",
             brief_prompt(w.brief, w.brief_file)
         );
@@ -198,6 +204,7 @@ mod tests {
         let prompt = &plan.args[1];
         assert!(prompt.starts_with("# You are the Coder\n\nA fresh session.") && prompt.ends_with("# Your brief\n\nFix it."), "{prompt}");
         assert!(!prompt.contains("name: coder"));
+        assert!(prompt.contains("short recap of the steps"), "{prompt}");
         assert_eq!(
             plan.args[2..],
             ["--output-format", "json", "--model", "gemini-3.8-flash-high", "--effort", "high", "--mode", "auto", "--print-timeout", "2h"]
