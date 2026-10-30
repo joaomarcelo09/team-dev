@@ -76,6 +76,32 @@ pub enum ThemePref {
     Dark,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThemeStyle {
+    #[default]
+    Default,
+    TokyoNight,
+    Dracula,
+}
+
+impl ThemeStyle {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "tokyo-night" => Self::TokyoNight,
+            "dracula" => Self::Dracula,
+            _ => Self::Default,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::TokyoNight => "tokyo-night",
+            Self::Dracula => "dracula",
+        }
+    }
+}
+
 pub struct App {
     pub conn: Conn,
     pub sessions: Vec<Session>,
@@ -96,6 +122,7 @@ pub struct App {
     pub window: Option<window::Id>,
     pub at_bottom: bool,
     pub theme_pref: ThemePref,
+    pub theme_style: ThemeStyle,
     pub system_mode: theme::Mode,
     /// Whole-window scale (1.0 = 100%).
     pub zoom: f32,
@@ -228,6 +255,7 @@ pub enum Msg {
     Window(window::Id, window::Event),
     SystemTheme(theme::Mode),
     SetTheme(ThemePref),
+    SetStyle(ThemeStyle),
     ToggleSettings,
     Zoom(Step),
     TextSize(Step),
@@ -249,6 +277,7 @@ impl App {
             "dark" => ThemePref::Dark,
             _ => ThemePref::System,
         };
+        let theme_style = ThemeStyle::parse(&desktop.style);
         let app = App {
             conn: Conn::Connecting,
             sessions: Vec::new(),
@@ -267,6 +296,7 @@ impl App {
             window: None,
             at_bottom: true,
             theme_pref,
+            theme_style,
             system_mode: theme::Mode::Dark,
             zoom: clamp_zoom(desktop.zoom),
             text_size,
@@ -305,12 +335,18 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        let dark = match self.theme_pref {
-            ThemePref::Dark => true,
-            ThemePref::Light => false,
-            ThemePref::System => self.system_mode != theme::Mode::Light,
-        };
-        if dark { crate::style::dark() } else { crate::style::light() }
+        match self.theme_style {
+            ThemeStyle::TokyoNight => crate::style::tokyo_night(),
+            ThemeStyle::Dracula => crate::style::dracula(),
+            ThemeStyle::Default => {
+                let dark = match self.theme_pref {
+                    ThemePref::Dark => true,
+                    ThemePref::Light => false,
+                    ThemePref::System => self.system_mode != theme::Mode::Light,
+                };
+                if dark { crate::style::dark() } else { crate::style::light() }
+            }
+        }
     }
 
     pub fn subscription(&self) -> Subscription<Msg> {
@@ -1048,6 +1084,11 @@ impl App {
                 self.save_view_settings();
                 Task::none()
             }
+            Msg::SetStyle(style) => {
+                self.theme_style = style;
+                self.save_view_settings();
+                Task::none()
+            }
             Msg::ToggleSettings => {
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
@@ -1225,7 +1266,7 @@ impl App {
         }
     }
 
-    /// Saves theme, zoom and text size to config.toml (other settings there are kept).
+    /// Saves theme, style, zoom and text size to config.toml (other settings there are kept).
     fn save_view_settings(&self) {
         let mut config = Config::load();
         config.desktop.theme = match self.theme_pref {
@@ -1234,8 +1275,31 @@ impl App {
             ThemePref::Light => "light",
         }
         .into();
+        config.desktop.style = self.theme_style.as_str().into();
         config.desktop.zoom = self.zoom;
         config.desktop.text_size = self.text_size;
         let _ = config.save();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn theme_style_parse_and_fallback() {
+        assert_eq!(ThemeStyle::parse("default"), ThemeStyle::Default);
+        assert_eq!(ThemeStyle::parse("tokyo-night"), ThemeStyle::TokyoNight);
+        assert_eq!(ThemeStyle::parse("dracula"), ThemeStyle::Dracula);
+
+        // Unknown values fall back to default
+        assert_eq!(ThemeStyle::parse("unknown"), ThemeStyle::Default);
+        assert_eq!(ThemeStyle::parse("nord"), ThemeStyle::Default);
+        assert_eq!(ThemeStyle::parse(""), ThemeStyle::Default);
+
+        // Round-trip through as_str
+        for style in [ThemeStyle::Default, ThemeStyle::TokyoNight, ThemeStyle::Dracula] {
+            assert_eq!(ThemeStyle::parse(style.as_str()), style);
+        }
     }
 }

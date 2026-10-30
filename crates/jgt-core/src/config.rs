@@ -398,6 +398,8 @@ fn check_effort(role: &str, harness: Harness, value: Option<&str>, warnings: &mu
 pub struct Desktop {
     /// `system`, `light` or `dark`.
     pub theme: String,
+    /// `default`, `tokyo-night` or `dracula`.
+    pub style: String,
     /// UI font family (a static, non-variable font); Noto Sans, DejaVu Sans or Liberation Sans when unset.
     pub font: Option<String>,
     /// Scales the whole window (1.0 = 100%).
@@ -416,7 +418,14 @@ impl Desktop {
 
 impl Default for Desktop {
     fn default() -> Self {
-        Self { theme: "system".into(), font: None, zoom: 1.0, text_size: Self::DEFAULT_TEXT_SIZE, tray: true }
+        Self {
+            theme: "system".into(),
+            style: "default".into(),
+            font: None,
+            zoom: 1.0,
+            text_size: Self::DEFAULT_TEXT_SIZE,
+            tray: true,
+        }
     }
 }
 
@@ -662,5 +671,25 @@ mod tests {
         assert_eq!(Config::default().team.for_skill("coder", &wt).model, "sonnet");
         assert_eq!(Config::default().team.for_skill("planner", &wt).model, "opus");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn desktop_style_round_trips_and_defaults() {
+        let toml_str = "[desktop]\ntheme = \"dark\"\nstyle = \"dracula\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.desktop.style, "dracula");
+        let serialized = toml::to_string(&cfg).unwrap();
+        let round_tripped: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.desktop.style, "dracula");
+
+        let toml_str = "[desktop]\nstyle = \"tokyo-night\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.desktop.style, "tokyo-night");
+
+        let old_toml = "[desktop]\ntheme = \"light\"\nzoom = 1.2\n";
+        let old_cfg: Config = toml::from_str(old_toml).unwrap();
+        assert_eq!(old_cfg.desktop.style, "default");
+
+        assert_eq!(Config::default().desktop.style, "default");
     }
 }
