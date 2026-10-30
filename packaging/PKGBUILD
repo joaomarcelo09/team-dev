@@ -5,7 +5,7 @@
 
 pkgname=jg-team-dev
 pkgver=0.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc="Chat with a Claude Code Coordinator that runs a team of worker sessions"
 arch=('x86_64')
 license=('MIT')
