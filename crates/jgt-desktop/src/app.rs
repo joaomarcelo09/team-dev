@@ -14,7 +14,7 @@ use jgt_core::{
     config::{Config, Desktop as DesktopConfig},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     time::{Duration, Instant},
 };
 
@@ -125,6 +125,10 @@ pub struct App {
     pub answers: HashMap<String, String>,
     pub search: String,
     pub show_archived: bool,
+    /// Coordinators whose workers are collapsed in the sidebar.
+    pub collapsed_coordinators: HashSet<String>,
+    /// Whether idle/done workers in the team panel are collapsed.
+    pub collapsed_idle: bool,
     pub rename: Option<String>,
     pub confirm_delete: bool,
     pub reconnecting: bool,
@@ -262,6 +266,8 @@ pub enum Msg {
     Deleted(Result<(), String>),
     Search(String),
     ToggleArchived,
+    ToggleCoordinatorCollapse(String),
+    ToggleIdleCollapse,
     Copy(String),
     Link(markdown::Uri),
     Window(window::Id, window::Event),
@@ -302,6 +308,8 @@ impl App {
             answers: HashMap::new(),
             search: String::new(),
             show_archived: false,
+            collapsed_coordinators: HashSet::new(),
+            collapsed_idle: false,
             rename: None,
             confirm_delete: false,
             reconnecting: false,
@@ -399,6 +407,20 @@ impl App {
     pub fn selected_session(&self) -> Option<&Session> {
         let id = self.selected.as_deref()?;
         self.sessions.iter().find(|s| s.id == id)
+    }
+
+    pub fn toggle_coordinator_collapse(&mut self, id: &str) {
+        if !self.collapsed_coordinators.remove(id) {
+            self.collapsed_coordinators.insert(id.to_string());
+        }
+    }
+
+    pub fn toggle_idle_collapse(&mut self) {
+        self.collapsed_idle = !self.collapsed_idle;
+    }
+
+    pub fn is_coordinator_collapsed(&self, id: &str) -> bool {
+        self.collapsed_coordinators.contains(id)
     }
 
     pub(crate) fn toast(&mut self, text: impl Into<String>, error: bool) {
@@ -1048,6 +1070,14 @@ impl App {
                 self.show_archived = !self.show_archived;
                 Task::none()
             }
+            Msg::ToggleCoordinatorCollapse(id) => {
+                self.toggle_coordinator_collapse(&id);
+                Task::none()
+            }
+            Msg::ToggleIdleCollapse => {
+                self.toggle_idle_collapse();
+                Task::none()
+            }
             Msg::Copy(text) => {
                 self.toast("Copied", false);
                 iced::clipboard::write(text)
@@ -1387,5 +1417,63 @@ mod tests {
         for style in [ThemeStyle::Default, ThemeStyle::TokyoNight, ThemeStyle::Dracula] {
             assert_eq!(ThemeStyle::parse(style.as_str()), style);
         }
+    }
+
+    #[test]
+    fn coordinator_collapse_toggles_and_preserves_state() {
+        let (mut app, _) = App::new(None);
+        assert!(!app.is_coordinator_collapsed("coord-1"));
+        assert!(!app.is_coordinator_collapsed("coord-2"));
+
+        // Toggle coord-1 to collapsed.
+        let _ = app.update(Msg::ToggleCoordinatorCollapse("coord-1".to_string()));
+        assert!(app.is_coordinator_collapsed("coord-1"));
+        assert!(!app.is_coordinator_collapsed("coord-2"));
+
+        // Toggle coord-2 to collapsed.
+        let _ = app.update(Msg::ToggleCoordinatorCollapse("coord-2".to_string()));
+        assert!(app.is_coordinator_collapsed("coord-1"));
+        assert!(app.is_coordinator_collapsed("coord-2"));
+
+        // Toggle coord-1 back to expanded.
+        let _ = app.update(Msg::ToggleCoordinatorCollapse("coord-1".to_string()));
+        assert!(!app.is_coordinator_collapsed("coord-1"));
+        assert!(app.is_coordinator_collapsed("coord-2"));
+    }
+
+    #[test]
+    fn idle_collapse_toggles() {
+        let (mut app, _) = App::new(None);
+        // Default is expanded (collapsed_idle == false).
+        assert!(!app.collapsed_idle);
+
+        let _ = app.update(Msg::ToggleIdleCollapse);
+        assert!(app.collapsed_idle);
+
+        let _ = app.update(Msg::ToggleIdleCollapse);
+        assert!(!app.collapsed_idle);
+    }
+
+    #[test]
+    fn collapsed_state_survives_sessions_refresh() {
+        let (mut app, _) = App::new(None);
+        let _ = app.update(Msg::ToggleCoordinatorCollapse("coord-1".to_string()));
+        let _ = app.update(Msg::ToggleIdleCollapse);
+        assert!(app.is_coordinator_collapsed("coord-1"));
+        assert!(app.collapsed_idle);
+
+        // Simulate session list refresh from hub.
+        let session = serde_json::from_value::<Session>(serde_json::json!({
+            "id": "coord-1", "harness": jgt_core::Harness::ClaudeCode, "external_id": "ext-1",
+            "cwd": "/w/", "title": null, "status": SessionStatus::Active,
+            "listen": false, "mirror": false, "archived": false, "unread": 0, "queued": 0,
+            "created_at": 0, "updated_at": 0, "last_seen_at": 0, "awaiting_reply": false,
+            "role": jgt_core::COORDINATOR,
+        }))
+        .expect("session");
+
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![session])));
+        assert!(app.is_coordinator_collapsed("coord-1"), "Collapsed coordinators must survive session list reload");
+        assert!(app.collapsed_idle, "Idle collapsed flag must survive session list reload");
     }
 }

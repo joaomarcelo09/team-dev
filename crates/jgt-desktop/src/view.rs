@@ -4,6 +4,7 @@ use crate::{
     app::{App, Conn, MESSAGES_ID, Msg, Tab, ThemePref, ThemeStyle, Thread},
     style,
 };
+use std::collections::HashSet;
 use chrono::{Datelike, Local, TimeZone};
 use iced::{
     Alignment, Color, Element, Fill, Font, Padding, Shrink, Theme,
@@ -298,16 +299,7 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
         if *label == "ARCHIVED" && !app.show_archived {
             continue;
         }
-        // Workers sit right under their Coordinator, whatever their own state; only a worker whose
-        // Coordinator is not listed is grouped by its own state.
-        let parent_listed = |w: &Session| visible.iter().any(|p| Some(p.id.as_str()) == w.parent_id.as_deref());
-        let mut items: Vec<&&Session> = Vec::new();
-        for s in visible.iter().filter(|s| include(s) && !(s.is_worker() && parent_listed(s))) {
-            items.push(s);
-            if !s.is_worker() {
-                items.extend(visible.iter().filter(|w| w.is_worker() && w.parent_id.as_deref() == Some(s.id.as_str())));
-            }
-        }
+        let items = sidebar_items(&visible, include, &app.collapsed_coordinators);
         if items.is_empty() {
             continue;
         }
@@ -316,7 +308,8 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
             container(muted(format!("{label} · {}", items.len())).size(style::fs(11)).font(bold())).padding([10, 8]),
         );
         for s in items {
-            let item = session_item(s, app.selected.as_deref() == Some(s.id.as_str()), theme);
+            let collapsed = s.is_coordinator().then(|| app.is_coordinator_collapsed(&s.id));
+            let item = session_item(s, app.selected.as_deref() == Some(s.id.as_str()), collapsed, theme);
             list = list.push(if s.is_worker() { container(item).padding(Padding::ZERO.left(16)).into() } else { item });
         }
     }
@@ -414,7 +407,32 @@ fn folder_value(app: &App) -> &str {
     app.new_team.as_deref().unwrap_or("").trim_end_matches('/')
 }
 
-fn session_item<'a>(s: &'a Session, selected: bool, theme: &Theme) -> Element<'a, Msg> {
+/// Which session items to display for a sidebar group.
+///
+/// Top-level sessions in `visible` matching `include` are listed. For any Coordinator (or parent session),
+/// its workers are listed beneath it unless the Coordinator is collapsed.
+pub fn sidebar_items<'a>(
+    visible: &[&'a Session],
+    include: impl Fn(&Session) -> bool,
+    collapsed: &HashSet<String>,
+) -> Vec<&'a Session> {
+    let parent_listed = |w: &Session| visible.iter().any(|p| Some(p.id.as_str()) == w.parent_id.as_deref());
+    let mut items: Vec<&'a Session> = Vec::new();
+    for s in visible.iter().copied().filter(|s| include(s) && !(s.is_worker() && parent_listed(s))) {
+        items.push(s);
+        if !s.is_worker() && !collapsed.contains(&s.id) {
+            items.extend(visible.iter().copied().filter(|w| w.is_worker() && w.parent_id.as_deref() == Some(s.id.as_str())));
+        }
+    }
+    items
+}
+
+fn session_item<'a>(
+    s: &'a Session,
+    selected: bool,
+    collapsed: Option<bool>,
+    theme: &Theme,
+) -> Element<'a, Msg> {
     let p = theme.extended_palette();
     let time = s.last_message_at.unwrap_or(s.updated_at);
     let role = match s.role.as_deref() {
@@ -441,9 +459,23 @@ fn session_item<'a>(s: &'a Session, selected: bool, theme: &Theme) -> Element<'a
     }
     let preview = s.status_text.clone().or_else(|| s.last_message.clone()).unwrap_or_default();
     let name_font = if s.unread > 0 { bold() } else { style::ui_font() };
+    let mut title_left = row![].spacing(4).align_y(Alignment::Center);
+    if let Some(is_collapsed) = collapsed {
+        let arrow = if is_collapsed { "▸" } else { "▾" };
+        let tooltip_msg = if is_collapsed { "Expand workers" } else { "Collapse workers" };
+        let arrow_btn = tip(
+            button(text(arrow).size(style::fs(11)))
+                .on_press(Msg::ToggleCoordinatorCollapse(s.id.clone()))
+                .style(style::ghost)
+                .padding([1, 4]),
+            tooltip_msg,
+        );
+        title_left = title_left.push(arrow_btn);
+    }
+    title_left = title_left.push(text(s.display_name()).size(style::fs(14)).font(name_font).wrapping(text::Wrapping::None));
     let content = column![
         row![
-            text(s.display_name()).size(style::fs(14)).font(name_font).wrapping(text::Wrapping::None),
+            title_left,
             space::horizontal(),
             muted(short_time(time)).size(style::fs(11))
         ]
@@ -633,6 +665,43 @@ fn duration(secs: i64) -> String {
     if secs >= 3600 { format!("{}h{:02}m", secs / 3600, secs % 3600 / 60) } else { format!("{}m{:02}s", secs / 60, secs % 60) }
 }
 
+/// Partitions team workers for the team panel into active (working) and idle/done workers.
+pub fn partition_team_workers<'a>(
+    workers: &[&'a Session],
+    show_archived: bool,
+) -> (Vec<&'a Session>, Vec<&'a Session>) {
+    let mut active = Vec::new();
+    let mut idle = Vec::new();
+    for &w in workers {
+        if !w.archived || show_archived {
+            if w.status == SessionStatus::Active {
+                active.push(w);
+            } else {
+                idle.push(w);
+            }
+        }
+    }
+    (active, idle)
+}
+
+/// Decides which team worker rows to show in the team panel and returns `(visible_workers, hidden_idle_count)`.
+#[allow(dead_code)]
+pub fn team_panel_rows<'a>(
+    workers: &[&'a Session],
+    show_archived: bool,
+    collapsed_idle: bool,
+) -> (Vec<&'a Session>, usize) {
+    let (active, idle) = partition_team_workers(workers, show_archived);
+    if collapsed_idle {
+        let hidden = idle.len();
+        (active, hidden)
+    } else {
+        let mut all = active;
+        all.extend(idle);
+        (all, 0)
+    }
+}
+
 /// A Coordinator's workers: what each is doing, for how long, and what it cost.
 fn team_panel<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element<'a, Msg>> {
     if !s.is_coordinator() {
@@ -643,7 +712,7 @@ fn team_panel<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element
         return None;
     }
     let now = jgt_core::now_ms();
-    let shown: Vec<&&Session> = workers.iter().filter(|w| !w.archived || app.show_archived).collect();
+    let (active_workers, idle_workers) = partition_team_workers(&workers, app.show_archived);
     let archived = workers.iter().filter(|w| w.archived).count();
     let working = workers.iter().filter(|w| w.status.is_connected()).count();
     let cost: f64 = workers.iter().filter_map(|w| w.cost_usd).sum();
@@ -666,45 +735,69 @@ fn team_panel<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element
     }
 
     let mut list = column![summary].spacing(2);
-    for w in shown {
-        let (state, secs) = match w.status {
-            SessionStatus::Active => ("working", (now - w.created_at) / 1000),
-            SessionStatus::Idle | SessionStatus::Listening => ("idle", (now - w.created_at) / 1000),
-            _ => (
-                if w.status == SessionStatus::Ended { "ended" } else { "done" },
-                w.run_secs.unwrap_or((w.updated_at - w.created_at) / 1000),
-            ),
+    for w in active_workers {
+        list = list.push(team_worker_row(w, now, theme));
+    }
+    if !idle_workers.is_empty() {
+        let count = idle_workers.len();
+        let label = if app.collapsed_idle {
+            format!("▸ Idle workers ({count})")
+        } else {
+            "▾ Idle workers".to_string()
         };
-        let detail = if w.status.is_connected() { w.status_text.clone().unwrap_or_default() } else { String::new() };
-        // A finished run whose harness reports no cost shows "—" (PRD H8).
-        let cost = match w.cost_usd {
-            Some(c) => format!("${c:.2}"),
-            None if w.status.is_connected() => String::new(),
-            None => "—".to_string(),
-        };
-        let runs_on = [Some(w.harness.label().to_string()), w.model.clone()].into_iter().flatten().collect::<Vec<_>>();
-        let line = row![
-            dot(style::status_color(theme, w.status), 7.0),
-            text(w.display_name()).size(style::fs(12)).wrapping(text::Wrapping::None).width(Fill),
-            muted(detail).size(style::fs(11)).wrapping(text::Wrapping::None),
-            container(text(runs_on.join(" · ")).size(style::fs(10)).wrapping(text::Wrapping::None))
-                .padding([1, 6])
-                .style(style::pill),
-            muted(state).size(style::fs(11)).width(56),
-            muted(duration(secs)).size(style::fs(11)).width(56),
-            muted(cost).size(style::fs(11)).width(48),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        list = list.push(
-            button(container(line).clip(true))
-                .on_press(Msg::Select(w.id.clone()))
-                .style(style::session_item(false))
-                .width(Fill)
-                .padding([3, 8]),
+        let toggle_btn = tip(
+            button(text(label).size(style::fs(11)))
+                .on_press(Msg::ToggleIdleCollapse)
+                .style(style::ghost)
+                .padding([1, 6]),
+            if app.collapsed_idle { "Show idle workers" } else { "Hide idle workers" },
         );
+        list = list.push(toggle_btn);
+        if !app.collapsed_idle {
+            for w in idle_workers {
+                list = list.push(team_worker_row(w, now, theme));
+            }
+        }
     }
     Some(container(list).padding([6, 8]).width(Fill).style(style::pill).into())
+}
+
+fn team_worker_row<'a>(w: &'a Session, now: i64, theme: &Theme) -> Element<'a, Msg> {
+    let (state, secs) = match w.status {
+        SessionStatus::Active => ("working", (now - w.created_at) / 1000),
+        SessionStatus::Idle | SessionStatus::Listening => ("idle", (now - w.created_at) / 1000),
+        _ => (
+            if w.status == SessionStatus::Ended { "ended" } else { "done" },
+            w.run_secs.unwrap_or((w.updated_at - w.created_at) / 1000),
+        ),
+    };
+    let detail = if w.status.is_connected() { w.status_text.clone().unwrap_or_default() } else { String::new() };
+    // A finished run whose harness reports no cost shows "—" (PRD H8).
+    let cost = match w.cost_usd {
+        Some(c) => format!("${c:.2}"),
+        None if w.status.is_connected() => String::new(),
+        None => "—".to_string(),
+    };
+    let runs_on = [Some(w.harness.label().to_string()), w.model.clone()].into_iter().flatten().collect::<Vec<_>>();
+    let line = row![
+        dot(style::status_color(theme, w.status), 7.0),
+        text(w.display_name()).size(style::fs(12)).wrapping(text::Wrapping::None).width(Fill),
+        muted(detail).size(style::fs(11)).wrapping(text::Wrapping::None),
+        container(text(runs_on.join(" · ")).size(style::fs(10)).wrapping(text::Wrapping::None))
+            .padding([1, 6])
+            .style(style::pill),
+        muted(state).size(style::fs(11)).width(56),
+        muted(duration(secs)).size(style::fs(11)).width(56),
+        muted(cost).size(style::fs(11)).width(48),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    button(container(line).clip(true))
+        .on_press(Msg::Select(w.id.clone()))
+        .style(style::session_item(false))
+        .width(Fill)
+        .padding([3, 8])
+        .into()
 }
 
 fn status_banner<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element<'a, Msg>> {
@@ -1356,5 +1449,116 @@ mod tests {
             tag_without, tag_with,
             "Root widget tag must not change when toast is shown, otherwise iced drops the widget tree and resets scroll positions"
         );
+    }
+
+    fn test_session(
+        id: &str,
+        role: Option<&str>,
+        parent_id: Option<&str>,
+        status: SessionStatus,
+        archived: bool,
+    ) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "harness": Harness::ClaudeCode,
+            "external_id": format!("ext-{id}"),
+            "cwd": "/w/",
+            "title": id,
+            "status": status,
+            "listen": false,
+            "mirror": false,
+            "archived": archived,
+            "unread": 0,
+            "queued": 0,
+            "created_at": 1000,
+            "updated_at": 2000,
+            "last_seen_at": 2000,
+            "awaiting_reply": false,
+            "role": role,
+            "parent_id": parent_id,
+        }))
+        .expect("test session")
+    }
+
+    #[test]
+    fn sidebar_items_expands_and_collapses_workers() {
+        let coord = test_session("c1", Some(jgt_core::COORDINATOR), None, SessionStatus::Active, false);
+        let worker1 = test_session("w1", Some("coder"), Some("c1"), SessionStatus::Active, false);
+        let worker2 = test_session("w2", Some("tester"), Some("c1"), SessionStatus::Idle, false);
+        let visible = [&coord, &worker1, &worker2];
+
+        // Expanded (default: collapsed set is empty)
+        let collapsed = HashSet::new();
+        let items = sidebar_items(&visible, |_| true, &collapsed);
+        let ids: Vec<&str> = items.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "w1", "w2"], "Expanded coordinator shows all workers beneath it");
+
+        // Collapsed
+        let mut collapsed = HashSet::new();
+        collapsed.insert("c1".to_string());
+        let items = sidebar_items(&visible, |_| true, &collapsed);
+        let ids: Vec<&str> = items.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["c1"], "Collapsed coordinator hides its workers");
+    }
+
+    #[test]
+    fn sidebar_items_independent_coordinators() {
+        let coord1 = test_session("c1", Some(jgt_core::COORDINATOR), None, SessionStatus::Active, false);
+        let worker1 = test_session("w1", Some("coder"), Some("c1"), SessionStatus::Active, false);
+        let coord2 = test_session("c2", Some(jgt_core::COORDINATOR), None, SessionStatus::Active, false);
+        let worker2 = test_session("w2", Some("reviewer"), Some("c2"), SessionStatus::Active, false);
+        let visible = [&coord1, &worker1, &coord2, &worker2];
+
+        // Collapse only c1
+        let mut collapsed = HashSet::new();
+        collapsed.insert("c1".to_string());
+        let items = sidebar_items(&visible, |_| true, &collapsed);
+        let ids: Vec<&str> = items.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["c1", "c2", "w2"], "Only c1 workers are collapsed; c2 workers remain visible");
+    }
+
+    #[test]
+    fn partition_team_workers_splits_active_and_idle() {
+        let w_active = test_session("w1", Some("coder"), Some("c1"), SessionStatus::Active, false);
+        let w_idle = test_session("w2", Some("tester"), Some("c1"), SessionStatus::Idle, false);
+        let w_listen = test_session("w3", Some("tester"), Some("c1"), SessionStatus::Listening, false);
+        let w_disc = test_session("w4", Some("tester"), Some("c1"), SessionStatus::Disconnected, false);
+        let w_ended = test_session("w5", Some("tester"), Some("c1"), SessionStatus::Ended, false);
+        let w_archived = test_session("w6", Some("tester"), Some("c1"), SessionStatus::Ended, true);
+
+        let workers = [&w_active, &w_idle, &w_listen, &w_disc, &w_ended, &w_archived];
+
+        // show_archived = false
+        let (active, idle) = partition_team_workers(&workers, false);
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, "w1");
+        assert_eq!(idle.len(), 4);
+        let idle_ids: Vec<&str> = idle.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(idle_ids, vec!["w2", "w3", "w4", "w5"]);
+
+        // show_archived = true
+        let (active, idle) = partition_team_workers(&workers, true);
+        assert_eq!(active.len(), 1);
+        assert_eq!(idle.len(), 5);
+        assert!(idle.iter().any(|s| s.id == "w6"));
+    }
+
+    #[test]
+    fn team_panel_rows_handles_collapse() {
+        let w_active = test_session("w1", Some("coder"), Some("c1"), SessionStatus::Active, false);
+        let w_idle1 = test_session("w2", Some("tester"), Some("c1"), SessionStatus::Idle, false);
+        let w_idle2 = test_session("w3", Some("reviewer"), Some("c1"), SessionStatus::Ended, false);
+        let workers = [&w_active, &w_idle1, &w_idle2];
+
+        // Expanded: all shown, hidden count = 0
+        let (shown, hidden) = team_panel_rows(&workers, false, false);
+        assert_eq!(shown.len(), 3);
+        assert_eq!(hidden, 0);
+
+        // Collapsed: only active shown, hidden count = 2
+        let (shown, hidden) = team_panel_rows(&workers, false, true);
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].id, "w1");
+        assert_eq!(hidden, 2);
     }
 }
