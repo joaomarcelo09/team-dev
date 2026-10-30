@@ -18,7 +18,7 @@ use jgt_core::{
 use serde_json::Value;
 use std::{
     io::{IsTerminal, Read},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
 };
@@ -214,6 +214,33 @@ fn summarize(stdout: &str) -> (bool, String, Option<f64>) {
     }
 }
 
+/// Longest result relayed whole to the Coordinator when it has no JSON block.
+const RELAY_MAX: usize = 1500;
+
+/// What the Coordinator gets of a result: the final ```json block the skills end with (the
+/// prose before it only repeats it), or the start of a result without one. Every relayed message
+/// stays in the Coordinator's context for good, so the rest is left in the saved `file`.
+fn relay_result(result: &str, file: Option<&Path>) -> String {
+    let json = result.rfind("```json").and_then(|start| {
+        let body = &result[start + "```json".len()..];
+        let end = body.find("```")?;
+        Some(format!("```json\n{}\n```", body[..end].trim()))
+    });
+    let cut = match json {
+        Some(block) if block.len() < result.trim().len() => block,
+        Some(_) => return result.trim().to_string(),
+        None if result.len() <= RELAY_MAX => return result.trim().to_string(),
+        None => {
+            let end = (0..=RELAY_MAX).rev().find(|&i| result.is_char_boundary(i)).unwrap_or(0);
+            format!("{}…", result[..end].trim_end())
+        }
+    };
+    match file {
+        Some(f) => format!("{cut}\n\nFull result: `{}`", f.display()),
+        None => cut,
+    }
+}
+
 fn tail(text: &str, lines: usize) -> String {
     let all: Vec<&str> = text.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
@@ -274,11 +301,9 @@ pub async fn run(args: WorkerRunArgs) -> Result<()> {
             .await;
     }
     let detail = if ok || !result.is_empty() { result.clone() } else { tail(&stderr, 20) };
-    if let Err(e) =
-        runs::worker_finished(&args.run_dir, &args.session_id, &args.skill, &args.task, ok, elapsed, cost, &detail)
-    {
-        eprintln!("jg-team-dev: recording the result in {}: {e:#}", args.run_dir.display());
-    }
+    let saved = runs::worker_finished(&args.run_dir, &args.session_id, &args.skill, &args.task, ok, elapsed, cost, &detail)
+        .map_err(|e| eprintln!("jg-team-dev: recording the result in {}: {e:#}", args.run_dir.display()))
+        .ok();
     if let Some(w) = &worker {
         let _: Result<Session, _> = client
             .patch(
@@ -294,12 +319,19 @@ pub async fn run(args: WorkerRunArgs) -> Result<()> {
     let cost = cost.map(|c| format!(", ${c:.2}")).unwrap_or_default();
     let text = if ok {
         format!(
-            "[jg-team-dev] Worker **{title}** finished ({}m{:02}s{cost}). Its result:\n\n{result}",
+            "[jg-team-dev] Worker **{title}** finished ({}m{:02}s{cost}). Its result:\n\n{}",
             elapsed / 60,
-            elapsed % 60
+            elapsed % 60,
+            relay_result(&result, saved.as_deref())
         )
     } else {
-        format!("[jg-team-dev] Worker **{title}** failed after {}m{:02}s ({}).\n\n{detail}", elapsed / 60, elapsed % 60, out.status)
+        format!(
+            "[jg-team-dev] Worker **{title}** failed after {}m{:02}s ({}).\n\n{}",
+            elapsed / 60,
+            elapsed % 60,
+            out.status,
+            relay_result(&detail, saved.as_deref())
+        )
     };
     team::relay(&client, &args.parent, worker.as_ref().map(|w| w.id.as_str()), &text)
         .await
@@ -345,6 +377,21 @@ mod tests {
         assert_eq!(&id[14..15], "4");
         assert!(matches!(&id[19..20], "8" | "9" | "a" | "b"));
         assert_ne!(id, new_uuid().unwrap());
+    }
+
+    #[test]
+    fn relay_keeps_the_json_block_and_points_at_the_rest() {
+        let file = Path::new("/p/.team/runs/r1/worker-results/coder-w1.md");
+        let long = format!("{}\n\n```json\n{{\"status\": \"completed\"}}\n```\n", "I changed a lot. ".repeat(50));
+        let text = relay_result(&long, Some(file));
+        assert!(text.starts_with("```json\n{\"status\": \"completed\"}\n```"));
+        assert!(text.ends_with("Full result: `/p/.team/runs/r1/worker-results/coder-w1.md`"));
+        assert!(!text.contains("I changed"));
+        // A short result without JSON goes as it is; a long one is cut, with the pointer.
+        assert_eq!(relay_result("done", Some(file)), "done");
+        let cut = relay_result(&"é".repeat(RELAY_MAX), Some(file));
+        assert!(cut.len() < RELAY_MAX + 100 && cut.contains("…\n\nFull result:"));
+        assert_eq!(relay_result(&"x".repeat(RELAY_MAX + 1), None), format!("{}…", "x".repeat(RELAY_MAX)));
     }
 
     #[test]

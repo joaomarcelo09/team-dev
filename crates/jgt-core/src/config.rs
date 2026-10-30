@@ -53,7 +53,18 @@ pub struct SkillSettings {
     /// Tools the session may not use (`claude --disallowedTools`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub disallowed_tools: Option<Vec<String>>,
+    /// Context size in tokens at which Claude Code compacts the session (`autoCompactWindow`,
+    /// 100000 to 1000000); 0 leaves it to Claude Code. The Coordinator defaults to
+    /// [`COORDINATOR_COMPACT_WINDOW`]: it lives for days, and every step re-reads its whole context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compact_window: Option<u64>,
 }
+
+/// Default `compact_window` of the Coordinator.
+pub const COORDINATOR_COMPACT_WINDOW: u64 = 120_000;
+
+/// The range Claude Code accepts for `autoCompactWindow`.
+pub const COMPACT_WINDOW_RANGE: (u64, u64) = (100_000, 1_000_000);
 
 impl SkillSettings {
     /// Fills what `self` leaves unset from `other`.
@@ -64,6 +75,7 @@ impl SkillSettings {
             permission_mode: self.permission_mode.or_else(|| other.permission_mode.clone()),
             allowed_tools: self.allowed_tools.or_else(|| other.allowed_tools.clone()),
             disallowed_tools: self.disallowed_tools.or_else(|| other.disallowed_tools.clone()),
+            compact_window: self.compact_window.or(other.compact_window),
         }
     }
 }
@@ -91,6 +103,8 @@ pub struct SessionSettings {
     pub permission_mode: String,
     pub allowed_tools: Vec<String>,
     pub disallowed_tools: Vec<String>,
+    /// `autoCompactWindow` for the session; `None` leaves it to Claude Code.
+    pub compact_window: Option<u64>,
 }
 
 /// The project config file that applies to `folder`: the nearest `.team/config.toml` above it.
@@ -129,6 +143,11 @@ impl Team {
             permission_mode: merged.permission_mode.unwrap_or_else(|| self.permission_mode.clone()),
             allowed_tools: merged.allowed_tools.unwrap_or_default(),
             disallowed_tools: merged.disallowed_tools.unwrap_or_default(),
+            compact_window: match merged.compact_window {
+                Some(0) => None,
+                Some(w) => Some(w.clamp(COMPACT_WINDOW_RANGE.0, COMPACT_WINDOW_RANGE.1)),
+                None => (skill == crate::model::COORDINATOR).then_some(COORDINATOR_COMPACT_WINDOW),
+            },
         }
     }
 }
@@ -276,6 +295,20 @@ mod tests {
         assert_eq!((tester.model.as_str(), tester.effort.as_str()), ("opus", "medium"));
         assert_eq!(tester.allowed_tools, ["Bash(cargo test:*)"]);
         assert_eq!(tester.permission_mode, "auto");
+        assert_eq!(tester.compact_window, None);
+    }
+
+    #[test]
+    fn the_coordinator_compacts_early_unless_told_otherwise() {
+        let none = ProjectTeam::default();
+        let team = Config::default().team;
+        assert_eq!(team.resolve("coordinator", &none).compact_window, Some(COORDINATOR_COMPACT_WINDOW));
+        let user: Config = toml::from_str(
+            "[team.skills.coordinator]\ncompact_window = 0\n[team.skills.coder]\ncompact_window = 5000\n",
+        )
+        .unwrap();
+        assert_eq!(user.team.resolve("coordinator", &none).compact_window, None);
+        assert_eq!(user.team.resolve("coder", &none).compact_window, Some(COMPACT_WINDOW_RANGE.0));
     }
 
     #[test]

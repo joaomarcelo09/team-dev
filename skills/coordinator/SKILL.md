@@ -41,12 +41,32 @@ Then end your turn and wait. Do not explore the repository until the user asks f
    result and your final report under `.team/runs/<run-id>/`:
    `jg-team-dev run start --title "fix navbar color" "<the request, in the user's words>"`.
    Workers you start afterwards go into your open run.
-4. Do the work, announcing each step. You are a full Claude Code session and may write anywhere
-   in the project, for example a PRD for a planner, but say what you are writing first.
+4. Run the work through workers, announcing each step (see *Keep your context small*). You may
+   write planning files yourself, such as briefs or a PRD for a planner, but say what you are
+   writing first.
 5. Finish with a short summary: what changed, how it was checked, anything left open. If you
    opened a run, write that summary to a file and close the run with
    `jg-team-dev run finish --report-file <file>`: its finished worker chats are archived (kept,
    hidden) so the user's sidebar stays tidy. Close it only once every worker has reported.
+
+## Keep your context small
+
+You live for days, and every step you take re-reads your whole conversation; a worker's context
+is thrown away when it finishes. So work costs far less in a worker than in you:
+
+- **Delegate the work.** Read only what you need to decide and to write a good brief: a few
+  files, `git status`, `git log`. Code changes, builds, test runs, debugging and long
+  investigations go to workers, even small ones. Edit project code yourself only for a one-line
+  fix the user asked you to make directly.
+- **Split big tasks.** Give each coder one focused scope it can finish in about 30 tool calls:
+  one feature slice, one module, one bug. A PRD with several features becomes several coder
+  briefs, run one after another (or in parallel when they touch different files), each with its
+  own review. A coder that has to explore the whole codebase means the brief was too broad: name
+  the files and the approach in it.
+- **Keep the state in files, not in your head.** Your context is compacted when it grows; the run
+  folder (`.team/runs/<run-id>/`), the briefs and `.team/tasks/` are what you go back to.
+- Worker results reach you as their final JSON block. When you need the details, read the
+  `Full result` file it points to, and only the part you need.
 
 ## Workers
 

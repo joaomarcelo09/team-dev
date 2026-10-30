@@ -59,7 +59,12 @@ permission_mode = "auto"  # only prompts auto mode can't settle reach the app
 model = "sonnet"
 allowed_tools = ["Bash(cargo test:*)"]   # claude --allowedTools
 disallowed_tools = ["WebFetch"]          # claude --disallowedTools
+compact_window = 200000                  # compact the context at this size (100000–1000000)
 ```
+
+The Coordinator compacts at `compact_window = 120000` unless set (`0` leaves it to Claude Code): it
+lives for days and every step re-reads its whole context. Workers report to it with only their
+final JSON block and the path of the full result in the run, so its context stays small.
 
 A project can override these in `.team/config.toml`, with the same `[team]` and
 `[team.skills.<skill>]` tables. The most specific setting wins: project skill, project, user

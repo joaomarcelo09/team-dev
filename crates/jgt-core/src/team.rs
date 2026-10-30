@@ -48,7 +48,7 @@ pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Ve
         "--permission-mode".into(),
         settings.permission_mode.clone(),
         "--settings".into(),
-        file("settings.json"),
+        settings_file(files, settings.compact_window).to_string_lossy().into_owned(),
         "--mcp-config".into(),
         file("mcp.json"),
         "--strict-mcp-config".into(),
@@ -68,6 +68,29 @@ pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Ve
         args.extend(["--disallowedTools".into(), tool.clone()]);
     }
     args
+}
+
+/// The `--settings` file for a session: `settings.json`, or for a compact window a copy of it with
+/// `autoCompactWindow` set, `settings-compact-<window>.json`. The window is in the file name
+/// because a background session respawns with the flags it was started with: the path must keep
+/// meaning the same window. The copy is rewritten from `settings.json` on each call, so it follows
+/// upgrades; if that fails, the session runs with `settings.json` and Claude Code's own window.
+pub fn settings_file(files: &Path, compact_window: Option<u64>) -> PathBuf {
+    let base = files.join("settings.json");
+    let Some(window) = compact_window else { return base };
+    let path = files.join(format!("settings-compact-{window}.json"));
+    let derived = std::fs::read_to_string(&base)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|mut v| {
+            v.as_object_mut()?.insert("autoCompactWindow".into(), window.into());
+            serde_json::to_string_pretty(&v).ok()
+        });
+    match derived {
+        Some(text) if std::fs::write(&path, &text).is_ok() => path,
+        _ if path.is_file() => path,
+        _ => base,
+    }
 }
 
 /// Whether Claude Code still keeps the background session's saved options. A plain
@@ -126,6 +149,21 @@ mod tests {
         assert!(args.contains("--settings /data/claude/settings.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
         assert!(args.contains("--setting-sources project,local --plugin-dir /data/claude/plugin"));
         assert!(args.ends_with("-n coordinator · app"));
+    }
+
+    #[test]
+    fn a_compact_window_gets_its_own_settings_file() {
+        let dir = std::env::temp_dir().join(format!("jgt-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(settings_file(&dir, Some(120_000)), dir.join("settings.json"), "no base file to copy");
+        std::fs::write(dir.join("settings.json"), r#"{"hooks": {"Stop": []}}"#).unwrap();
+        assert_eq!(settings_file(&dir, None), dir.join("settings.json"));
+        let path = settings_file(&dir, Some(120_000));
+        assert_eq!(path, dir.join("settings-compact-120000.json"));
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["autoCompactWindow"], 120_000);
+        assert!(v["hooks"]["Stop"].is_array());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

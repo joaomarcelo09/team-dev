@@ -194,7 +194,7 @@ pub fn worker_started(run: &Path, worker: &str, skill: &str, task: &str, cwd: &P
     )
 }
 
-/// Saves a worker's result in `worker-results/` and records its end.
+/// Saves a worker's result in `worker-results/` and records its end. Returns the result file.
 #[allow(clippy::too_many_arguments)]
 pub fn worker_finished(
     run: &Path,
@@ -205,19 +205,21 @@ pub fn worker_finished(
     secs: u64,
     cost_usd: Option<f64>,
     result: &str,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let name = format!("{skill}-{}.md", jgt_core::short_id(worker));
     let dir = run.join(RESULTS);
     std::fs::create_dir_all(&dir)?;
     let state = if ok { "finished" } else { "failed" };
-    std::fs::write(dir.join(&name), format!("# {skill} · {} ({state})\n\n{}\n", task.trim(), result.trim()))?;
+    let file = dir.join(&name);
+    std::fs::write(&file, format!("# {skill} · {} ({state})\n\n{}\n", task.trim(), result.trim()))?;
     append(
         run,
         json!({
             "event": "worker_finished", "worker": worker, "skill": skill, "ok": ok, "secs": secs,
             "cost_usd": cost_usd, "result": format!("{RESULTS}/{name}"),
         }),
-    )
+    )?;
+    Ok(file)
 }
 
 /// The worker's hub session, when it registered.
