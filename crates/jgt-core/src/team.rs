@@ -102,18 +102,28 @@ pub async fn relay(client: &crate::HubClient, to: &str, from: Option<&str>, text
     wake(client, &target).await
 }
 
+/// Normalizes a folder path for comparison: trims whitespace and trailing slashes,
+/// keeping "/" as "/".
+pub fn normalize_folder(folder: &str) -> &str {
+    let trimmed = folder.trim();
+    match trimmed.trim_end_matches('/') {
+        "" if trimmed.starts_with('/') => "/",
+        rest => rest,
+    }
+}
+
 /// The Coordinator of `folder` now: the newest coordinator session of that folder not ended.
 pub async fn current_coordinator(client: &crate::HubClient, folder: &str) -> Result<Option<crate::Session>, String> {
     let all: crate::api::SessionsResponse =
         client.get("/v1/sessions?archived=true").await.map_err(|e| e.to_string())?;
-    let folder = folder.trim_end_matches('/');
+    let folder = normalize_folder(folder);
     Ok(all
         .sessions
         .into_iter()
         .filter(|s| {
             s.is_coordinator()
                 && s.status != crate::SessionStatus::Ended
-                && s.cwd.as_deref().is_some_and(|c| c.trim_end_matches('/') == folder)
+                && s.cwd.as_deref().is_some_and(|c| normalize_folder(c) == folder)
         })
         .max_by_key(|s| s.created_at))
 }
@@ -163,5 +173,16 @@ mod tests {
         let args = session_args(Path::new("/f"), "t", &settings);
         let tail = &args[args.len() - 6..];
         assert_eq!(tail, ["--allowedTools", "Bash(cargo test:*)", "--allowedTools", "Read", "--disallowedTools", "WebFetch"]);
+    }
+
+    #[test]
+    fn normalize_folder_cases() {
+        assert_eq!(normalize_folder("/foo/bar/"), "/foo/bar");
+        assert_eq!(normalize_folder("/foo/bar///"), "/foo/bar");
+        assert_eq!(normalize_folder("/"), "/");
+        assert_eq!(normalize_folder("///"), "/");
+        assert_eq!(normalize_folder("/foo/bar"), "/foo/bar");
+        assert_eq!(normalize_folder("foo/bar/"), "foo/bar");
+        assert_eq!(normalize_folder("foo/bar"), "foo/bar");
     }
 }

@@ -71,14 +71,20 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
                 // Claude Code lost the saved options (see `team::has_saved_options`): pass them again.
                 let folder = cwd.clone().unwrap_or_default();
                 agent_args.extend(crate::team::coordinator_args(&crate::team::files_dir(), &folder, config));
+            }
+            if session.is_coordinator() {
                 env.push((crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into()));
             }
             Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: true, log: None, env })
         }
         (Harness::ClaudeCode, ReconnectMode::Terminal) => {
+            let mut env = vec![];
+            if session.is_coordinator() {
+                env.push((crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into()));
+            }
             agent_args.extend(["--resume".into(), ext]);
             agent_args.extend(prompt);
-            in_terminal(program, agent_args, cwd, path_prepend, config)
+            in_terminal(program, agent_args, cwd, path_prepend, env, config)
         }
         (Harness::Opencode, ReconnectMode::Background) => {
             agent_args.extend(["run".into(), "--session".into(), ext]);
@@ -97,7 +103,7 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
             if let Some(p) = prompt {
                 agent_args.extend(["--prompt".into(), p]);
             }
-            in_terminal(program, agent_args, cwd, path_prepend, config)
+            in_terminal(program, agent_args, cwd, path_prepend, vec![], config)
         }
         (Harness::Antigravity | Harness::Custom, _) => unreachable!(),
     }
@@ -170,6 +176,7 @@ fn in_terminal(
     agent_args: Vec<String>,
     cwd: Option<PathBuf>,
     path_prepend: Option<PathBuf>,
+    env: Vec<(String, String)>,
     config: &Config,
 ) -> Result<LaunchPlan, String> {
     let dir = cwd
@@ -185,7 +192,7 @@ fn in_terminal(
     command.extend(agent_args);
     let terminal = command.remove(0);
     let terminal = which(&terminal).unwrap_or_else(|| PathBuf::from(&terminal));
-    Ok(LaunchPlan { program: terminal, args: command, cwd, path_prepend, wait: false, log: None, env: vec![] })
+    Ok(LaunchPlan { program: terminal, args: command, cwd, path_prepend, wait: false, log: None, env })
 }
 
 fn detect_terminal(cwd: &str) -> Option<Vec<String>> {
@@ -287,5 +294,30 @@ mod tests {
         assert_ne!(find_program_in(&home, "sh", None).unwrap(), mine);
         assert!(find_program_in(&home, "no-such-program-jgt", None).is_err());
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn coordinator_reconnect_preserves_role_env() {
+        let session: Session = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "harness": "claude-code",
+            "external_id": "ext1",
+            "status": "disconnected",
+            "role": crate::model::COORDINATOR,
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 0,
+            "updated_at": 0,
+            "last_seen_at": 0,
+        }))
+        .unwrap();
+        let mut config = Config::default();
+        config.commands.claude = Some("/bin/sh".into());
+        let p_bg = plan(&session, ReconnectMode::Background, None, &config).unwrap();
+        assert!(p_bg.env.contains(&(crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into())));
+        let p_term = plan(&session, ReconnectMode::Terminal, None, &config).unwrap();
+        assert!(p_term.env.contains(&(crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into())));
     }
 }

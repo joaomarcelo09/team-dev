@@ -382,13 +382,15 @@ impl Db {
     /// The Coordinator of a workspace: the newest coordinator session with that folder that has
     /// not ended (a reset retires, i.e. ends, the previous one).
     pub fn current_coordinator(&self, workspace: &str) -> Result<Option<Session>> {
+        let ws_norm = jgt_core::team::normalize_folder(workspace);
         self.with(|c| {
             c.query_row(
                 &format!(
                     "SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.role = 'coordinator' AND s.status != 'ended'
-                     AND (s.cwd = ?1 OR s.cwd = ?1 || '/') ORDER BY s.created_at DESC LIMIT 1"
+                     AND (s.cwd = ?1 OR s.cwd = ?1 || '/' OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = ?1))
+                     ORDER BY s.created_at DESC LIMIT 1"
                 ),
-                [workspace],
+                [ws_norm],
                 session_from_row,
             )
             .optional()
@@ -535,9 +537,9 @@ impl Db {
     /// Listening → idle for every session (used at start-up, when no waiter can exist).
     pub fn reset_listening(&self) -> Result<usize> {
         let now = now_ms();
-        Ok(self.with(|c| {
+        self.with(|c| {
             c.execute("UPDATE sessions SET status = 'idle', updated_at = ?1 WHERE status = 'listening'", params![now])
-        })?)
+        })
     }
 
     pub fn set_status_if(&self, id: &str, from: SessionStatus, to: SessionStatus) -> Result<bool> {

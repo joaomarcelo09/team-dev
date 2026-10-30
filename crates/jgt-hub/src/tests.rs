@@ -835,6 +835,20 @@ mod board {
             parent_id: None,
         };
         hub.create_task(&req).unwrap();
+        // Coordinator without trailing slash matching workspace with trailing slash.
+        let coord2 = session(&hub, "c2", jgt_core::COORDINATOR, "/tmp/jgt-board-test/no-slash", None);
+        let req2 = CreateTaskRequest {
+            actor: as_session(&coord2),
+            workspace: "/tmp/jgt-board-test/no-slash/".into(),
+            title: "ok2".into(),
+            description: String::new(),
+            priority: None,
+            status: None,
+            parent_id: None,
+        };
+        hub.create_task(&req2).unwrap();
+        assert_eq!(hub.db.current_coordinator("/tmp/jgt-board-test/no-slash/").unwrap().unwrap().id, coord2.id);
+        assert_eq!(hub.db.current_coordinator("/tmp/jgt-board-test/no-slash").unwrap().unwrap().id, coord2.id);
         // Retired (ended) Coordinators are refused.
         hub.end(&coord.id, &EndRequest { reason: format!("{}: reset", jgt_core::RETIRED), gone: true }).unwrap();
         forbidden(hub.create_task(&req));
