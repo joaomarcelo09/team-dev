@@ -3,7 +3,10 @@
 
 use iced::{
     Background, Border, Color, Font, Shadow, Theme, border,
-    theme::{Palette, palette::Extended},
+    theme::{
+        Palette,
+        palette::{self, Extended},
+    },
     widget::{button, container, text_editor, text_input},
 };
 use jgt_core::{NotifyLevel, SessionStatus, TaskPriority, config::Desktop as DesktopConfig};
@@ -80,6 +83,44 @@ pub fn light() -> Theme {
             success: rgb(0x23944f),
             warning: rgb(0xb7791f),
             danger: rgb(0xd1383d),
+        },
+    )
+}
+
+pub fn tokyo_night() -> Theme {
+    Theme::custom_with_fn(
+        "Tokyo Night",
+        Palette {
+            background: rgb(0x1a1b26),
+            text: rgb(0xc0caf5),
+            primary: rgb(0x7aa2f7),
+            success: rgb(0x9ece6a),
+            warning: rgb(0xe0af68),
+            danger: rgb(0xf7768e),
+        },
+        |palette| {
+            let mut ext = Extended::generate(palette);
+            ext.background.weak = palette::Pair::new(rgb(0x24283b), palette.text);
+            ext
+        },
+    )
+}
+
+pub fn dracula() -> Theme {
+    Theme::custom_with_fn(
+        "Dracula",
+        Palette {
+            background: rgb(0x282a36),
+            text: rgb(0xf8f8f2),
+            primary: rgb(0xbd93f9),
+            success: rgb(0x50fa7b),
+            warning: rgb(0xffb86c),
+            danger: rgb(0xff5555),
+        },
+        |palette| {
+            let mut ext = Extended::generate(palette);
+            ext.background.weak = palette::Pair::new(rgb(0x44475a), palette.text);
+            ext
         },
     )
 }
@@ -211,11 +252,21 @@ pub fn banner(accent: Color) -> impl Fn(&Theme) -> container::Style {
 }
 
 pub fn badge(color: Color) -> impl Fn(&Theme) -> container::Style {
-    move |_| container::Style {
-        background: Some(color.into()),
-        border: border::rounded(9),
-        text_color: Some(Color::WHITE),
-        ..Default::default()
+    move |theme| {
+        let p = ext(theme);
+        let text_color = if color == p.primary.base.color {
+            p.primary.base.text
+        } else if color == p.warning.base.color {
+            p.warning.base.text
+        } else {
+            Color::WHITE
+        };
+        container::Style {
+            background: Some(color.into()),
+            border: border::rounded(9),
+            text_color: Some(text_color),
+            ..Default::default()
+        }
     }
 }
 
@@ -294,6 +345,25 @@ pub fn ghost(theme: &Theme, status: button::Status) -> button::Style {
         text_color: match status {
             button::Status::Disabled => muted(theme).scale_alpha(0.6),
             _ => p.background.base.text,
+        },
+        border: border::rounded(6),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// Flat button for inside user bubbles (accented by primary color).
+pub fn ghost_on_primary(theme: &Theme, status: button::Status) -> button::Style {
+    let p = ext(theme);
+    let background = match status {
+        button::Status::Hovered | button::Status::Pressed => Some(p.primary.base.text.scale_alpha(0.15).into()),
+        _ => None,
+    };
+    button::Style {
+        background,
+        text_color: match status {
+            button::Status::Disabled => p.primary.base.text.scale_alpha(0.4),
+            _ => p.primary.base.text,
         },
         border: border::rounded(6),
         shadow: Shadow::default(),
@@ -397,5 +467,23 @@ pub fn task_panel(theme: &Theme) -> container::Style {
         border: Border { color: p.background.strong.color.scale_alpha(0.5), width: 1.0, radius: 0.0.into() },
         text_color: Some(p.background.base.text),
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn styles_are_dark_and_have_surface() {
+        let tn = tokyo_night();
+        assert!(ext(&tn).is_dark);
+        assert_eq!(tn.palette().background, rgb(0x1a1b26));
+        assert_eq!(ext(&tn).background.weak.color, rgb(0x24283b));
+
+        let drac = dracula();
+        assert!(ext(&drac).is_dark);
+        assert_eq!(drac.palette().background, rgb(0x282a36));
+        assert_eq!(ext(&drac).background.weak.color, rgb(0x44475a));
     }
 }

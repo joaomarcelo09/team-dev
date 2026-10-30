@@ -1,7 +1,7 @@
 //! Everything on screen: the session sidebar, the chat, the composer.
 
 use crate::{
-    app::{App, Conn, MESSAGES_ID, Msg, Tab, ThemePref, Thread},
+    app::{App, Conn, MESSAGES_ID, Msg, Tab, ThemePref, ThemeStyle, Thread},
     style,
 };
 use chrono::{Datelike, Local, TimeZone};
@@ -135,6 +135,12 @@ fn settings(app: &App) -> Element<'_, Msg> {
             .style(if app.theme_pref == pref { style::primary_button } else { style::pill_button })
             .padding([4, 12])
     };
+    let style_button = |label: &'static str, s: ThemeStyle| {
+        button(text(label).size(style::fs(13)))
+            .on_press(Msg::SetStyle(s))
+            .style(if app.theme_style == s { style::primary_button } else { style::pill_button })
+            .padding([4, 12])
+    };
     let line = |label: &'static str, control: Element<'static, Msg>| {
         row![text(label).size(style::fs(14)).width(style::fs(14) * 7.0), control].spacing(12).align_y(Alignment::Center)
     };
@@ -165,6 +171,18 @@ fn settings(app: &App) -> Element<'_, Msg> {
                     .into(),
             ),
             muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
+                .size(style::fs(12)),
+            line(
+                "Style",
+                row![
+                    style_button("Default", ThemeStyle::Default),
+                    style_button("Tokyo Night", ThemeStyle::TokyoNight),
+                    style_button("Dracula", ThemeStyle::Dracula),
+                ]
+                .spacing(6)
+                .into()
+            ),
+            muted("Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
                 .size(style::fs(12)),
             line(
                 "Zoom",
@@ -902,6 +920,20 @@ fn copy_button<'a>(body: &str) -> Element<'a, Msg> {
     )
 }
 
+fn copy_button_user<'a>(body: &str) -> Element<'a, Msg> {
+    tip(
+        button(
+            text("Copy")
+                .size(style::fs(11))
+                .style(|theme: &Theme| text::Style { color: Some(theme.extended_palette().primary.base.text.scale_alpha(0.75)) }),
+        )
+        .on_press(Msg::Copy(body.to_string()))
+        .style(style::ghost_on_primary)
+        .padding([0, 6]),
+        "Copy the message text",
+    )
+}
+
 fn select_button<'a>(id: i64, selecting: bool) -> Element<'a, Msg> {
     if selecting {
         tip(
@@ -919,6 +951,34 @@ fn select_button<'a>(id: i64, selecting: bool) -> Element<'a, Msg> {
                 .on_press(Msg::ToggleSelect(id))
                 .style(style::ghost)
                 .padding([0, 6]),
+            "Select text in this message",
+        )
+    }
+}
+
+fn select_button_user<'a>(id: i64, selecting: bool) -> Element<'a, Msg> {
+    if selecting {
+        tip(
+            button(
+                text("Done")
+                    .size(style::fs(11))
+                    .style(|theme: &Theme| text::Style { color: Some(theme.extended_palette().primary.base.text) }),
+            )
+            .on_press(Msg::ToggleSelect(id))
+            .style(style::ghost_on_primary)
+            .padding([0, 6]),
+            "Done selecting text",
+        )
+    } else {
+        tip(
+            button(
+                text("Select")
+                    .size(style::fs(11))
+                    .style(|theme: &Theme| text::Style { color: Some(theme.extended_palette().primary.base.text.scale_alpha(0.75)) }),
+            )
+            .on_press(Msg::ToggleSelect(id))
+            .style(style::ghost_on_primary)
+            .padding([0, 6]),
             "Select text in this message",
         )
     }
@@ -980,8 +1040,8 @@ fn message_view<'a>(
             let footer = row![
                 time_status,
                 space::horizontal(),
-                select_button(m.id, is_selecting),
-                copy_button(&m.body),
+                select_button_user(m.id, is_selecting),
+                copy_button_user(&m.body),
             ]
             .spacing(6)
             .align_y(Alignment::Center);
