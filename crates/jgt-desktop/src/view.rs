@@ -152,6 +152,16 @@ fn settings(app: &App) -> Element<'_, Msg> {
                 .into()
             ),
             line(
+                "Pop-ups",
+                button(text(if app.popups { "On" } else { "Off" }).size(style::fs(13)))
+                    .on_press(Msg::TogglePopups)
+                    .style(if app.popups { style::primary_button } else { style::pill_button })
+                    .padding([4, 12])
+                    .into(),
+            ),
+            muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
+                .size(style::fs(12)),
+            line(
                 "Zoom",
                 stepper(
                     format!("{:.0}%", app.zoom * 100.0),

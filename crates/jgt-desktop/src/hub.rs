@@ -114,6 +114,14 @@ pub async fn presence(focused: bool, session_id: Option<String>) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
+pub async fn reload_config() -> Result<(), String> {
+    client()
+        .post::<_, serde_json::Value>("/v1/config/reload", &())
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 pub async fn reconnect(session: Session, mode: ReconnectMode) -> Result<String, String> {
     jgt_core::launch::reconnect(&client(), &session, mode).await
 }

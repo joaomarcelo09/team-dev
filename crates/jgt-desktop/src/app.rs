@@ -101,6 +101,7 @@ pub struct App {
     pub zoom: f32,
     /// Chat text size in pixels.
     pub text_size: u16,
+    pub popups: bool,
     pub show_settings: bool,
     /// Problems in the `[team]` config (unknown harness or effort, …), shown as a banner in Settings.
     pub config_warnings: Vec<String>,
@@ -229,6 +230,7 @@ pub enum Msg {
     SystemTheme(theme::Mode),
     SetTheme(ThemePref),
     ToggleSettings,
+    TogglePopups,
     Zoom(Step),
     TextSize(Step),
     Key(keyboard::Event),
@@ -241,7 +243,8 @@ pub enum Msg {
 
 impl App {
     pub fn new(start_session: Option<String>) -> (App, Task<Msg>) {
-        let desktop = Config::load().desktop;
+        let config = Config::load();
+        let desktop = &config.desktop;
         let text_size = desktop.text_size.clamp(TEXT_SIZE_RANGE.0, TEXT_SIZE_RANGE.1);
         crate::style::set_text_size(text_size);
         let theme_pref = match desktop.theme.as_str() {
@@ -270,8 +273,9 @@ impl App {
             system_mode: theme::Mode::Dark,
             zoom: clamp_zoom(desktop.zoom),
             text_size,
+            popups: config.notifications.enabled,
             show_settings: false,
-            config_warnings: Config::load().team.warnings(None),
+            config_warnings: config.team.warnings(None),
             new_team: None,
             starting_team: false,
             tabs: HashMap::new(),
@@ -1051,9 +1055,18 @@ impl App {
             Msg::ToggleSettings => {
                 self.show_settings = !self.show_settings;
                 if self.show_settings {
-                    self.config_warnings = Config::load().team.warnings(None);
+                    let config = Config::load();
+                    self.popups = config.notifications.enabled;
+                    self.config_warnings = config.team.warnings(None);
                 }
                 Task::none()
+            }
+            Msg::TogglePopups => {
+                self.popups = !self.popups;
+                let mut config = Config::load();
+                apply_popups(&mut config, self.popups);
+                let _ = config.save();
+                Task::perform(hub::reload_config(), Msg::Done)
             }
             Msg::Zoom(step) => {
                 // 10% steps, rounded so repeated steps don't drift.
@@ -1237,5 +1250,25 @@ impl App {
         config.desktop.zoom = self.zoom;
         config.desktop.text_size = self.text_size;
         let _ = config.save();
+    }
+}
+
+/// Applies the desktop pop-ups setting to a config.
+pub(crate) fn apply_popups(config: &mut Config, enabled: bool) {
+    config.notifications.enabled = enabled;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn applying_popups_toggle_updates_config() {
+        let mut config = Config::default();
+        assert!(config.notifications.enabled);
+        apply_popups(&mut config, false);
+        assert!(!config.notifications.enabled);
+        apply_popups(&mut config, true);
+        assert!(config.notifications.enabled);
     }
 }
