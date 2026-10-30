@@ -3,12 +3,13 @@
 
 use anyhow::Result;
 use jgt_core::{
-    Delivery, Direction, Harness, Message, MessageKind, Question, Session, SessionStatus, now_ms,
+    Actor, Delivery, Direction, Harness, Message, MessageKind, Question, Session, SessionStatus, Task, TaskEvent,
+    TaskEventKind, TaskPriority, TaskStatus, now_ms, task_key,
 };
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{path::Path, sync::Mutex};
 
-const SCHEMA_VERSION: i64 = 4;
+pub(crate) const SCHEMA_VERSION: i64 = 7;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -35,6 +36,10 @@ CREATE TABLE sessions (
     parent_id       TEXT,
     cost_usd        REAL,
     run_secs        INTEGER,
+    model           TEXT,
+    effort          TEXT,
+    tokens_in       INTEGER,
+    tokens_out      INTEGER,
     UNIQUE (harness, external_id)
 );
 CREATE INDEX sessions_pid ON sessions (pid);
@@ -70,11 +75,66 @@ CREATE TABLE questions (
 CREATE INDEX questions_message ON questions (message_id);
 "#;
 
+/// The Board (schema 5): tasks, their activity log and the per-workspace key counters. Kept out
+/// of `SCHEMA` so older schemas can still be derived from it; `IF NOT EXISTS` makes it safe to
+/// run again after a crash, since migrations are not transactional.
+pub(crate) const TASKS_SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS tasks (
+    id            TEXT PRIMARY KEY,
+    workspace     TEXT NOT NULL,
+    number        INTEGER NOT NULL,
+    title         TEXT NOT NULL,
+    description   TEXT NOT NULL DEFAULT '',
+    details       TEXT,
+    status        TEXT NOT NULL,
+    position      INTEGER NOT NULL,
+    priority      TEXT NOT NULL DEFAULT 'normal',
+    waiting       TEXT,
+    review_rounds INTEGER NOT NULL DEFAULT 0,
+    round_limit   INTEGER NOT NULL DEFAULT 3,
+    test_result   TEXT,
+    review_result TEXT,
+    run_id        TEXT,
+    worktree      TEXT,
+    parent_id     TEXT REFERENCES tasks (id) ON DELETE SET NULL,
+    created_at    INTEGER NOT NULL,
+    updated_at    INTEGER NOT NULL,
+    done_at       INTEGER,
+    archived      INTEGER NOT NULL DEFAULT 0,
+    UNIQUE (workspace, number)
+);
+CREATE INDEX IF NOT EXISTS tasks_board ON tasks (workspace, status, position);
+
+CREATE TABLE IF NOT EXISTS task_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id    TEXT NOT NULL REFERENCES tasks (id) ON DELETE CASCADE,
+    kind       TEXT NOT NULL,
+    actor      TEXT NOT NULL,
+    body       TEXT NOT NULL DEFAULT '',
+    meta       TEXT NOT NULL DEFAULT '{}',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS task_events_task ON task_events (task_id, id);
+
+-- Keys are never reused, even after a delete: branches, worktrees and runs are named after them.
+CREATE TABLE IF NOT EXISTS task_counters (
+    workspace TEXT PRIMARY KEY,
+    next      INTEGER NOT NULL
+);
+"#;
+
 /// Upgrades from each older schema version, applied in order.
 const MIGRATIONS: &[(i64, &str)] = &[
     (2, "ALTER TABLE sessions ADD COLUMN role TEXT;"),
     (3, "ALTER TABLE sessions ADD COLUMN parent_id TEXT;"),
     (4, "ALTER TABLE sessions ADD COLUMN cost_usd REAL; ALTER TABLE sessions ADD COLUMN run_secs INTEGER;"),
+    (5, TASKS_SCHEMA),
+    // The Orchestrator review column replaces the round-limit flag (PRD D4).
+    (6, "UPDATE tasks SET status = 'orchestrator_review', waiting = NULL
+            WHERE json_extract(waiting, '$.kind') = 'round_limit';"),
+    // What a worker runs on, and the tokens it used (PRD H7, H8).
+    (7, "ALTER TABLE sessions ADD COLUMN model TEXT; ALTER TABLE sessions ADD COLUMN effort TEXT;
+         ALTER TABLE sessions ADD COLUMN tokens_in INTEGER; ALTER TABLE sessions ADD COLUMN tokens_out INTEGER;"),
 ];
 
 /// Columns selected for a `Session`, including the computed counters.
@@ -89,7 +149,7 @@ const SESSION_COLUMNS: &str = r#"
     (SELECT m.body FROM messages m WHERE m.session_id = s.id AND m.kind != 'event'
         ORDER BY m.id DESC LIMIT 1) AS last_message,
     (SELECT m.created_at FROM messages m WHERE m.session_id = s.id ORDER BY m.id DESC LIMIT 1) AS last_message_at,
-    s.role, s.parent_id, s.cost_usd, s.run_secs
+    s.role, s.parent_id, s.cost_usd, s.run_secs, s.model, s.effort, s.tokens_in, s.tokens_out
 "#;
 
 const MESSAGE_COLUMNS: &str =
@@ -97,6 +157,20 @@ const MESSAGE_COLUMNS: &str =
 
 const QUESTION_COLUMNS: &str =
     "id, session_id, message_id, kind, prompt, options, answer, status, created_at, answered_at, expires_at";
+
+/// Columns selected for a `Task`; `current_worker` is computed in the same query (K14).
+const TASK_COLUMNS: &str = r#"
+    t.id, t.workspace, t.number, t.title, t.description, t.details, t.status, t.position, t.priority,
+    t.waiting, t.review_rounds, t.round_limit, t.test_result, t.review_result, t.run_id, t.worktree,
+    t.parent_id, t.created_at, t.updated_at, t.done_at, t.archived,
+    (SELECT json_extract(e.meta, '$.worker') FROM task_events e WHERE e.task_id = t.id
+        AND e.kind = 'worker_started' AND NOT EXISTS (SELECT 1 FROM task_events f
+            WHERE f.task_id = t.id AND f.kind = 'worker_finished' AND f.id > e.id
+            AND json_extract(f.meta, '$.worker') = json_extract(e.meta, '$.worker'))
+        ORDER BY e.id DESC LIMIT 1) AS current_worker
+"#;
+
+const TASK_EVENT_COLUMNS: &str = "id, task_id, kind, actor, body, meta, created_at";
 
 pub struct Db {
     conn: Mutex<Connection>,
@@ -151,7 +225,75 @@ fn session_from_row(row: &Row) -> rusqlite::Result<Session> {
         parent_id: row.get(23)?,
         cost_usd: row.get(24)?,
         run_secs: row.get(25)?,
+        model: row.get(26)?,
+        effort: row.get(27)?,
+        tokens_in: row.get(28)?,
+        tokens_out: row.get(29)?,
     })
+}
+
+/// Reads a JSON column; a value that does not parse is a conversion error, not silently dropped.
+fn json<T: serde::de::DeserializeOwned>(idx: usize, value: Option<String>) -> rusqlite::Result<Option<T>> {
+    value
+        .map(|v| {
+            serde_json::from_str(&v).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(idx, rusqlite::types::Type::Text, e.into())
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn to_json<T: serde::Serialize>(value: &Option<T>) -> Option<String> {
+    value.as_ref().map(|v| serde_json::to_string(v).unwrap_or_default())
+}
+
+fn task_from_row(row: &Row) -> rusqlite::Result<Task> {
+    let number: i64 = row.get(2)?;
+    Ok(Task {
+        id: row.get(0)?,
+        workspace: row.get(1)?,
+        number,
+        key: task_key(number),
+        title: row.get(3)?,
+        description: row.get(4)?,
+        details: row.get(5)?,
+        status: parse(6, row.get(6)?)?,
+        position: row.get(7)?,
+        priority: parse(8, row.get(8)?)?,
+        waiting: json(9, row.get(9)?)?,
+        review_rounds: row.get(10)?,
+        round_limit: row.get(11)?,
+        test_result: json(12, row.get(12)?)?,
+        review_result: json(13, row.get(13)?)?,
+        run_id: row.get(14)?,
+        worktree: row.get(15)?,
+        parent_id: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
+        done_at: row.get(19)?,
+        archived: row.get(20)?,
+        current_worker: row.get(21)?,
+    })
+}
+
+fn task_event_from_row(row: &Row) -> rusqlite::Result<TaskEvent> {
+    let meta: String = row.get(5)?;
+    Ok(TaskEvent {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        kind: parse(2, row.get(2)?)?,
+        actor: json(3, Some(row.get(3)?))?.unwrap_or(Actor::Hub),
+        body: row.get(4)?,
+        meta: serde_json::from_str(&meta).unwrap_or(serde_json::Value::Null),
+        created_at: row.get(6)?,
+    })
+}
+
+/// `ORDER BY` expression putting tasks in Board column order.
+fn column_order() -> String {
+    let cases: String =
+        TaskStatus::ALL.iter().enumerate().map(|(i, s)| format!(" WHEN '{}' THEN {i}", s.as_str())).collect();
+    format!("CASE t.status{cases} END")
 }
 
 fn message_from_row(row: &Row) -> rusqlite::Result<Message> {
@@ -207,6 +349,7 @@ impl Db {
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if version == 0 {
             conn.execute_batch(SCHEMA)?;
+            conn.execute_batch(TASKS_SCHEMA)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         } else if version < SCHEMA_VERSION {
             for (to, sql) in MIGRATIONS.iter().filter(|(to, _)| *to > version) {
@@ -224,7 +367,33 @@ impl Db {
         Ok(f(&conn)?)
     }
 
+    /// Runs Board queries in one transaction, committed only when `f` succeeds. `f` must not
+    /// call other `Db` methods: the connection is locked while it runs.
+    pub fn board<T, E: From<rusqlite::Error>>(&self, f: impl FnOnce(&Board) -> Result<T, E>) -> Result<T, E> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = conn.unchecked_transaction()?;
+        let out = f(&Board { c: &tx })?;
+        tx.commit()?;
+        Ok(out)
+    }
+
     // ── sessions ────────────────────────────────────────────────────────────
+
+    /// The Coordinator of a workspace: the newest coordinator session with that folder that has
+    /// not ended (a reset retires, i.e. ends, the previous one).
+    pub fn current_coordinator(&self, workspace: &str) -> Result<Option<Session>> {
+        self.with(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.role = 'coordinator' AND s.status != 'ended'
+                     AND (s.cwd = ?1 OR s.cwd = ?1 || '/') ORDER BY s.created_at DESC LIMIT 1"
+                ),
+                [workspace],
+                session_from_row,
+            )
+            .optional()
+        })
+    }
 
     pub fn session(&self, id: &str) -> Result<Option<Session>> {
         self.with(|c| {
@@ -434,6 +603,24 @@ impl Db {
                 c.execute("UPDATE sessions SET cost_usd = ?2, run_secs = ?3 WHERE id = ?1", params![id, cost, secs])?;
             }
             c.execute("UPDATE sessions SET updated_at = ?2 WHERE id = ?1", params![id, now])
+        })?;
+        Ok(())
+    }
+
+    /// A worker's model and effort, and the tokens of its run; `None` leaves a field as it is.
+    pub fn set_run_info(
+        &self,
+        id: &str,
+        model: Option<&str>,
+        effort: Option<&str>,
+        tokens: (Option<i64>, Option<i64>),
+    ) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE sessions SET model = COALESCE(?2, model), effort = COALESCE(?3, effort),
+                    tokens_in = COALESCE(?4, tokens_in), tokens_out = COALESCE(?5, tokens_out) WHERE id = ?1",
+                params![id, model, effort, tokens.0, tokens.1],
+            )
         })?;
         Ok(())
     }
@@ -674,5 +861,268 @@ impl Db {
             self.with(|c| c.execute("UPDATE questions SET status = 'expired' WHERE id = ?1", [id]))?;
         }
         ids.iter().filter_map(|id| self.question(id).transpose()).collect()
+    }
+}
+
+/// A new task; the number and position are allocated by `Board::insert_task`.
+pub struct NewTask<'a> {
+    pub workspace: &'a str,
+    pub title: &'a str,
+    pub description: &'a str,
+    pub priority: TaskPriority,
+    pub status: TaskStatus,
+    pub parent_id: Option<&'a str>,
+}
+
+/// Board queries inside one transaction (see `Db::board`).
+pub struct Board<'a> {
+    c: &'a Connection,
+}
+
+impl Board<'_> {
+    pub fn task(&self, id: &str) -> rusqlite::Result<Option<Task>> {
+        self.c.query_row(&format!("SELECT {TASK_COLUMNS} FROM tasks t WHERE t.id = ?1"), [id], task_from_row).optional()
+    }
+
+    pub fn task_by_key(&self, workspace: &str, number: i64) -> rusqlite::Result<Option<Task>> {
+        self.c
+            .query_row(
+                &format!("SELECT {TASK_COLUMNS} FROM tasks t WHERE t.workspace = ?1 AND t.number = ?2"),
+                params![workspace, number],
+                task_from_row,
+            )
+            .optional()
+    }
+
+    /// A workspace's tasks in Board order: column, then position.
+    pub fn tasks(&self, workspace: &str, include_archived: bool) -> rusqlite::Result<Vec<Task>> {
+        let mut stmt = self.c.prepare(&format!(
+            "SELECT {TASK_COLUMNS} FROM tasks t WHERE t.workspace = ?1 AND (?2 OR t.archived = 0)
+             ORDER BY {}, t.position, t.number",
+            column_order()
+        ))?;
+        stmt.query_map(params![workspace, include_archived], task_from_row)?.collect()
+    }
+
+    /// Creates a task with the workspace's next key, at the end of its column.
+    pub fn insert_task(&self, new: &NewTask) -> rusqlite::Result<Task> {
+        let now = now_ms();
+        self.c.execute(
+            "INSERT INTO task_counters (workspace, next) VALUES (?1, 1) ON CONFLICT (workspace) DO NOTHING",
+            [new.workspace],
+        )?;
+        let number: i64 =
+            self.c.query_row("SELECT next FROM task_counters WHERE workspace = ?1", [new.workspace], |r| r.get(0))?;
+        self.c.execute("UPDATE task_counters SET next = next + 1 WHERE workspace = ?1", [new.workspace])?;
+        let id = ulid::Ulid::generate().to_string();
+        self.c.execute(
+            "INSERT INTO tasks (id, workspace, number, title, description, status, position, priority, parent_id,
+                created_at, updated_at, round_limit)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
+                (SELECT COALESCE(MAX(position) + 1, 0) FROM tasks WHERE workspace = ?2 AND status = ?6 AND archived = 0),
+                ?7, ?8, ?9, ?9, ?10)",
+            params![
+                id,
+                new.workspace,
+                number,
+                new.title,
+                new.description,
+                new.status.as_str(),
+                new.priority.as_str(),
+                new.parent_id,
+                now,
+                jgt_core::ROUND_LIMIT
+            ],
+        )?;
+        self.task(&id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
+    }
+
+    /// Writes every field of `task` except its column and position (see `place`).
+    pub fn save(&self, task: &Task) -> rusqlite::Result<()> {
+        self.c.execute(
+            "UPDATE tasks SET title = ?2, description = ?3, details = ?4, priority = ?5, waiting = ?6,
+                review_rounds = ?7, round_limit = ?8, test_result = ?9, review_result = ?10, run_id = ?11,
+                worktree = ?12, parent_id = ?13, done_at = ?14, archived = ?15, updated_at = ?16
+             WHERE id = ?1",
+            params![
+                task.id,
+                task.title,
+                task.description,
+                task.details,
+                task.priority.as_str(),
+                to_json(&task.waiting),
+                task.review_rounds,
+                task.round_limit,
+                to_json(&task.test_result),
+                to_json(&task.review_result),
+                task.run_id,
+                task.worktree,
+                task.parent_id,
+                task.done_at,
+                task.archived,
+                now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Writes only the named columns of a task (plus `updated_at`), so an edit cannot overwrite
+    /// what other writes changed. Column names come from the hub, never from a request.
+    pub fn set_columns(&self, id: &str, columns: &[(&str, &dyn rusqlite::ToSql)]) -> rusqlite::Result<()> {
+        let sets: String = columns.iter().enumerate().map(|(i, (name, _))| format!("{name} = ?{}, ", i + 3)).collect();
+        let sql = format!("UPDATE tasks SET {sets}updated_at = ?2 WHERE id = ?1");
+        let now = now_ms();
+        let mut values: Vec<&dyn rusqlite::ToSql> = vec![&id, &now];
+        values.extend(columns.iter().map(|(_, v)| *v));
+        self.c.execute(&sql, values.as_slice())?;
+        Ok(())
+    }
+
+    /// Puts a task in column `to` at index `position` (the end when absent) and renumbers that
+    /// column from 0. A task leaving its column closes the gap it leaves there (see `compact`).
+    pub fn place(&self, id: &str, workspace: &str, to: TaskStatus, position: Option<i64>) -> rusqlite::Result<()> {
+        let from: String = self.c.query_row("SELECT status FROM tasks WHERE id = ?1", [id], |r| r.get(0))?;
+        let mut ids = self.column_ids(workspace, to.as_str(), id)?;
+        let at = position.map_or(ids.len(), |p| p.clamp(0, ids.len() as i64) as usize);
+        ids.insert(at, id.to_string());
+        self.c.execute(
+            "UPDATE tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, to.as_str(), now_ms()],
+        )?;
+        self.renumber(&ids)?;
+        if from != to.as_str() {
+            self.compact(workspace, &from)?;
+        }
+        Ok(())
+    }
+
+    /// The ids of a column's tasks in order, without archived tasks and `except`.
+    fn column_ids(&self, workspace: &str, status: &str, except: &str) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.c.prepare(
+            "SELECT id FROM tasks WHERE workspace = ?1 AND status = ?2 AND id != ?3 AND archived = 0
+             ORDER BY position, number",
+        )?;
+        stmt.query_map(params![workspace, status, except], |r| r.get(0))?.collect()
+    }
+
+    fn renumber(&self, ids: &[String]) -> rusqlite::Result<()> {
+        let mut stmt = self.c.prepare("UPDATE tasks SET position = ?2 WHERE id = ?1")?;
+        for (i, id) in ids.iter().enumerate() {
+            stmt.execute(params![id, i as i64])?;
+        }
+        Ok(())
+    }
+
+    /// Numbers a column's tasks from 0 again, so positions stay the index the app places cards by.
+    fn compact(&self, workspace: &str, status: &str) -> rusqlite::Result<()> {
+        self.renumber(&self.column_ids(workspace, status, "")?)
+    }
+
+    /// Deletes a task and closes the gap it leaves in its column.
+    pub fn delete_task(&self, id: &str) -> rusqlite::Result<bool> {
+        let column: Option<(String, String)> = self
+            .c
+            .query_row("SELECT workspace, status FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((workspace, status)) = column else { return Ok(false) };
+        self.c.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+        self.compact(&workspace, &status)?;
+        Ok(true)
+    }
+
+    /// Done tasks finished before `cutoff` (ms) and not archived yet, in every workspace.
+    pub fn done_before(&self, cutoff: i64) -> rusqlite::Result<Vec<String>> {
+        let mut stmt = self.c.prepare(
+            "SELECT id FROM tasks WHERE status = 'done' AND archived = 0 AND done_at IS NOT NULL AND done_at < ?1",
+        )?;
+        stmt.query_map([cutoff], |r| r.get(0))?.collect()
+    }
+
+    /// Hides a task from the Board (K15) and closes the gap it leaves in its column.
+    pub fn archive(&self, id: &str) -> rusqlite::Result<()> {
+        let (workspace, status): (String, String) =
+            self.c.query_row("SELECT workspace, status FROM tasks WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        self.set_columns(id, &[("archived", &true as &dyn rusqlite::ToSql)])?;
+        self.compact(&workspace, &status)
+    }
+
+    /// Tasks of the workspace the team is working on (Working, Testing, Review), except `except`.
+    pub fn count_in_progress(&self, workspace: &str, except: &str) -> rusqlite::Result<i64> {
+        self.c.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE workspace = ?1 AND id != ?2
+             AND status IN ('working', 'testing', 'review') AND archived = 0",
+            params![workspace, except],
+            |r| r.get(0),
+        )
+    }
+
+    pub fn insert_event(
+        &self,
+        task_id: &str,
+        kind: TaskEventKind,
+        actor: &Actor,
+        body: &str,
+        meta: &serde_json::Value,
+    ) -> rusqlite::Result<TaskEvent> {
+        let meta = if meta.is_null() { "{}".to_string() } else { meta.to_string() };
+        self.c.execute(
+            "INSERT INTO task_events (task_id, kind, actor, body, meta, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![task_id, kind.as_str(), serde_json::to_string(actor).unwrap_or_default(), body, meta, now_ms()],
+        )?;
+        let id = self.c.last_insert_rowid();
+        self.c.query_row(
+            &format!("SELECT {TASK_EVENT_COLUMNS} FROM task_events WHERE id = ?1"),
+            [id],
+            task_event_from_row,
+        )
+    }
+
+    /// A task's activity log, oldest first.
+    pub fn events(&self, task_id: &str) -> rusqlite::Result<Vec<TaskEvent>> {
+        let mut stmt =
+            self.c.prepare(&format!("SELECT {TASK_EVENT_COLUMNS} FROM task_events WHERE task_id = ?1 ORDER BY id"))?;
+        stmt.query_map([task_id], task_event_from_row)?.collect()
+    }
+
+    /// Whether the user put the task on the queue (created it there, or moved it there).
+    pub fn queued_by_user(&self, task_id: &str) -> rusqlite::Result<bool> {
+        self.c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM task_events WHERE task_id = ?1
+                AND json_extract(actor, '$.kind') = 'user'
+                AND ((kind = 'moved' AND json_extract(meta, '$.to') = 'on_queue')
+                    OR (kind = 'created' AND json_extract(meta, '$.status') = 'on_queue')))",
+            [task_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Every task with a *Waiting* flag, in any workspace.
+    pub fn waiting_tasks(&self) -> rusqlite::Result<Vec<Task>> {
+        let ids: Vec<String> = self
+            .c
+            .prepare("SELECT id FROM tasks WHERE waiting IS NOT NULL")?
+            .query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        ids.iter().filter_map(|id| self.task(id).transpose()).collect()
+    }
+
+    /// When the task last moved into `status`, from its activity log.
+    pub fn entered(&self, task_id: &str, status: TaskStatus) -> rusqlite::Result<Option<i64>> {
+        self.c.query_row(
+            "SELECT MAX(created_at) FROM task_events WHERE task_id = ?1 AND kind = 'moved'
+                AND json_extract(meta, '$.to') = ?2",
+            params![task_id, status.as_str()],
+            |r| r.get(0),
+        )
+    }
+
+    /// Whether a K8 decision taking the task away from the team (take over, stop) was made.
+    pub fn taken_from_team(&self, task_id: &str) -> rusqlite::Result<bool> {
+        self.c.query_row(
+            "SELECT EXISTS (SELECT 1 FROM task_events WHERE task_id = ?1 AND kind = 'decision'
+                AND json_extract(meta, '$.choice') IN ('take_over', 'stop'))",
+            [task_id],
+            |r| r.get(0),
+        )
     }
 }

@@ -6,7 +6,7 @@ use iced::{
     theme::{Palette, palette::Extended},
     widget::{button, container, text_editor, text_input},
 };
-use jgt_core::{NotifyLevel, SessionStatus, config::Desktop as DesktopConfig};
+use jgt_core::{NotifyLevel, SessionStatus, TaskPriority, config::Desktop as DesktopConfig};
 
 /// The UI font family: `[desktop] font` in config.toml, else the first installed of a few
 /// common sans-serif families. Static fonts only: iced cannot pick weights out of variable
@@ -248,6 +248,34 @@ pub fn editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style 
     style
 }
 
+pub fn read_only_editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let p = ext(theme);
+    let mut style = text_editor::default(theme, status);
+    style.background = Background::Color(Color::TRANSPARENT);
+    style.border = Border {
+        color: p.background.strong.color.scale_alpha(0.5),
+        width: 1.0,
+        radius: 8.0.into(),
+    };
+    style.value = p.background.base.text;
+    style.selection = p.primary.base.color.scale_alpha(0.35);
+    style
+}
+
+pub fn read_only_user_editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let p = ext(theme);
+    let mut style = text_editor::default(theme, status);
+    style.background = Background::Color(Color::TRANSPARENT);
+    style.border = Border {
+        color: p.primary.base.text.scale_alpha(0.4),
+        width: 1.0,
+        radius: 8.0.into(),
+    };
+    style.value = p.primary.base.text;
+    style.selection = p.primary.base.text.scale_alpha(0.35);
+    style
+}
+
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let mut style = text_input::default(theme, status);
     style.border = style.border.rounded(8);
@@ -295,4 +323,79 @@ pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
     let mut style = button::danger(theme, status);
     style.border = style.border.rounded(8);
     style
+}
+
+// ── board ───────────────────────────────────────────────────────────────────
+
+/// The Chat | Board tabs in a Coordinator's header.
+pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let p = ext(theme);
+        let mut style = ghost(theme, status);
+        if active {
+            style.background = Some(p.primary.weak.color.scale_alpha(if p.is_dark { 0.35 } else { 0.25 }).into());
+            style.text_color = p.background.base.text;
+        }
+        style
+    }
+}
+
+pub fn priority_color(theme: &Theme, priority: TaskPriority) -> Color {
+    let p = ext(theme);
+    match priority {
+        TaskPriority::High => p.danger.base.color,
+        TaskPriority::Normal => p.primary.base.color,
+        TaskPriority::Low => muted(theme),
+    }
+}
+
+/// A Board column: a soft lane behind the cards.
+pub fn board_column(theme: &Theme) -> container::Style {
+    let p = ext(theme);
+    container::Style {
+        background: Some(p.background.weak.color.scale_alpha(if p.is_dark { 0.35 } else { 0.6 }).into()),
+        border: border::rounded(10),
+        text_color: Some(p.background.base.text),
+        ..Default::default()
+    }
+}
+
+/// A task card; the open one has a primary border, a waiting one a warning border.
+pub fn task_card(open: bool, waiting: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        let p = ext(theme);
+        let border = if open {
+            Border { color: p.primary.base.color, width: 1.5, radius: 8.0.into() }
+        } else if waiting {
+            Border { color: p.warning.base.color, width: 1.5, radius: 8.0.into() }
+        } else {
+            Border { color: p.background.strong.color.scale_alpha(0.4), width: 1.0, radius: 8.0.into() }
+        };
+        container::Style {
+            background: Some(if p.is_dark { p.background.weak.color } else { Color::WHITE }.into()),
+            border,
+            text_color: Some(p.background.base.text),
+            ..Default::default()
+        }
+    }
+}
+
+/// The line where a dragged card would land.
+pub fn drop_line(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(ext(theme).primary.base.color.into()),
+        border: Border { radius: 2.0.into(), ..Default::default() },
+        ..Default::default()
+    }
+}
+
+/// The task side panel, next to the columns.
+pub fn task_panel(theme: &Theme) -> container::Style {
+    let p = ext(theme);
+    container::Style {
+        background: Some(p.background.base.color.into()),
+        border: Border { color: p.background.strong.color.scale_alpha(0.5), width: 1.0, radius: 0.0.into() },
+        text_color: Some(p.background.base.text),
+        ..Default::default()
+    }
 }

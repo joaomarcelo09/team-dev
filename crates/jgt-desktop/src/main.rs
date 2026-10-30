@@ -1,6 +1,7 @@
 //! jg-team-dev-desktop: the jg-team-dev chat window.
 
 mod app;
+mod board;
 mod hub;
 mod style;
 mod view;

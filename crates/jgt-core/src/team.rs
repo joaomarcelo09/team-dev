@@ -1,11 +1,7 @@
 //! What team sessions are started with. Shared by `jg-team-dev start` and the reconnect launcher,
 //! so a Coordinator always comes back with the same hooks, MCP server and skills.
 
-use crate::{
-    config::{Config, SessionSettings},
-    model::COORDINATOR,
-    paths,
-};
+use crate::{config::Config, model::COORDINATOR, paths};
 use std::path::{Path, PathBuf};
 
 /// Plugin name; its skills are invoked as `/jg-team-dev:<skill>`.
@@ -17,8 +13,16 @@ pub const ROLE_ENV: &str = "JGT_ROLE";
 /// Hub id of the Coordinator, set on the workers it starts.
 pub const PARENT_ENV: &str = "JGT_PARENT";
 
+/// The hub's `external_id` of a worker whose harness does not register itself; our MCP server
+/// reads it to find the session (PRD Part B).
+pub const SESSION_ENV: &str = "JGT_SESSION";
+
+/// The board task (hub id) a worker works on, set by `jg-team-dev worker --task-id`; `task_get`
+/// reads it by default.
+pub const TASK_ENV: &str = "JGT_TASK";
+
 /// Worker skills a Coordinator can start (`jg-team-dev worker <skill>`).
-pub const WORKER_SKILLS: &[&str] = &["planner", "coder", "reviewer", "tester", "git-coder"];
+pub const WORKER_SKILLS: &[&str] = &["planner", "coder", "verifier", "reviewer", "tester", "git-coder"];
 
 /// Where `settings.json`, `mcp.json` and `plugin/` for team sessions are written.
 pub fn files_dir() -> PathBuf {
@@ -36,39 +40,7 @@ pub fn worker_title(skill: &str, task: &str) -> String {
     format!("{skill} · {}", task.trim())
 }
 
-/// Claude Code flags for a team session titled `title`, without `--bg`/`-p` and the prompt.
-/// `settings` come from `config.team.for_skill(<skill>, <folder>)`.
-pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Vec<String> {
-    let file = |n: &str| files.join(n).to_string_lossy().into_owned();
-    let mut args: Vec<String> = vec![
-        "--model".into(),
-        settings.model.clone(),
-        "--effort".into(),
-        settings.effort.clone(),
-        "--permission-mode".into(),
-        settings.permission_mode.clone(),
-        "--settings".into(),
-        file("settings.json"),
-        "--mcp-config".into(),
-        file("mcp.json"),
-        "--strict-mcp-config".into(),
-        // Leave out user settings so other tools' global hooks (Liaison, …) never see this session.
-        "--setting-sources".into(),
-        "project,local".into(),
-        "--plugin-dir".into(),
-        file("plugin"),
-        "-n".into(),
-        title.to_string(),
-    ];
-    // One flag per tool: the options take several values, and a pattern may hold spaces.
-    for tool in &settings.allowed_tools {
-        args.extend(["--allowedTools".into(), tool.clone()]);
-    }
-    for tool in &settings.disallowed_tools {
-        args.extend(["--disallowedTools".into(), tool.clone()]);
-    }
-    args
-}
+pub use crate::harness::session_args;
 
 /// Whether Claude Code still keeps the background session's saved options. A plain
 /// `claude --bg --resume <id>` restores them; passing flags then would start a copy under a new
@@ -84,21 +56,16 @@ pub fn has_saved_options(external_id: &str) -> bool {
 /// Queues `text` for the session `to` (a worker reporting to its Coordinator) and wakes `to`
 /// when it is a sleeping Coordinator, so the message is read right away.
 pub async fn relay(client: &crate::HubClient, to: &str, from: Option<&str>, text: &str) -> Result<(), String> {
-    use crate::api::{RelayRequest, SessionsResponse};
+    use crate::api::RelayRequest;
 
     // A result for a Coordinator that has since reset goes to the folder's current Coordinator.
     let mut to = to.to_string();
     let first: crate::Session = client.get(&format!("/v1/sessions/{to}")).await.map_err(|e| e.to_string())?;
-    if first.is_retired() {
-        let all: SessionsResponse = client.get("/v1/sessions?archived=true").await.map_err(|e| e.to_string())?;
-        if let Some(current) = all
-            .sessions
-            .into_iter()
-            .filter(|s| s.is_coordinator() && s.status != crate::SessionStatus::Ended && s.cwd == first.cwd)
-            .max_by_key(|s| s.created_at)
-        {
-            to = current.id;
-        }
+    if first.is_retired()
+        && let Some(cwd) = first.cwd.as_deref()
+        && let Some(current) = current_coordinator(client, cwd).await?
+    {
+        to = current.id;
     }
     let to = to.as_str();
     let _: crate::Message = client
@@ -109,8 +76,30 @@ pub async fn relay(client: &crate::HubClient, to: &str, from: Option<&str>, text
         .await
         .map_err(|e| e.to_string())?;
     let target: crate::Session = client.get(&format!("/v1/sessions/{to}")).await.map_err(|e| e.to_string())?;
-    if target.is_coordinator() && target.status == crate::SessionStatus::Disconnected {
-        crate::launch::reconnect(client, &target, crate::ReconnectMode::Background).await?;
+    wake(client, &target).await
+}
+
+/// The Coordinator of `folder` now: the newest coordinator session of that folder not ended.
+pub async fn current_coordinator(client: &crate::HubClient, folder: &str) -> Result<Option<crate::Session>, String> {
+    let all: crate::api::SessionsResponse =
+        client.get("/v1/sessions?archived=true").await.map_err(|e| e.to_string())?;
+    let folder = folder.trim_end_matches('/');
+    Ok(all
+        .sessions
+        .into_iter()
+        .filter(|s| {
+            s.is_coordinator()
+                && s.status != crate::SessionStatus::Ended
+                && s.cwd.as_deref().is_some_and(|c| c.trim_end_matches('/') == folder)
+        })
+        .max_by_key(|s| s.created_at))
+}
+
+/// Wakes `session` when it is a sleeping (disconnected) Coordinator, so it reads the messages
+/// queued for it right away. The hub never starts agents: the client that queued them does.
+pub async fn wake(client: &crate::HubClient, session: &crate::Session) -> Result<(), String> {
+    if session.is_coordinator() && session.status == crate::SessionStatus::Disconnected {
+        crate::launch::reconnect(client, session, crate::ReconnectMode::Background).await?;
     }
     Ok(())
 }

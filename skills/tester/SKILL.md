@@ -12,7 +12,11 @@ description: jg-team-dev tester worker. Runs independent validation from a valid
 - Tell product failures apart from environment failures (missing tools, services, credentials).
 - Report the exact failing commands with short failure evidence.
 - Skip expensive suites unrelated to the task unless the brief requires them.
+- After a fix round the brief gives a diff base (`jg-team-dev snapshot --task JGT-n --diff`):
+  re-run only the checks that touch the changed files, plus a full build.
 - Never fix product code: report, and the Coordinator decides.
+- If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when you
+  were started with `--task-id`); never move cards: the Coordinator does.
 
 ## How you work
 

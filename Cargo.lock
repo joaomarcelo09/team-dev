@@ -1886,6 +1886,7 @@ dependencies = [
  "futures",
  "iced",
  "jgt-core",
+ "pulldown-cmark",
  "rfd",
  "serde",
  "serde_json",

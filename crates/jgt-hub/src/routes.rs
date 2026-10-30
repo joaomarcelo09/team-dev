@@ -21,6 +21,7 @@ impl IntoResponse for HubError {
             HubError::Gone(msg) => (StatusCode::GONE, msg),
             HubError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             HubError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+            HubError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             HubError::Internal(e) => {
                 tracing::error!("internal error: {e:#}");
                 (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
@@ -69,6 +70,12 @@ pub fn router(hub: SharedHub) -> Router {
         .route("/v1/questions/{id}/wait", get(wait_question))
         .route("/v1/questions/{id}/answer", post(answer))
         .route("/v1/pids/{pid}/pending", get(pending))
+        .route("/v1/tasks", get(list_tasks).post(create_task))
+        .route("/v1/tasks/{id}", get(get_task).patch(patch_task).delete(delete_task))
+        .route("/v1/tasks/{id}/move", post(move_task))
+        .route("/v1/tasks/{id}/results", post(task_results))
+        .route("/v1/tasks/{id}/decision", post(task_decision))
+        .route("/v1/tasks/{id}/events", get(task_events).post(task_event))
         .route("/v1/ui/presence", post(presence))
         .route("/v1/ui/focus", post(focus))
         .with_state(hub)
@@ -256,6 +263,112 @@ async fn pending(
     Query(q): Query<WaitQuery>,
 ) -> ApiResult<PendingResponse> {
     Ok(Json(PendingResponse { sessions: hub.pending_for_pid(pid, q.duration(25)).await? }))
+}
+
+// ── board ───────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct TasksQuery {
+    workspace: String,
+    #[serde(default)]
+    archived: bool,
+}
+
+async fn list_tasks(State(hub): State<SharedHub>, Query(q): Query<TasksQuery>) -> ApiResult<TasksResponse> {
+    Ok(Json(TasksResponse { tasks: hub.tasks(&q.workspace, q.archived)? }))
+}
+
+async fn create_task(State(hub): State<SharedHub>, Json(req): Json<CreateTaskRequest>) -> ApiResult<jgt_core::Task> {
+    Ok(Json(hub.create_task(&req)?))
+}
+
+/// `{id}` is a task id, or a key (`JGT-12`) with `?workspace=`.
+#[derive(Deserialize)]
+struct TaskQuery {
+    workspace: Option<String>,
+}
+
+async fn get_task(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+) -> ApiResult<jgt_core::Task> {
+    Ok(Json(hub.task(&id, q.workspace.as_deref())?))
+}
+
+async fn patch_task(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+    Json(req): Json<PatchTaskRequest>,
+) -> ApiResult<jgt_core::Task> {
+    Ok(Json(hub.patch_task(&id, q.workspace.as_deref(), &req)?))
+}
+
+/// `?actor=user`, or `?session=<id>` for an agent (which the hub refuses: only the user deletes).
+#[derive(Deserialize)]
+struct DeleteTaskQuery {
+    workspace: Option<String>,
+    actor: Option<String>,
+    session: Option<String>,
+}
+
+async fn delete_task(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<DeleteTaskQuery>,
+) -> Result<StatusCode, HubError> {
+    let actor = match (q.actor.as_deref(), q.session) {
+        (_, Some(session)) => ActorRequest::Session { session },
+        (Some("user"), None) => ActorRequest::User,
+        _ => return Err(HubError::BadRequest("pass ?actor=user or ?session=<id>".into())),
+    };
+    hub.delete_task(&id, q.workspace.as_deref(), &actor)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn move_task(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+    Json(req): Json<MoveTaskRequest>,
+) -> ApiResult<MoveResponse> {
+    Ok(Json(hub.move_task(&id, q.workspace.as_deref(), &req)?))
+}
+
+async fn task_results(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+    Json(req): Json<ResultRequest>,
+) -> ApiResult<jgt_core::Task> {
+    Ok(Json(hub.record_results(&id, q.workspace.as_deref(), &req)?))
+}
+
+async fn task_decision(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+    Json(req): Json<DecisionRequest>,
+) -> ApiResult<jgt_core::Task> {
+    Ok(Json(hub.decide(&id, q.workspace.as_deref(), &req)?))
+}
+
+async fn task_events(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+) -> ApiResult<TaskEventsResponse> {
+    Ok(Json(TaskEventsResponse { events: hub.task_events(&id, q.workspace.as_deref())? }))
+}
+
+async fn task_event(
+    State(hub): State<SharedHub>,
+    Path(id): Path<String>,
+    Query(q): Query<TaskQuery>,
+    Json(req): Json<TaskEventRequest>,
+) -> ApiResult<jgt_core::TaskEvent> {
+    Ok(Json(hub.add_task_event(&id, q.workspace.as_deref(), &req)?))
 }
 
 async fn presence(State(hub): State<SharedHub>, Json(req): Json<PresenceRequest>) -> StatusCode {

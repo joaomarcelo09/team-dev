@@ -19,6 +19,8 @@ use std::{
 };
 use tokio::sync::{broadcast, watch};
 
+pub(crate) mod board;
+
 #[derive(Debug, Default, Clone)]
 pub struct Presence {
     pub focused: bool,
@@ -45,12 +47,20 @@ pub enum HubError {
     Gone(String),
     Conflict(String),
     BadRequest(String),
+    /// The actor may not do this (a worker writing the Board, an agent editing the user's text).
+    Forbidden(String),
     Internal(anyhow::Error),
 }
 
 impl From<anyhow::Error> for HubError {
     fn from(e: anyhow::Error) -> Self {
         HubError::Internal(e)
+    }
+}
+
+impl From<rusqlite::Error> for HubError {
+    fn from(e: rusqlite::Error) -> Self {
+        HubError::Internal(e.into())
     }
 }
 
@@ -263,6 +273,9 @@ impl Hub {
             req.archived,
             req.run_secs.map(|secs| (req.cost_usd, secs)),
         )?;
+        if req.model.is_some() || req.effort.is_some() || req.tokens_in.is_some() || req.tokens_out.is_some() {
+            self.db.set_run_info(id, req.model.as_deref(), req.effort.as_deref(), (req.tokens_in, req.tokens_out))?;
+        }
         self.bump();
         self.emit_session(id);
         self.session(id)

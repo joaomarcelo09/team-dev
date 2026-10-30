@@ -1,7 +1,9 @@
 //! Shared types and helpers for every jg-team-dev component.
 
 pub mod api;
+pub mod board;
 pub mod config;
+pub mod harness;
 pub mod launch;
 pub mod client;
 pub mod model;
