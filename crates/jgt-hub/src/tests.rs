@@ -274,6 +274,103 @@ fn coordinators_listen_from_the_start() {
     assert!(again.is_coordinator());
 }
 
+#[test]
+    fn empty_registration_keeps_role_coordinator() {
+        let hub = hub();
+        let req = |role| RegisterRequest {
+            harness: Harness::ClaudeCode,
+            external_id: "coord-session".into(),
+            cwd: Some("/tmp/folder-x".into()),
+            title: Some("coord · folder-x".into()),
+            pid: None,
+            transcript_path: None,
+            source: Some("startup".into()),
+            role,
+            parent: None,
+        };
+        let s = hub.register(&req(Some(jgt_core::COORDINATOR.into()))).unwrap();
+        assert_eq!(s.role.as_deref(), Some(jgt_core::COORDINATOR));
+
+        // Re-register with empty role:
+        let s2 = hub.register(&req(None)).unwrap();
+        assert_eq!(s2.role.as_deref(), Some(jgt_core::COORDINATOR));
+    }
+
+    #[test]
+    fn claim_coordinator_sets_role_and_refuses_second_live_coordinator() {
+        let hub = hub();
+        let make_sess = |ext: &str, cwd: &str, role: Option<&str>| {
+            hub.register(&RegisterRequest {
+                harness: Harness::ClaudeCode,
+                external_id: ext.into(),
+                cwd: Some(cwd.into()),
+                title: Some(format!("coord · {ext}")),
+                pid: None,
+                transcript_path: None,
+                source: Some("startup".into()),
+                role: role.map(str::to_owned),
+                parent: None,
+            })
+            .unwrap()
+        };
+
+        let folder_a = "/tmp/test-folder-a";
+        let folder_b = "/tmp/test-folder-b";
+
+        // Session 1 in folder A with no role claims coordinator:
+        let s1 = make_sess("s1", folder_a, None);
+        assert_eq!(s1.role, None);
+        let s1_claimed = hub.claim_coordinator(&s1.id).unwrap();
+        assert_eq!(s1_claimed.role.as_deref(), Some(jgt_core::COORDINATOR));
+        assert!(s1_claimed.listen);
+
+        // Re-claiming coordinator on an existing Coordinator session is allowed:
+        let s1_reclaimed = hub.claim_coordinator(&s1.id).unwrap();
+        assert_eq!(s1_reclaimed.role.as_deref(), Some(jgt_core::COORDINATOR));
+
+        // Session 2 in folder A with no role tries to claim coordinator while s1 is live (idle/listening):
+        let s2 = make_sess("s2", folder_a, None);
+        let err = hub.claim_coordinator(&s2.id).unwrap_err();
+        match err {
+            HubError::Forbidden(msg) => {
+                assert!(msg.contains("another Coordinator is already running for /tmp/test-folder-a"));
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+
+        // Session 3 in folder B (different folder) succeeds:
+        let s3 = make_sess("s3", folder_b, None);
+        let s3_claimed = hub.claim_coordinator(&s3.id).unwrap();
+        assert_eq!(s3_claimed.role.as_deref(), Some(jgt_core::COORDINATOR));
+
+        // If Session 1 in folder A ends, Session 2 can now claim coordinator:
+        hub.end(&s1.id, &EndRequest { reason: "ended".into(), gone: false }).unwrap();
+        let s2_claimed = hub.claim_coordinator(&s2.id).unwrap();
+        assert_eq!(s2_claimed.role.as_deref(), Some(jgt_core::COORDINATOR));
+
+        // A worker session (e.g. coder) cannot claim coordinator even in an uncoordinated folder:
+        let w = make_sess("w1", "/tmp/test-folder-c", Some("coder"));
+        assert!(w.is_worker());
+        let err = hub.claim_coordinator(&w.id).unwrap_err();
+        match err {
+            HubError::Forbidden(msg) => {
+                assert!(msg.contains("coder worker, not a Coordinator"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+
+        // A verifier worker is also refused:
+        let w2 = make_sess("w2", "/tmp/test-folder-d", Some("verifier"));
+        assert!(w2.is_worker());
+        let err2 = hub.claim_coordinator(&w2.id).unwrap_err();
+        match err2 {
+            HubError::Forbidden(msg) => {
+                assert!(msg.contains("verifier worker, not a Coordinator"), "unexpected message: {msg}");
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
+    }
+
 /// The sessions schema before version 7 added what a worker runs on (`model`, `effort`, tokens).
 fn schema_6() -> String {
     ["model           TEXT", "effort          TEXT", "tokens_in       INTEGER", "tokens_out      INTEGER"]
@@ -822,6 +919,31 @@ mod board {
         let t = team();
         let elsewhere = session(&t.hub, "coord2", jgt_core::COORDINATOR, "/tmp/jgt-board-test/other", None);
         forbidden(t.create(as_session(&elsewhere), "x", None));
+
+        let no_role = t
+            .hub
+            .register(&RegisterRequest {
+                harness: Harness::ClaudeCode,
+                external_id: "no-role-sess".into(),
+                cwd: Some(WS.into()),
+                title: Some("no-role-sess".into()),
+                pid: None,
+                transcript_path: None,
+                source: Some("startup".into()),
+                role: None,
+                parent: None,
+            })
+            .unwrap();
+        let err = t.create(as_session(&no_role), "x", None).unwrap_err();
+        match err {
+            HubError::Forbidden(msg) => {
+                assert_eq!(
+                    msg,
+                    "this Claude Code session has no jg-team-dev role (JGT_ROLE was not set when it started). Run jg-team-dev claim-coordinator, or restart it with jg-team-dev start."
+                );
+            }
+            other => panic!("expected Forbidden, got {other:?}"),
+        }
         // A trailing slash in the Coordinator's folder still matches.
         let hub = hub();
         let coord = session(&hub, "c", jgt_core::COORDINATOR, &format!("{WS}/"), None);

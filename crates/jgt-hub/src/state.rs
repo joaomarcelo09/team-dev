@@ -183,6 +183,36 @@ impl Hub {
         self.session(&session.id)
     }
 
+    /// Sets the role of `id` to `coordinator`, provided no other live Coordinator is running for the same folder (PRD R3).
+    pub fn claim_coordinator(&self, id: &str) -> HubResult<Session> {
+        let session = self.db.session(id)?.ok_or(HubError::NotFound("session"))?;
+        if session.status == SessionStatus::Ended {
+            return Err(HubError::Forbidden("session has ended".into()));
+        }
+        if session.is_worker() {
+            return Err(HubError::Forbidden(session.not_coordinator_error()));
+        }
+        let cwd = session.cwd.as_deref().ok_or_else(|| HubError::BadRequest("session has no folder".into()))?;
+
+        // Refuse if another live (connected) Coordinator already exists on the same folder.
+        if let Some(live) = self.db.live_coordinator(cwd)?
+            && live.id != session.id
+        {
+            return Err(HubError::Forbidden(format!(
+                "another Coordinator is already running for {cwd} ({})",
+                live.display_name()
+            )));
+        }
+
+        self.db.set_role(id, jgt_core::model::COORDINATOR)?;
+        if !session.listen {
+            self.db.patch_session(id, None, false, None, Some(true), None, None, None)?;
+        }
+        self.bump();
+        self.emit_session(id);
+        self.session(id)
+    }
+
     pub fn set_state(&self, id: &str, req: &StateRequest) -> HubResult<Session> {
         let session = self.session(id)?;
         if !req.status.is_connected() {

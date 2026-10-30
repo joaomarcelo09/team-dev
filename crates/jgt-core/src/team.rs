@@ -32,7 +32,7 @@ pub fn files_dir() -> PathBuf {
 /// Claude Code flags for a Coordinator in `folder`, without `--bg` and the prompt.
 pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<String> {
     let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
-    session_args(files, &format!("{COORDINATOR} · {name}"), &config.team.for_skill(COORDINATOR, folder))
+    session_args_for_role(files, &format!("{COORDINATOR} · {name}"), &config.team.for_skill(COORDINATOR, folder), Some(COORDINATOR))
 }
 
 /// Chat title of a worker: `<skill> · <task>`.
@@ -40,18 +40,28 @@ pub fn worker_title(skill: &str, task: &str) -> String {
     format!("{skill} · {}", task.trim())
 }
 
-pub use crate::harness::session_args;
+pub use crate::harness::{session_args, session_args_for_role};
 
-/// The `--settings` file for a session: `settings.json`, or for a compact window a copy of it with
-/// `autoCompactWindow` set, `settings-compact-<window>.json`. The window is in the file name
-/// because a background session respawns with the flags it was started with: the path must keep
-/// meaning the same window. The copy is rewritten from `settings.json` on each call, so it follows
-/// upgrades; if that fails, the session runs with `settings.json` and Claude Code's own window.
-pub fn settings_file(files: &Path, compact_window: Option<u64>) -> PathBuf {
-    let base = files.join("settings.json");
+/// The `--settings` file for a session, optionally role-specific: `settings.json` (or `settings-<role>.json`),
+/// or for a compact window a copy of it with `autoCompactWindow` set (`settings[-<role>]-compact-<window>.json`).
+/// The window is in the file name because a background session respawns with the flags it was started with:
+/// the path must keep meaning the same window. The copy is rewritten from the base file on each call, so it
+/// follows upgrades; if that fails, the session runs with the base file and Claude Code's own window.
+pub fn settings_file_for_role(files: &Path, compact_window: Option<u64>, role: Option<&str>) -> PathBuf {
+    let base_name = match role {
+        Some(r) => format!("settings-{r}.json"),
+        None => "settings.json".to_string(),
+    };
+    let base = files.join(&base_name);
+    let fallback = files.join("settings.json");
+    let base_to_read = if base.is_file() { &base } else { &fallback };
     let Some(window) = compact_window else { return base };
-    let path = files.join(format!("settings-compact-{window}.json"));
-    let derived = std::fs::read_to_string(&base)
+    let path_name = match role {
+        Some(r) => format!("settings-{r}-compact-{window}.json"),
+        None => format!("settings-compact-{window}.json"),
+    };
+    let path = files.join(path_name);
+    let derived = std::fs::read_to_string(base_to_read)
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .and_then(|mut v| {
@@ -63,6 +73,11 @@ pub fn settings_file(files: &Path, compact_window: Option<u64>) -> PathBuf {
         _ if path.is_file() => path,
         _ => base,
     }
+}
+
+/// The `--settings` file for a session without a specific role: `settings.json` (or `settings-compact-<window>.json`).
+pub fn settings_file(files: &Path, compact_window: Option<u64>) -> PathBuf {
+    settings_file_for_role(files, compact_window, None)
 }
 
 /// Whether Claude Code still keeps the background session's saved options. A plain
@@ -145,7 +160,7 @@ mod tests {
     fn coordinator_args_isolate_the_session() {
         let args = coordinator_args(Path::new("/data/claude"), Path::new("/work/app"), &Config::default()).join(" ");
         assert!(args.starts_with("--model opus --effort medium --permission-mode auto"));
-        assert!(args.contains("--settings /data/claude/settings.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
+        assert!(args.contains("--settings /data/claude/settings-coordinator.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
         assert!(args.contains("--setting-sources project,local --plugin-dir /data/claude/plugin"));
         assert!(args.ends_with("-n coordinator · app"));
     }
@@ -162,6 +177,15 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v["autoCompactWindow"], 120_000);
         assert!(v["hooks"]["Stop"].is_array());
+
+        // Role-specific settings file (e.g. settings-coordinator-compact-120000.json).
+        std::fs::write(dir.join("settings-coordinator.json"), r#"{"hooks": {"Stop": []}}"#).unwrap();
+        assert_eq!(settings_file_for_role(&dir, None, Some(COORDINATOR)), dir.join("settings-coordinator.json"));
+        let coord_path = settings_file_for_role(&dir, Some(120_000), Some(COORDINATOR));
+        assert_eq!(coord_path, dir.join("settings-coordinator-compact-120000.json"));
+        let coord_v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&coord_path).unwrap()).unwrap();
+        assert_eq!(coord_v["autoCompactWindow"], 120_000);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

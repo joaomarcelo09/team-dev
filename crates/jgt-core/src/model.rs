@@ -214,6 +214,24 @@ impl Session {
         self.role.as_deref() == Some(COORDINATOR)
     }
 
+    /// A clear error message when `!self.is_coordinator()`, distinguishing sessions with no role
+    /// from sessions that are workers (PRD R4).
+    pub fn not_coordinator_error(&self) -> String {
+        match self.role.as_deref().filter(|r| !r.is_empty()) {
+            Some(role) => format!("session {} is a {role} worker, not a Coordinator.", self.display_name()),
+            None => "this Claude Code session has no jg-team-dev role (JGT_ROLE was not set when it started). Run jg-team-dev claim-coordinator, or restart it with jg-team-dev start.".to_string(),
+        }
+    }
+
+    /// Verifies that this session is a Coordinator, returning an error message if not.
+    pub fn require_coordinator(&self) -> Result<(), String> {
+        if self.is_coordinator() {
+            Ok(())
+        } else {
+            Err(self.not_coordinator_error())
+        }
+    }
+
     /// A Coordinator that handed over to a fresh one with `jg-team-dev reset`.
     pub fn is_retired(&self) -> bool {
         self.status == SessionStatus::Ended && self.ended_reason.as_deref().is_some_and(|r| r.starts_with(RETIRED))
@@ -221,7 +239,7 @@ impl Session {
 
     /// A session started by a Coordinator with one skill.
     pub fn is_worker(&self) -> bool {
-        self.role.is_some() && !self.is_coordinator()
+        self.role.as_deref().is_some_and(|r| !r.is_empty() && r != COORDINATOR)
     }
 
     /// A human-friendly name: the title, else the project folder, else the id.
@@ -755,5 +773,45 @@ mod tests {
         let a = Actor::Coordinator { session: "s1".into() };
         assert_eq!(serde_json::to_string(&a).unwrap(), r#"{"kind":"coordinator","session":"s1"}"#);
         assert_eq!(serde_json::to_string(&Actor::User).unwrap(), r#"{"kind":"user"}"#);
+    }
+
+    #[test]
+    fn not_coordinator_error_distinguishes_no_role_and_worker_role() {
+        let mut s: Session = serde_json::from_value(serde_json::json!({
+            "id": "1",
+            "harness": "claude-code",
+            "external_id": "ext1",
+            "title": "my-worker",
+            "status": "active",
+            "role": null,
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 0,
+            "updated_at": 0,
+            "last_seen_at": 0,
+        }))
+        .unwrap();
+
+        assert_eq!(
+            s.not_coordinator_error(),
+            "this Claude Code session has no jg-team-dev role (JGT_ROLE was not set when it started). Run jg-team-dev claim-coordinator, or restart it with jg-team-dev start."
+        );
+        assert!(!s.is_worker());
+        assert_eq!(s.require_coordinator(), Err(s.not_coordinator_error()));
+
+        s.role = Some("coder".into());
+        assert_eq!(
+            s.not_coordinator_error(),
+            "session my-worker is a coder worker, not a Coordinator."
+        );
+        assert!(s.is_worker());
+        assert_eq!(s.require_coordinator(), Err(s.not_coordinator_error()));
+
+        s.role = Some(COORDINATOR.into());
+        assert!(s.is_coordinator());
+        assert!(!s.is_worker());
+        assert_eq!(s.require_coordinator(), Ok(()));
     }
 }

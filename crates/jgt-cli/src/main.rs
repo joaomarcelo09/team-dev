@@ -98,8 +98,15 @@ enum Command {
         #[arg(long, value_parser = parse_harness, default_value = "claude-code")]
         harness: Harness,
     },
+    /// Claim the Coordinator role for this Claude Code session.
+    ClaimCoordinator,
     /// Claude Code hook (started by Claude Code).
-    Hook { event: hooks::HookEvent },
+    Hook {
+        /// Role of the session calling this hook (coordinator, worker, etc.).
+        #[arg(long)]
+        role: Option<String>,
+        event: hooks::HookEvent,
+    },
 }
 
 fn parse_harness(s: &str) -> Result<Harness, String> {
@@ -116,7 +123,8 @@ async fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Mcp { harness } => mcp::run(harness).await,
-        Command::Hook { event } => hooks::run(event).await,
+        Command::ClaimCoordinator => team::claim_coordinator().await,
+        Command::Hook { role, event } => hooks::run(event, role).await,
         Command::Start { folder } => team::start(folder).await,
         Command::Worker(args) => workers::start(args).await,
         Command::Workers { parent } => workers::list(parent).await,

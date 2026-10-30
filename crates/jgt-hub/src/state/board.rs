@@ -162,8 +162,11 @@ impl Hub {
         if session.status == jgt_core::SessionStatus::Ended {
             return Err(HubError::Forbidden(format!("session {} has ended", session.display_name())));
         }
-        if !session.is_coordinator() {
+        if session.is_worker() {
             return Ok(Actor::Worker { session: session.id });
+        }
+        if !session.is_coordinator() {
+            return Err(HubError::Forbidden(session.not_coordinator_error()));
         }
         match self.db.current_coordinator(workspace)? {
             Some(current) if current.id == session.id => Ok(Actor::Coordinator { session: session.id }),

@@ -17,6 +17,12 @@ pub struct ClaudeCode;
 /// Claude Code flags for a team session titled `title`, without `--bg`/`-p` and the prompt.
 /// `settings` come from `config.team.for_skill(<skill>, <folder>)`.
 pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Vec<String> {
+    session_args_for_role(files, title, settings, None)
+}
+
+/// Claude Code flags for a team session titled `title`, with an optional role (e.g. `COORDINATOR`),
+/// without `--bg`/`-p` and the prompt.
+pub fn session_args_for_role(files: &Path, title: &str, settings: &SessionSettings, role: Option<&str>) -> Vec<String> {
     let file = |n: &str| files.join(n).to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["--model".into(), settings.model.clone()];
     args.extend(ClaudeCode.effort_args(&settings.effort).unwrap_or_default());
@@ -24,7 +30,7 @@ pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Ve
         "--permission-mode".into(),
         settings.permission_mode.clone(),
         "--settings".into(),
-        crate::team::settings_file(files, settings.compact_window).to_string_lossy().into_owned(),
+        crate::team::settings_file_for_role(files, settings.compact_window, role).to_string_lossy().into_owned(),
         "--mcp-config".into(),
         file("mcp.json"),
         "--strict-mcp-config".into(),
