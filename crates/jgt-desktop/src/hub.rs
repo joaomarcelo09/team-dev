@@ -2,8 +2,14 @@
 
 use futures::{SinkExt, Stream, channel::mpsc};
 use jgt_core::{
-    Event, HubClient, Message, Question, ReconnectMode, Session, SessionStatus,
-    api::{AnswerRequest, MessagesResponse, PatchSessionRequest, PresenceRequest, SendRequest, SessionsResponse},
+    Decision, Event, HubClient, Message, Question, ReconnectMode, Session, SessionStatus, Task, TaskEvent, TaskEventKind,
+    TaskStatus,
+    api::{
+        ActorRequest, AnswerRequest, CreateTaskRequest, DecisionRequest, MessagesResponse, MoveResponse,
+        MoveTaskRequest, PatchSessionRequest, PatchTaskRequest, PresenceRequest, SendRequest, SessionsResponse,
+        TaskEventRequest, TaskEventsResponse, TasksResponse,
+    },
+    client::encode_query,
 };
 use std::time::Duration;
 
@@ -150,4 +156,78 @@ pub async fn start_team(folder: String) -> Result<String, String> {
     } else {
         Err(text.trim().trim_start_matches("jg-team-dev: ").to_string())
     }
+}
+
+// ── board ───────────────────────────────────────────────────────────────────
+// The app acts for the user: every Board write carries `ActorRequest::User`.
+
+pub async fn tasks(workspace: String) -> Result<Vec<Task>, String> {
+    client()
+        .get::<TasksResponse>(&format!("/v1/tasks?workspace={}", encode_query(&workspace)))
+        .await
+        .map(|r| r.tasks)
+        .map_err(|e| e.to_string())
+}
+
+pub async fn task_events(task_id: String) -> Result<Vec<TaskEvent>, String> {
+    client()
+        .get::<TaskEventsResponse>(&format!("/v1/tasks/{task_id}/events"))
+        .await
+        .map(|r| r.events)
+        .map_err(|e| e.to_string())
+}
+
+pub async fn create_task(workspace: String, title: String, status: TaskStatus) -> Result<Task, String> {
+    let req = CreateTaskRequest {
+        actor: ActorRequest::User,
+        workspace,
+        title,
+        description: String::new(),
+        priority: None,
+        status: Some(status),
+        parent_id: None,
+    };
+    client().post("/v1/tasks", &req).await.map_err(|e| e.to_string())
+}
+
+/// `edit` fills in the fields to change on a request made for the user.
+pub async fn patch_task(task_id: String, edit: impl FnOnce(&mut PatchTaskRequest)) -> Result<Task, String> {
+    let mut req = PatchTaskRequest::new(ActorRequest::User);
+    edit(&mut req);
+    client().patch(&format!("/v1/tasks/{task_id}"), &req).await.map_err(|e| e.to_string())
+}
+
+/// Moves a task; a sleeping Coordinator told about it (a task put on the queue) is woken.
+pub async fn move_task(task_id: String, to: TaskStatus, position: Option<i64>) -> Result<MoveResponse, String> {
+    let req = MoveTaskRequest { actor: ActorRequest::User, to, position, reason: None };
+    let client = client();
+    let moved: MoveResponse = client.post(&format!("/v1/tasks/{task_id}/move"), &req).await.map_err(|e| e.to_string())?;
+    if let Some(coordinator) = &moved.coordinator {
+        jgt_core::team::wake(&client, coordinator)
+            .await
+            .map_err(|e| format!("moved, but waking the Coordinator failed: {e}"))?;
+    }
+    Ok(moved)
+}
+
+/// Comments on a task as the user (K13). The hub relays it to the workspace's Coordinator, which
+/// is woken here; returns whether a Coordinator is there to read it.
+pub async fn comment(task_id: String, workspace: String, text: String) -> Result<bool, String> {
+    let req = TaskEventRequest { actor: ActorRequest::User, kind: TaskEventKind::Comment, body: text, meta: Default::default() };
+    let client = client();
+    let _: TaskEvent = client.post(&format!("/v1/tasks/{task_id}/events"), &req).await.map_err(|e| e.to_string())?;
+    let Some(coordinator) = jgt_core::team::current_coordinator(&client, &workspace).await? else { return Ok(false) };
+    jgt_core::team::wake(&client, &coordinator)
+        .await
+        .map_err(|e| format!("sent, but waking the Coordinator failed: {e}"))?;
+    Ok(true)
+}
+
+pub async fn delete_task(task_id: String) -> Result<(), String> {
+    client().delete::<()>(&format!("/v1/tasks/{task_id}?actor=user")).await.map_err(|e| e.to_string())
+}
+
+pub async fn decide(task_id: String, choice: Decision) -> Result<Task, String> {
+    let req = DecisionRequest { actor: ActorRequest::User, choice, question_id: None };
+    client().post(&format!("/v1/tasks/{task_id}/decision"), &req).await.map_err(|e| e.to_string())
 }

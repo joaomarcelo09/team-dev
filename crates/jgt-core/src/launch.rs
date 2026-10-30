@@ -44,33 +44,24 @@ const DEFAULT_PROMPT: &str = "You were reconnected from the jg-team-dev app. Say
 
 /// Builds the command that resumes `session`.
 pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config: &Config) -> Result<LaunchPlan, String> {
+    if session.is_worker() && mode == ReconnectMode::Background {
+        // A worker answers one message headless on its own harness, then exits again.
+        let adapter = crate::harness::adapter(session.harness)
+            .ok_or_else(|| format!("{} sessions cannot be restarted by jg-team-dev", session.harness.label()))?;
+        return adapter.resume(session, prompt.unwrap_or(DEFAULT_PROMPT), config);
+    }
     let cwd = session.cwd.as_deref().map(PathBuf::from).filter(|p| p.is_dir());
     let ext = session.external_id.clone();
     let (program, mut agent_args) = match session.harness {
         Harness::ClaudeCode => (find_program("claude", config.commands.claude.as_deref())?, vec![]),
         Harness::Opencode => (find_program("opencode", config.commands.opencode.as_deref())?, vec![]),
+        Harness::Antigravity => return Err("Antigravity workers cannot be restarted by jg-team-dev yet".into()),
         Harness::Custom => return Err("custom sessions cannot be restarted by jg-team-dev".into()),
     };
     let path_prepend = program.parent().map(Path::to_path_buf);
     let prompt = prompt.map(str::to_owned);
 
     match (session.harness, mode) {
-        (Harness::ClaudeCode, ReconnectMode::Background) if session.is_worker() => {
-            // A worker answers one message headless, then exits again (it never listens).
-            let role = session.role.clone().unwrap_or_default();
-            let title = session.title.clone().unwrap_or_else(|| role.clone());
-            agent_args.extend(["-p".into(), "--resume".into(), ext]);
-            agent_args.push(prompt.unwrap_or_else(|| DEFAULT_PROMPT.into()));
-            agent_args.extend(["--output-format".into(), "json".into()]);
-            let settings = config.team.for_skill(&role, cwd.as_deref().unwrap_or(Path::new(".")));
-            agent_args.extend(crate::team::session_args(&crate::team::files_dir(), &title, &settings));
-            let mut env = vec![(crate::team::ROLE_ENV.into(), role)];
-            if let Some(parent) = &session.parent_id {
-                env.push((crate::team::PARENT_ENV.into(), parent.clone()));
-            }
-            let log = crate::paths::data_dir().join("logs").join(format!("{}.log", session.id));
-            Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: false, log: Some(log), env })
-        }
         (Harness::ClaudeCode, ReconnectMode::Background) => {
             let mut env = vec![];
             let restore = session.is_coordinator() && !crate::team::has_saved_options(&ext);
@@ -108,7 +99,7 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
             }
             in_terminal(program, agent_args, cwd, path_prepend, config)
         }
-        (Harness::Custom, _) => unreachable!(),
+        (Harness::Antigravity | Harness::Custom, _) => unreachable!(),
     }
 }
 

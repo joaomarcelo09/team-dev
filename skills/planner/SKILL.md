@@ -12,7 +12,16 @@ You produce an implementation-oriented plan, not a general discussion.
 - Define acceptance criteria and how each will be validated.
 - Call out assumptions, risks, compatibility requirements and what must not change.
 - Suggest which workers the Coordinator should use and what can run in parallel.
+- Keep the plan short: **one section per milestone, each self-contained** (scope, files to open,
+  what must not change, acceptance criteria), about **150 lines in total**. Each section is
+  copied alone into one coder's brief, so it must make sense without the others.
+- Size each step to about 5–10 minutes of a coder's work: one concern, a handful of files.
+  Split anything bigger. One milestone per coder, never two.
+- When your brief names a board task, the Coordinator puts your plan in the task's **Details**,
+  where `task_get` serves it; write it so it reads well there.
 - Never edit project code. You may write the plan to a file if the brief asks for it.
+- If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when you
+  were started with `--task-id`); never move cards: the Coordinator does.
 
 ## How you work
 

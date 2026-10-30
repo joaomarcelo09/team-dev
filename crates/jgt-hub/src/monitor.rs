@@ -35,8 +35,28 @@ fn check(hub: &SharedHub, slow: bool) -> Result<(), crate::state::HubError> {
                 hub.mark_ended(&session, "transcript deleted")?;
             }
         }
+        hub.archive_done_tasks()?;
+        for coordinator in hub.resume_usage_limits()? {
+            wake(coordinator);
+        }
     }
     hub.expire_questions()?;
     hub.check_reconnects()?;
     Ok(())
+}
+
+/// Wakes a sleeping Coordinator after a usage limit reset (E7). The one place the hub starts an
+/// agent: no app or CLI is there to do it at the reset time. It runs the same reconnect plan the
+/// app would, in the background; the queued message reaches the Coordinator either way.
+fn wake(session: jgt_core::Session) {
+    if !(session.is_coordinator() && session.status == SessionStatus::Disconnected) {
+        return;
+    }
+    tokio::spawn(async move {
+        let client = jgt_core::HubClient::default();
+        match jgt_core::launch::reconnect(&client, &session, jgt_core::ReconnectMode::Background).await {
+            Ok(started) => tracing::info!("woke {} after the usage limit: {started}", session.id),
+            Err(e) => tracing::warn!("could not wake {} after the usage limit: {e}", session.id),
+        }
+    });
 }

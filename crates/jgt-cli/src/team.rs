@@ -4,7 +4,7 @@
 use crate::settings;
 use anyhow::{Context, Result, bail};
 use jgt_core::{
-    COORDINATOR, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, procs, short_id,
+    COORDINATOR, Harness, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, procs, short_id,
     api::{EndRequest, HealthResponse, PatchSessionRequest, SessionsResponse},
     config::Config,
     launch::{self, LaunchPlan},
@@ -24,6 +24,7 @@ const SKILLS: &[(&str, &str)] = &[
     ("coder", include_str!("../../../skills/coder/SKILL.md")),
     ("reviewer", include_str!("../../../skills/reviewer/SKILL.md")),
     ("tester", include_str!("../../../skills/tester/SKILL.md")),
+    ("verifier", include_str!("../../../skills/verifier/SKILL.md")),
     ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),
 ];
 
@@ -48,14 +49,33 @@ pub fn write_plugin(dir: &Path) -> Result<()> {
 /// Writes the settings, MCP config and plugin that team sessions load; returns their folder.
 /// Rewritten on every launch, so an upgraded binary's hooks and skills take effect.
 pub fn prepare_files() -> Result<PathBuf> {
+    let files = team::files_dir();
+    prepare_files_in(&files)?;
+    Ok(files)
+}
+
+fn prepare_files_in(files: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("locating the jg-team-dev executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
-    let files = team::files_dir();
-    std::fs::create_dir_all(&files)?;
+    std::fs::create_dir_all(files)?;
     std::fs::write(files.join("settings.json"), serde_json::to_string_pretty(&settings::claude_settings(&exe))?)?;
     std::fs::write(files.join("mcp.json"), serde_json::to_string_pretty(&settings::mcp_config(&exe))?)?;
     write_plugin(&files.join("plugin"))?;
+    Ok(())
+}
+
+/// `prepare_files`, then what a worker on `harness` loads besides (OpenCode's agent files, in
+/// our own config folder under `files`); returns the folder.
+pub fn prepare_worker_files(harness: Harness) -> Result<PathBuf> {
+    let files = team::files_dir();
+    prepare_worker_files_in(&files, harness)?;
     Ok(files)
+}
+
+fn prepare_worker_files_in(files: &Path, harness: Harness) -> Result<()> {
+    prepare_files_in(files)?;
+    let adapter = jgt_core::harness::adapter(harness).with_context(|| format!("{} cannot run workers", harness.label()))?;
+    adapter.install(files).with_context(|| format!("writing the {} worker files in {}", harness.label(), files.display()))
 }
 
 /// Marks `folder` trusted in Claude Code's `~/.claude.json`, which `claude --bg` requires.
@@ -232,6 +252,20 @@ pub async fn reset(summary: Option<PathBuf>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_opencode_worker_gets_its_agent_files_in_our_folder() {
+        let files = temp("oc-install");
+        prepare_worker_files_in(&files, Harness::Opencode).unwrap();
+        for skill in jgt_core::team::WORKER_SKILLS {
+            let agent = files.join("opencode/agents").join(format!("jgt-{skill}.md"));
+            let text = std::fs::read_to_string(&agent).unwrap_or_else(|e| panic!("{}: {e}", agent.display()));
+            assert!(text.starts_with(&format!("---\ndescription: jg-team-dev {skill} worker\n")), "{text}");
+        }
+        // Workers load them through `OPENCODE_CONFIG_DIR`, our folder; `~/.config/opencode` is untouched.
+        assert!(std::fs::read_dir(files.join("opencode")).unwrap().all(|e| e.unwrap().file_name() == "agents"));
+        let _ = std::fs::remove_dir_all(&files);
+    }
 
     fn temp(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("jgt-team-{name}-{}", std::process::id()));

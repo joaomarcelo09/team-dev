@@ -6,6 +6,8 @@ mod hooks;
 mod mcp;
 mod runs;
 mod settings;
+mod snapshot;
+mod tasks;
 mod team;
 mod workers;
 mod worktree;
@@ -36,6 +38,11 @@ enum Command {
     /// Run records under .team/runs/: open one per request, close it with a final report.
     #[command(subcommand)]
     Run(runs::RunCommand),
+    /// The workspace Board: list, create, move and inspect tasks (`JGT-<n>`).
+    Task(tasks::TaskArgs),
+    /// Save what a verification checked as `refs/jgt/<key>/checked-<round>`, or print the diff
+    /// since then (`--diff`), so the next round looks only at the fix.
+    Snapshot(snapshot::SnapshotArgs),
     /// Runs a worker and relays its result (started by `worker`).
     #[command(hide = true)]
     WorkerRun(workers::WorkerRunArgs),
@@ -114,7 +121,9 @@ async fn main() {
         Command::Worker(args) => workers::start(args).await,
         Command::Workers { parent } => workers::list(parent).await,
         Command::WorkerRun(args) => workers::run(args).await,
+        Command::Snapshot(args) => snapshot::run(args).await,
         Command::Run(cmd) => runs::command(cmd).await,
+        Command::Task(args) => tasks::command(args).await,
         Command::Reset { summary } => team::reset(summary).await,
         Command::Settings { mcp } => settings::print(mcp),
         Command::Status => commands::status().await,

@@ -1,7 +1,7 @@
 //! Everything on screen: the session sidebar, the chat, the composer.
 
 use crate::{
-    app::{App, Conn, MESSAGES_ID, Msg, ThemePref, Thread},
+    app::{App, Conn, MESSAGES_ID, Msg, Tab, ThemePref, Thread},
     style,
 };
 use chrono::{Datelike, Local, TimeZone};
@@ -18,11 +18,11 @@ use jgt_core::{
     SessionStatus,
 };
 
-fn bold() -> Font {
+pub(crate) fn bold() -> Font {
     Font { weight: Weight::Semibold, ..style::ui_font() }
 }
 
-fn muted<'a>(content: impl text::IntoFragment<'a>) -> text::Text<'a> {
+pub(crate) fn muted<'a>(content: impl text::IntoFragment<'a>) -> text::Text<'a> {
     text(content).style(|theme: &Theme| text::Style { color: Some(style::muted(theme)) })
 }
 
@@ -30,11 +30,11 @@ fn local(ms: i64) -> Option<chrono::DateTime<Local>> {
     Local.timestamp_millis_opt(ms).single()
 }
 
-fn clock(ms: i64) -> String {
+pub(crate) fn clock(ms: i64) -> String {
     local(ms).map(|t| t.format("%H:%M").to_string()).unwrap_or_default()
 }
 
-fn short_time(ms: i64) -> String {
+pub(crate) fn short_time(ms: i64) -> String {
     let (Some(t), now) = (local(ms), Local::now()) else { return String::new() };
     if t.date_naive() == now.date_naive() {
         t.format("%H:%M").to_string()
@@ -66,11 +66,11 @@ fn status_label(s: &Session) -> &'static str {
     }
 }
 
-fn dot<'a>(color: Color, size: f32) -> Element<'a, Msg> {
+pub(crate) fn dot<'a>(color: Color, size: f32) -> Element<'a, Msg> {
     container(Space::new().width(size).height(size)).style(style::dot(color)).into()
 }
 
-fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: &'a str) -> Element<'a, Msg> {
+pub(crate) fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: &'a str) -> Element<'a, Msg> {
     tooltip(
         content,
         container(text(label).size(style::fs(12))).padding([6, 10]).style(container::rounded_box),
@@ -173,6 +173,7 @@ fn settings(app: &App) -> Element<'_, Msg> {
             ),
             muted("Zoom scales the whole window (Ctrl + / Ctrl − / Ctrl 0). Text size changes only the letters.")
                 .size(style::fs(12)),
+            config_banner(app),
         ]
         .spacing(16),
     )
@@ -187,6 +188,19 @@ fn settings(app: &App) -> Element<'_, Msg> {
     )
     .on_press(Msg::ToggleSettings);
     stack![backdrop, container(iced::widget::opaque(card)).center(Fill)].into()
+}
+
+/// The `[team]` config's warnings (unknown harness, effort the harness lacks, …): the team still
+/// runs, on the replacement each warning names.
+fn config_banner(app: &App) -> Element<'_, Msg> {
+    if app.config_warnings.is_empty() {
+        return Space::new().into();
+    }
+    let mut col = column![text("Team config").size(style::fs(13)).font(bold())].spacing(4);
+    for w in &app.config_warnings {
+        col = col.push(text(format!("⚠ {w}")).size(style::fs(12)));
+    }
+    container(col).padding([8, 12]).width(Fill).style(style::banner(Color::from_rgb(0.85, 0.55, 0.1))).into()
 }
 
 // ── sidebar ─────────────────────────────────────────────────────────────────
@@ -418,6 +432,12 @@ fn session_item<'a>(s: &'a Session, selected: bool, theme: &Theme) -> Element<'a
 
 fn main<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     let Some(session) = app.selected_session() else { return welcome(app) };
+    if has_board(session) && app.tab(&session.id) == Tab::Board {
+        return column![chat_header(app, session, theme), rule::horizontal(1).style(rule::weak), crate::board::board(app, session, theme)]
+            .width(Fill)
+            .height(Fill)
+            .into();
+    }
     let thread = app.threads.get(&session.id);
     column![
         chat_header(app, session, theme),
@@ -490,7 +510,7 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
         dot(style::status_color(theme, s.status), 8.0),
         text(status_label(s)).size(style::fs(12)),
         muted("·").size(style::fs(12)),
-        muted(s.harness.label()).size(style::fs(12)),
+        muted(runs_on(s)).size(style::fs(12)),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
@@ -532,7 +552,18 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
         button(text("Delete").size(style::fs(13))).on_press(Msg::DeleteAsk).style(style::ghost).padding([6, 10]).into()
     };
 
-    let controls = row![listen, mirror, archive, delete].spacing(14).align_y(Alignment::Center);
+    let mut controls = row![].spacing(14).align_y(Alignment::Center);
+    if has_board(s) {
+        let tab = app.tab(&s.id);
+        let tab_button = |label: &'static str, which: Tab| {
+            button(text(label).size(style::fs(13)).font(if tab == which { bold() } else { style::ui_font() }))
+                .on_press(Msg::SetTab(which))
+                .style(style::tab(tab == which))
+                .padding([6, 12])
+        };
+        controls = controls.push(row![tab_button("Chat", Tab::Chat), tab_button("Board", Tab::Board)].spacing(2));
+    }
+    let controls = controls.push(listen).push(mirror).push(archive).push(delete);
     // The title side takes what the controls leave and clips (long paths, large text).
     let top = row![column![title, subtitle].spacing(4).width(Fill).clip(true), controls]
         .spacing(16)
@@ -546,6 +577,21 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
         col = col.push(team);
     }
     container(col).padding([12, 18]).width(Fill).style(style::header).into()
+}
+
+/// What a session runs on: `coder · OpenCode · <model> · high` for a worker (PRD H7), the
+/// harness alone otherwise. A worker whose harness has no effort setting shows "effort: n/a".
+fn runs_on(s: &Session) -> String {
+    let Some(role) = s.role.as_deref().filter(|_| s.is_worker()) else { return s.harness.label().to_string() };
+    let mut parts = vec![role.to_string(), s.harness.label().to_string()];
+    parts.extend(s.model.clone());
+    parts.push(s.effort.clone().filter(|e| !e.is_empty()).unwrap_or_else(|| "effort: n/a".into()));
+    parts.join(" · ")
+}
+
+/// Coordinators with a folder get the Chat | Board tabs.
+fn has_board(s: &Session) -> bool {
+    crate::board::workspace(s).is_some()
 }
 
 /// `1m05s`, `2h03m`.
@@ -597,11 +643,20 @@ fn team_panel<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element
             ),
         };
         let detail = if w.status.is_connected() { w.status_text.clone().unwrap_or_default() } else { String::new() };
-        let cost = w.cost_usd.map(|c| format!("${c:.2}")).unwrap_or_default();
+        // A finished run whose harness reports no cost shows "—" (PRD H8).
+        let cost = match w.cost_usd {
+            Some(c) => format!("${c:.2}"),
+            None if w.status.is_connected() => String::new(),
+            None => "—".to_string(),
+        };
+        let runs_on = [Some(w.harness.label().to_string()), w.model.clone()].into_iter().flatten().collect::<Vec<_>>();
         let line = row![
             dot(style::status_color(theme, w.status), 7.0),
             text(w.display_name()).size(style::fs(12)).wrapping(text::Wrapping::None).width(Fill),
             muted(detail).size(style::fs(11)).wrapping(text::Wrapping::None),
+            container(text(runs_on.join(" · ")).size(style::fs(10)).wrapping(text::Wrapping::None))
+                .padding([1, 6])
+                .style(style::pill),
             muted(state).size(style::fs(11)).width(56),
             muted(duration(secs)).size(style::fs(11)).width(56),
             muted(cost).size(style::fs(11)).width(48),
@@ -711,14 +766,109 @@ fn messages<'a>(app: &'a App, s: &'a Session, thread: Option<&'a Thread>, theme:
                     .padding([6, 0]),
             );
         }
-        col = col.push(message_view(app, s, m, thread.markdown.get(&m.id), settings, theme));
+        col = col.push(message_view(app, s, thread, m, thread.markdown.get(&m.id), settings, theme));
     }
     scrollable(col).id(MESSAGES_ID).on_scroll(Msg::Scrolled).height(Fill).width(Fill).into()
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ChatViewer;
+
+impl<'a> markdown::Viewer<'a, Msg> for ChatViewer {
+    fn on_link_click(url: markdown::Uri) -> Msg {
+        Msg::Link(url)
+    }
+
+    fn code_block(
+        &self,
+        settings: markdown::Settings,
+        _language: Option<&'a str>,
+        code: &'a str,
+        lines: &'a [markdown::Text],
+    ) -> Element<'a, Msg> {
+        let copy_btn = tip(
+            button(muted("Copy").size(style::fs(11)))
+                .on_press(Msg::Copy(code.to_string()))
+                .style(style::ghost)
+                .padding([0, 6]),
+            "Copy code block",
+        );
+        let bar = row![space::horizontal(), copy_btn].align_y(Alignment::Center);
+        let block = markdown::code_block(settings, lines, Self::on_link_click);
+        column![block, bar].spacing(2).into()
+    }
+}
+
+#[allow(dead_code)]
+pub fn normalize_indented_code_blocks(body: &str) -> String {
+    use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag, TagEnd};
+
+    let mut replacements = Vec::new();
+    let mut in_indented = false;
+    let mut block_start = 0;
+    let mut block_text = String::new();
+
+    let parser = Parser::new(body).into_offset_iter();
+    for (event, range) in parser {
+        match event {
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Indented)) => {
+                in_indented = true;
+                block_start = range.start;
+                block_text.clear();
+            }
+            Event::Text(text) if in_indented => {
+                block_text.push_str(&text);
+            }
+            Event::End(TagEnd::CodeBlock) if in_indented => {
+                in_indented = false;
+                replacements.push((block_start..range.end, block_text.clone()));
+            }
+            _ => {}
+        }
+    }
+
+    if replacements.is_empty() {
+        return body.to_string();
+    }
+
+    let mut out = String::new();
+    let mut last_idx = 0;
+    for (range, code) in replacements {
+        out.push_str(&body[last_idx..range.start]);
+        let needs_leading_newline = !out.is_empty() && !out.ends_with('\n');
+        if needs_leading_newline {
+            out.push('\n');
+        }
+        out.push_str("```\n");
+        out.push_str(&code);
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("```\n");
+        last_idx = range.end;
+    }
+    out.push_str(&body[last_idx..]);
+    out
+}
+
+pub fn parse_markdown(body: &str) -> Vec<markdown::Item> {
+    markdown::parse(&normalize_indented_code_blocks(body)).collect()
+}
+
+#[allow(dead_code)]
+pub fn extract_code_blocks(body: &str) -> Vec<String> {
+    parse_markdown(body)
+        .into_iter()
+        .filter_map(|item| match item {
+            markdown::Item::CodeBlock { code, .. } => Some(code),
+            _ => None,
+        })
+        .collect()
+}
+
 fn md<'a>(items: Option<&'a Vec<markdown::Item>>, body: &'a str, settings: markdown::Settings) -> Element<'a, Msg> {
     match items {
-        Some(items) => markdown::view(items, settings).map(Msg::Link),
+        Some(items) => markdown::view_with(items, settings, &ChatViewer),
         None => text(body).size(style::fs(14)).into(),
     }
 }
@@ -730,15 +880,62 @@ fn copy_button<'a>(body: &str) -> Element<'a, Msg> {
     )
 }
 
+fn select_button<'a>(id: i64, selecting: bool) -> Element<'a, Msg> {
+    if selecting {
+        tip(
+            button(text("Done").size(style::fs(11)).style(|theme: &Theme| text::Style {
+                color: Some(theme.extended_palette().primary.base.color),
+            }))
+            .on_press(Msg::ToggleSelect(id))
+            .style(style::ghost)
+            .padding([0, 6]),
+            "Done selecting text",
+        )
+    } else {
+        tip(
+            button(muted("Select").size(style::fs(11)))
+                .on_press(Msg::ToggleSelect(id))
+                .style(style::ghost)
+                .padding([0, 6]),
+            "Select text in this message",
+        )
+    }
+}
+
+fn message_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, Msg> {
+    text_editor(editor)
+        .on_action(move |action| Msg::MessageEditor(id, action))
+        .padding([8, 10])
+        .size(style::fs(14))
+        .font(style::ui_font())
+        .wrapping(iced::widget::text::Wrapping::Word)
+        .style(style::read_only_editor)
+        .into()
+}
+
+fn message_user_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, Msg> {
+    text_editor(editor)
+        .on_action(move |action| Msg::MessageEditor(id, action))
+        .padding([8, 10])
+        .size(style::fs(14))
+        .font(style::ui_font())
+        .wrapping(iced::widget::text::Wrapping::Word)
+        .style(style::read_only_user_editor)
+        .into()
+}
+
 fn message_view<'a>(
     app: &'a App,
     s: &'a Session,
+    thread: &'a Thread,
     m: &'a Message,
     items: Option<&'a Vec<markdown::Item>>,
     settings: markdown::Settings,
     theme: &Theme,
 ) -> Element<'a, Msg> {
     let p = theme.extended_palette();
+    let is_selecting = app.selecting_message == Some(m.id);
+    let editor = thread.editors.get(&m.id);
     match (m.direction, m.kind) {
         (Direction::System, _) | (_, MessageKind::Event) => container(
             muted(format!("{} · {}", m.body, clock(m.created_at))).size(style::fs(12)),
@@ -752,28 +949,54 @@ fn message_view<'a>(
                 Delivery::Delivered | Delivery::Read => ("delivered", false),
                 Delivery::Undeliverable => ("not delivered", true),
             };
-            let footer = text(format!("{} · {status}", clock(m.created_at))).size(style::fs(11)).style(move |theme: &Theme| {
+            let time_status = text(format!("{} · {status}", clock(m.created_at))).size(style::fs(11)).style(move |theme: &Theme| {
                 let p = theme.extended_palette();
                 text::Style {
                     color: Some(if failed { p.danger.base.color } else { p.primary.base.text.scale_alpha(0.75) }),
                 }
             });
-            let bubble = container(column![text(m.body.as_str()).size(style::fs(14)), footer].spacing(4))
+            let footer = row![
+                time_status,
+                space::horizontal(),
+                select_button(m.id, is_selecting),
+                copy_button(&m.body),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
+                message_user_editor(ed, m.id)
+            } else {
+                text(m.body.as_str()).size(style::fs(14)).into()
+            };
+            let bubble = container(column![content, footer].spacing(4))
                 .padding([8, 12])
                 .max_width(560)
                 .style(if failed { style::bubble_failed } else { style::bubble_user });
             row![space::horizontal(), bubble].into()
         }
 
-        (Direction::FromAgent, MessageKind::Question | MessageKind::Permission) => question_view(app, s, m, items, settings, theme),
+        (Direction::FromAgent, MessageKind::Question | MessageKind::Permission) => {
+            question_view(app, s, thread, m, items, settings, theme)
+        }
 
         (Direction::FromAgent, MessageKind::Notify) => {
             let level = m.meta_str("level").and_then(|l| l.parse().ok()).unwrap_or(NotifyLevel::Info);
             let accent = style::level_color(theme, level);
-            let footer = row![muted(format!("{} · notification", clock(m.created_at))).size(style::fs(11)), space::horizontal(), copy_button(&m.body)]
-                .align_y(Alignment::Center);
+            let footer = row![
+                muted(format!("{} · notification", clock(m.created_at))).size(style::fs(11)),
+                space::horizontal(),
+                select_button(m.id, is_selecting),
+                copy_button(&m.body),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+            let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
+                message_editor(ed, m.id)
+            } else {
+                md(items, &m.body, settings)
+            };
             let card = container(
-                row![dot(accent, 10.0), column![md(items, &m.body, settings), footer].spacing(6).width(Fill)]
+                row![dot(accent, 10.0), column![content, footer].spacing(6).width(Fill)]
                     .spacing(10)
                     .align_y(Alignment::Start),
             )
@@ -791,13 +1014,18 @@ fn message_view<'a>(
                     "The agent's final answer, mirrored from its session",
                 ));
             }
-            footer = footer.push(space::horizontal()).push(copy_button(&m.body));
+            footer = footer.push(space::horizontal()).push(select_button(m.id, is_selecting)).push(copy_button(&m.body));
             let unread_mark: Element<'a, Msg> = if m.read_at.is_none() {
                 dot(p.primary.base.color, 6.0)
             } else {
                 Space::new().width(6).into()
             };
-            let bubble = container(column![md(items, &m.body, settings), footer].spacing(6))
+            let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
+                message_editor(ed, m.id)
+            } else {
+                md(items, &m.body, settings)
+            };
+            let bubble = container(column![content, footer].spacing(6))
                 .padding([10, 14])
                 .max_width(680)
                 .style(style::bubble_agent);
@@ -809,6 +1037,7 @@ fn message_view<'a>(
 fn question_view<'a>(
     app: &'a App,
     s: &'a Session,
+    thread: &'a Thread,
     m: &'a Message,
     items: Option<&'a Vec<markdown::Item>>,
     settings: markdown::Settings,
@@ -818,10 +1047,17 @@ fn question_view<'a>(
     let permission = m.kind == MessageKind::Permission;
     let accent = if permission { p.warning.base.color } else { p.primary.base.color };
     let label = if permission { "Permission request" } else { "Question" };
+    let is_selecting = app.selecting_message == Some(m.id);
+    let editor = thread.editors.get(&m.id);
+    let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
+        message_editor(ed, m.id)
+    } else {
+        md(items, &m.body, settings)
+    };
 
     let mut col = column![
         text(label).size(style::fs(12)).font(bold()).style(move |_: &Theme| text::Style { color: Some(accent) }),
-        md(items, &m.body, settings),
+        content,
     ]
     .spacing(8);
 
@@ -886,7 +1122,15 @@ fn question_view<'a>(
         }
         None => {}
     }
-    col = col.push(muted(clock(m.created_at)).size(style::fs(11)));
+    let footer = row![
+        muted(clock(m.created_at)).size(style::fs(11)),
+        space::horizontal(),
+        select_button(m.id, is_selecting),
+        copy_button(&m.body),
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+    col = col.push(footer);
 
     let card = container(col).padding([12, 14]).max_width(680).style(style::card(accent));
     row![card, space::horizontal()].into()
@@ -943,4 +1187,55 @@ fn composer<'a>(app: &'a App, s: &'a Session) -> Element<'a, Msg> {
     .width(Fill)
     .style(style::composer_box)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extracts_fenced_code_block_with_language() {
+        let md = "Here is some code:\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\nAll done.";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], "fn main() {\n    println!(\"hello\");\n}\n");
+    }
+
+    #[test]
+    fn extracts_fenced_code_block_without_language() {
+        let md = "Plain block:\n```\njust plain text\n```";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], "just plain text\n");
+    }
+
+    #[test]
+    fn extracts_multiple_code_blocks_in_order() {
+        let md = "First block:\n```bash\ncargo check\n```\nSecond block:\n```bash\ncargo test\n```";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0], "cargo check\n");
+        assert_eq!(blocks[1], "cargo test\n");
+    }
+
+    #[test]
+    fn extracts_indented_code_blocks() {
+        let md = "Indented:\n\n    let a = 1;\n    let b = 2;\n\nEnd.";
+        let blocks = extract_code_blocks(md);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0], "let a = 1;\nlet b = 2;\n");
+    }
+
+    #[test]
+    fn ignores_inline_code_and_plain_text() {
+        let md = "Use `cargo test` to run tests. No blocks here!";
+        let blocks = extract_code_blocks(md);
+        assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn handles_empty_message() {
+        let blocks = extract_code_blocks("");
+        assert!(blocks.is_empty());
+    }
 }
