@@ -393,12 +393,17 @@ fn check_effort(role: &str, harness: Harness, value: Option<&str>, warnings: &mu
     }
 }
 
+fn default_legacy_style() -> String {
+    "default".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Desktop {
     /// `system`, `light` or `dark`.
     pub theme: String,
-    /// `default`, `tokyo-night` or `dracula`.
+    /// `jg-violet`, `default`, `tokyo-night` or `dracula`.
+    #[serde(default = "default_legacy_style")]
     pub style: String,
     /// UI font family (a static, non-variable font); Noto Sans, DejaVu Sans or Liberation Sans when unset.
     pub font: Option<String>,
@@ -420,7 +425,7 @@ impl Default for Desktop {
     fn default() -> Self {
         Self {
             theme: "system".into(),
-            style: "default".into(),
+            style: "jg-violet".into(),
             font: None,
             zoom: 1.0,
             text_size: Self::DEFAULT_TEXT_SIZE,
@@ -686,10 +691,17 @@ mod tests {
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.desktop.style, "tokyo-night");
 
+        let toml_str = "[desktop]\nstyle = \"jg-violet\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.desktop.style, "jg-violet");
+        let serialized = toml::to_string(&cfg).unwrap();
+        let round_tripped: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.desktop.style, "jg-violet");
+
         let old_toml = "[desktop]\ntheme = \"light\"\nzoom = 1.2\n";
         let old_cfg: Config = toml::from_str(old_toml).unwrap();
         assert_eq!(old_cfg.desktop.style, "default");
 
-        assert_eq!(Config::default().desktop.style, "default");
+        assert_eq!(Config::default().desktop.style, "jg-violet");
     }
 }

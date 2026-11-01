@@ -300,9 +300,8 @@ fn column_width() -> f32 {
     style::fs(14) * 17.0
 }
 
-pub fn board<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, Msg> {
-    let folder = workspace(s);
-    let Some(tasks) = folder.as_ref().and_then(|w| app.boards.get(w)) else {
+pub fn board<'a>(app: &'a App, workspace: &str, theme: &Theme) -> Element<'a, Msg> {
+    let Some(tasks) = app.boards.get(workspace) else {
         return container(muted("Loading the Board…")).center(Fill).into();
     };
     let mut lanes = row![].spacing(12).padding(Padding { top: 6.0, right: 16.0, bottom: 14.0, left: 16.0 }).height(Fill);
@@ -314,7 +313,7 @@ pub fn board<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, Msg
         .width(Fill)
         .height(Fill);
     let mut bar = row![].spacing(8).padding([8, 16]).align_y(Alignment::Center);
-    if let Some(folder) = app.offer_team.as_ref().filter(|w| folder.as_ref() == Some(*w)) {
+    if let Some(folder) = app.offer_team.as_ref().filter(|w| *w == workspace) {
         bar = bar.push(
             container(
                 row![

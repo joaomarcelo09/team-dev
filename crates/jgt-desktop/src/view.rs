@@ -1,17 +1,21 @@
 //! Everything on screen: the session sidebar, the chat, the composer.
 
 use crate::{
-    app::{App, Conn, MESSAGES_ID, Msg, Tab, ThemePref, ThemeStyle, Thread},
-    style,
+    app::{App, Conn, MESSAGES_ID, Msg, ThemePref, ThemeStyle, Thread},
+    icons, style,
 };
-use std::collections::HashSet;
+
+// used from step 4 on
+#[allow(unused_imports)]
+pub use crate::app::{Module, Workspace, coordinator_for, partition_team_workers, workers_for, workspaces};
+use std::collections::{HashMap, HashSet};
 use chrono::{Datelike, Local, TimeZone};
 use iced::{
     Alignment, Color, Element, Fill, Font, Padding, Shrink, Theme,
     font::Weight,
     widget::{
-        Space, button, column, container, markdown, row, rule, scrollable, space, stack, text, text_editor,
-        text_input, toggler, tooltip,
+        Space, button, column, container, markdown, pick_list, row, rule, scrollable, space, stack, text, text_editor,
+        text_input, tooltip,
     },
 };
 use jgt_core::{
@@ -81,10 +85,186 @@ pub(crate) fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: &'a str) -> E
     .into()
 }
 
+/// An item in the workspace selector dropdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceChoice {
+    Team { key: String, name: String },
+    NewTeam,
+}
+
+impl std::fmt::Display for WorkspaceChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Team { name, .. } => write!(f, "{name}"),
+            Self::NewTeam => write!(f, "New team…"),
+        }
+    }
+}
+
+/// Pure helper computing the active worker count and total worker cost for a workspace.
+///
+/// Matches the calculation used in the team panel:
+/// - Working sessions are connected non-coordinator workers belonging to the workspace's coordinator.
+/// - Cost is the sum of `cost_usd` across all workers of that coordinator (including archived and ended workers).
+pub fn team_summary(sessions: &[Session], workspace: &str) -> (usize, f64) {
+    let ws_norm = jgt_core::team::normalize_folder(workspace);
+    if ws_norm.is_empty() {
+        return (0, 0.0);
+    }
+    let Some(coord) = coordinator_for(sessions, ws_norm) else {
+        return (0, 0.0);
+    };
+    let workers: Vec<&Session> = sessions
+        .iter()
+        .filter(|w| !w.is_coordinator() && w.parent_id.as_deref() == Some(coord.id.as_str()))
+        .collect();
+    let working = workers.iter().filter(|w| w.status.is_connected()).count();
+    let cost: f64 = workers.iter().filter_map(|w| w.cost_usd).sum();
+    (working, cost)
+}
+
+/// The top-level 56px application header.
+pub fn app_header<'a>(app: &'a App) -> Element<'a, Msg> {
+    let theme = app.theme();
+    let p = theme.extended_palette();
+
+    let brand = row![
+        dot(p.primary.base.color, 8.0),
+        text(jgt_core::APP_NAME)
+            .size(style::fs(15))
+            .font(bold())
+            .style(|theme: &Theme| text::Style {
+                color: Some(theme.extended_palette().primary.base.color),
+            }),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let team_list = workspaces(&app.sessions);
+    let mut choices: Vec<WorkspaceChoice> = team_list
+        .into_iter()
+        .map(|w| WorkspaceChoice::Team { key: w.key, name: w.name })
+        .collect();
+    if let Some(key) = app.workspace.as_deref()
+        && !choices.iter().any(|c| matches!(c, WorkspaceChoice::Team { key: k, .. } if k == key))
+    {
+        let name = std::path::Path::new(key)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| key.to_string());
+        choices.push(WorkspaceChoice::Team { key: key.to_string(), name });
+    }
+    choices.push(WorkspaceChoice::NewTeam);
+
+    let selected: Option<WorkspaceChoice> = app.workspace.as_deref().and_then(|key| {
+        choices.iter().find(|c| match c {
+            WorkspaceChoice::Team { key: k, .. } => k == key,
+            WorkspaceChoice::NewTeam => false,
+        }).cloned()
+    });
+
+    let handle = iced::widget::pick_list::Handle::Static(iced::widget::pick_list::Icon {
+        font: crate::icons::ICON_FONT,
+        code_point: crate::icons::Icon::ExpandMore.codepoint(),
+        size: Some(iced::Pixels(style::fs(14))),
+        line_height: Default::default(),
+        shaping: Default::default(),
+    });
+
+    let selector = pick_list(
+        choices,
+        selected,
+        move |choice| match choice {
+            WorkspaceChoice::Team { key, .. } => Msg::SelectWorkspace(key),
+            WorkspaceChoice::NewTeam => Msg::NewTeamOpen,
+        },
+    )
+    .placeholder("No team")
+    .handle(handle)
+    .text_size(style::fs(13))
+    .padding([4, 10])
+    .style(style::workspace_selector)
+    .menu_style(style::workspace_menu);
+
+    let folder_icon = icons::icon(icons::Icon::Folder, style::fs(14)).style(|theme: &Theme| text::Style {
+        color: Some(theme.extended_palette().primary.base.color),
+    });
+
+    let ws_selector = row![folder_icon, selector].spacing(6).align_y(Alignment::Center);
+
+    let (working, cost) = app
+        .workspace
+        .as_deref()
+        .map(|ws| team_summary(&app.sessions, ws))
+        .unwrap_or((0, 0.0));
+
+    let summary_text = if cost > 0.0 {
+        format!("{working} working · ${cost:.2}")
+    } else {
+        format!("{working} working")
+    };
+
+    let dot_color = if working > 0 {
+        p.success.base.color
+    } else {
+        style::muted(&theme)
+    };
+
+    let summary_pill = container(
+        row![
+            dot(dot_color, 6.0),
+            text(summary_text).size(style::fs(12)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([4, 10])
+    .style(style::summary_pill);
+
+    let archive_btn = tip(
+        button(icons::icon(icons::Icon::Archive, style::fs(16)))
+            .on_press(Msg::ToggleArchived)
+            .style(if app.show_archived { style::pill_button } else { style::ghost })
+            .padding([6, 8]),
+        if app.show_archived { "Hide archived chats" } else { "Show archived chats" },
+    );
+
+    let settings_btn = tip(
+        button(icons::icon(icons::Icon::Settings, style::fs(16)))
+            .on_press(Msg::ToggleSettings)
+            .style(if app.show_settings { style::pill_button } else { style::ghost })
+            .padding([6, 8]),
+        "Theme, zoom and text size",
+    );
+
+    let bar = row![
+        brand,
+        Space::new().width(12),
+        ws_selector,
+        space::horizontal(),
+        summary_pill,
+        archive_btn,
+        settings_btn,
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+
+    container(bar)
+        .width(Fill)
+        .height(56)
+        .padding([0, 16])
+        .align_y(Alignment::Center)
+        .style(style::app_header)
+        .into()
+}
+
 pub fn view(app: &App) -> Element<'_, Msg> {
     let theme = app.theme();
-    let body = row![sidebar(app, &theme), rule::vertical(1).style(rule::weak), main(app, &theme)];
-    let mut root = stack![container(body).width(Fill).height(Fill)];
+    let body = row![sidebar(app, &theme), rule::vertical(1).style(rule::weak), main(app, &theme)].height(Fill);
+    let layout = column![app_header(app), rule::horizontal(1).style(rule::weak), body]
+        .width(Fill)
+        .height(Fill);
+    let mut root = stack![container(layout).width(Fill).height(Fill)];
 
     if app.show_settings {
         root = root.push(settings(app));
@@ -176,6 +356,7 @@ fn settings(app: &App) -> Element<'_, Msg> {
             line(
                 "Style",
                 row![
+                    style_button("JG Violet", ThemeStyle::Violet),
                     style_button("Default", ThemeStyle::Default),
                     style_button("Tokyo Night", ThemeStyle::TokyoNight),
                     style_button("Dracula", ThemeStyle::Dracula),
@@ -183,7 +364,7 @@ fn settings(app: &App) -> Element<'_, Msg> {
                 .spacing(6)
                 .into()
             ),
-            muted("Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
+            muted("JG Violet, Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
                 .size(style::fs(12)),
             line(
                 "Zoom",
@@ -239,38 +420,38 @@ fn config_banner(app: &App) -> Element<'_, Msg> {
 
 // ── sidebar ─────────────────────────────────────────────────────────────────
 
+/// The data model for a workspace's sidebar rows: Board task count, Coordinator, and workers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidebarWorkspaceModel<'a> {
+    pub workspace: &'a str,
+    pub board_open_tasks: Option<usize>,
+    pub coordinator: Option<&'a Session>,
+    pub workers: Vec<&'a Session>,
+    pub workers_collapsed: bool,
+}
+
+pub fn sidebar_workspace_model<'a>(
+    sessions: &'a [Session],
+    boards: &'a HashMap<String, crate::board::Board>,
+    workspace: &'a str,
+    workers_collapsed: bool,
+) -> SidebarWorkspaceModel<'a> {
+    let board_open_tasks = boards.get(workspace).map(|b| {
+        b.tasks().iter().filter(|t| t.status != jgt_core::TaskStatus::Done).count()
+    });
+    let coordinator = coordinator_for(sessions, workspace);
+    let workers = workers_for(sessions, workspace);
+    SidebarWorkspaceModel {
+        workspace,
+        board_open_tasks,
+        coordinator,
+        workers,
+        workers_collapsed,
+    }
+}
+
 fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
-    let (conn_color, conn_label) = match &app.conn {
-        Conn::Connected => (p.success.base.color, "Connected to the JG Team Dev hub".to_string()),
-        Conn::Connecting => (p.warning.base.color, "Connecting to the hub…".to_string()),
-        Conn::Offline(e) => (p.danger.base.color, format!("Hub not running: {e}")),
-    };
-    let header = row![
-        text(jgt_core::APP_NAME).size(style::fs(17)).font(bold()),
-        tooltip(
-            dot(conn_color, 8.0),
-            container(text(conn_label).size(style::fs(12))).padding([6, 10]).style(container::rounded_box),
-            tooltip::Position::Bottom
-        ),
-        space::horizontal(),
-        tip(
-            button(text("Settings").size(style::fs(12)))
-                .on_press(Msg::ToggleSettings)
-                .style(if app.show_settings { style::pill_button } else { style::ghost })
-                .padding([4, 8]),
-            "Theme, zoom and text size"
-        ),
-        tip(
-            button(text("Archived").size(style::fs(12)))
-                .on_press(Msg::ToggleArchived)
-                .style(if app.show_archived { style::pill_button } else { style::ghost })
-                .padding([4, 8]),
-            if app.show_archived { "Hide archived chats" } else { "Show archived chats" }
-        ),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
 
     let search = text_input("Search chats", &app.search)
         .on_input(Msg::Search)
@@ -279,127 +460,292 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
         .style(style::input);
 
     let query = app.search.trim().to_lowercase();
-    let matches = |s: &&Session| {
-        query.is_empty()
-            || s.display_name().to_lowercase().contains(&query)
-            || s.cwd.as_deref().unwrap_or("").to_lowercase().contains(&query)
-            || s.harness.label().to_lowercase().contains(&query)
-    };
-    let visible: Vec<&Session> = app.sessions.iter().filter(matches).collect();
+    let searching = !query.is_empty();
+    let showing_archived = app.show_archived;
 
-    let groups: [(&str, Box<dyn Fn(&Session) -> bool>); 4] = [
-        ("ONLINE", Box::new(|s: &Session| !s.archived && s.status.is_connected())),
-        ("OFFLINE", Box::new(|s: &Session| !s.archived && s.status == SessionStatus::Disconnected)),
-        ("ENDED", Box::new(|s: &Session| !s.archived && s.status == SessionStatus::Ended)),
-        ("ARCHIVED", Box::new(|s: &Session| s.archived)),
-    ];
-    let mut list = column![].spacing(2);
-    let mut any = false;
-    for (label, include) in groups.iter() {
-        if *label == "ARCHIVED" && !app.show_archived {
-            continue;
+    let mut list = column![].spacing(3);
+
+    if searching || showing_archived {
+        let matches = |s: &&Session| {
+            if showing_archived && !searching && !s.archived {
+                return false;
+            }
+            if !showing_archived && s.archived && !searching {
+                return false;
+            }
+            query.is_empty()
+                || s.display_name().to_lowercase().contains(&query)
+                || s.cwd.as_deref().unwrap_or("").to_lowercase().contains(&query)
+                || s.harness.label().to_lowercase().contains(&query)
+                || s.role.as_deref().unwrap_or("").to_lowercase().contains(&query)
+        };
+        let visible: Vec<&Session> = app.sessions.iter().filter(matches).collect();
+
+        #[allow(clippy::type_complexity)]
+        let groups: [(&str, Box<dyn Fn(&Session) -> bool>); 4] = [
+            ("ONLINE", Box::new(|s: &Session| !s.archived && s.status.is_connected())),
+            ("OFFLINE", Box::new(|s: &Session| !s.archived && s.status == SessionStatus::Disconnected)),
+            ("ENDED", Box::new(|s: &Session| !s.archived && s.status == SessionStatus::Ended)),
+            ("ARCHIVED", Box::new(|s: &Session| s.archived)),
+        ];
+        let mut any = false;
+        for (label, include) in groups.iter() {
+            if *label == "ARCHIVED" && !showing_archived && !searching {
+                continue;
+            }
+            let items = sidebar_items(&visible, include, &app.collapsed_coordinators);
+            if items.is_empty() {
+                continue;
+            }
+            any = true;
+            list = list.push(
+                container(muted(format!("{label} · {}", items.len())).size(style::fs(11)).font(bold())).padding([10, 8]),
+            );
+            for s in items {
+                let collapsed = s.is_coordinator().then(|| app.is_coordinator_collapsed(&s.id));
+                let item = session_item(s, app.selected.as_deref() == Some(s.id.as_str()), collapsed, theme);
+                list = list.push(if s.is_worker() { container(item).padding(Padding::ZERO.left(16)).into() } else { item });
+            }
         }
-        let items = sidebar_items(&visible, include, &app.collapsed_coordinators);
-        if items.is_empty() {
-            continue;
+        if !any {
+            list = list.push(container(muted("Nothing matches.").size(style::fs(13))).padding(12));
         }
-        any = true;
-        list = list.push(
-            container(muted(format!("{label} · {}", items.len())).size(style::fs(11)).font(bold())).padding([10, 8]),
-        );
-        for s in items {
-            let collapsed = s.is_coordinator().then(|| app.is_coordinator_collapsed(&s.id));
-            let item = session_item(s, app.selected.as_deref() == Some(s.id.as_str()), collapsed, theme);
-            list = list.push(if s.is_worker() { container(item).padding(Padding::ZERO.left(16)).into() } else { item });
+    } else if let Some(ws) = &app.workspace {
+        let model = sidebar_workspace_model(&app.sessions, &app.boards, ws, app.workers_collapsed);
+
+        // 1. Board row
+        let board_selected = app.module == Module::Board;
+        let mut board_row = row![
+            icons::icon(icons::Icon::Board, style::fs(16)),
+            text("Board")
+                .size(style::fs(13))
+                .font(if board_selected { bold() } else { style::ui_font() }),
+            space::horizontal(),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        if let Some(open_count) = model.board_open_tasks {
+            board_row = board_row.push(
+                container(
+                    text(open_count.to_string())
+                        .size(style::fs(10))
+                        .font(bold())
+                        .style(|theme: &Theme| text::Style {
+                            color: Some(theme.extended_palette().primary.base.color),
+                        }),
+                )
+                .padding([1, 6])
+                .style(style::pill),
+            );
         }
-    }
-    if !any {
+
+        let board_btn = button(board_row)
+            .on_press(Msg::SelectModule(Module::Board))
+            .style(style::session_item(board_selected))
+            .width(Fill)
+            .padding([7, 10]);
+
+        list = list.push(board_btn);
+
+        // 2. Coordinator row
+        let coord_selected = app.module == Module::Coordinator;
+        let mut coord_right = row![].spacing(6).align_y(Alignment::Center);
+        if let Some(coord) = model.coordinator {
+            coord_right = coord_right.push(dot(style::status_color(theme, coord.status), 7.0));
+            if coord.unread > 0 {
+                coord_right = coord_right.push(
+                    container(
+                        text(coord.unread.to_string())
+                            .size(style::fs(10))
+                            .font(bold()),
+                    )
+                    .padding([1, 6])
+                    .style(style::badge(p.primary.base.color)),
+                );
+            }
+        }
+
+        let coord_row = row![
+            icons::icon(icons::Icon::Coordinator, style::fs(16)),
+            text("Coordinator")
+                .size(style::fs(13))
+                .font(if coord_selected { bold() } else { style::ui_font() }),
+            space::horizontal(),
+            coord_right,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let coord_btn = button(coord_row)
+            .on_press(Msg::SelectModule(Module::Coordinator))
+            .style(style::session_item(coord_selected))
+            .width(Fill)
+            .padding([7, 10]);
+
+        list = list.push(coord_btn);
+
+        // 3. Worker section
+        let chevron = if app.workers_collapsed {
+            icons::Icon::ChevronRight
+        } else {
+            icons::Icon::ExpandMore
+        };
+
+        let worker_header_row = row![
+            icons::icon(chevron, style::fs(14)),
+            text("Worker").size(style::fs(12)).font(bold()),
+            space::horizontal(),
+            container(
+                text(model.workers.len().to_string()).size(style::fs(10)),
+            )
+            .padding([1, 6])
+            .style(style::pill),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        let worker_header_btn = button(worker_header_row)
+            .on_press(Msg::ToggleWorkers)
+            .style(style::ghost)
+            .width(Fill)
+            .padding([6, 8]);
+
+        list = list.push(worker_header_btn);
+
+        if !app.workers_collapsed {
+            let now = jgt_core::now_ms();
+            for w in &model.workers {
+                let is_selected = app.module == Module::Worker(w.id.clone());
+                let (state, secs) = match w.status {
+                    SessionStatus::Active => ("working", (now - w.created_at) / 1000),
+                    SessionStatus::Idle | SessionStatus::Listening => ("idle", (now - w.created_at) / 1000),
+                    _ => (
+                        if w.status == SessionStatus::Ended { "ended" } else { "done" },
+                        w.run_secs.unwrap_or((w.updated_at - w.created_at) / 1000),
+                    ),
+                };
+                let dur = duration(secs);
+                let cost = match w.cost_usd {
+                    Some(c) => format!("${c:.2}"),
+                    None if w.status.is_connected() => String::new(),
+                    None => "—".to_string(),
+                };
+                let name = match w.role.as_deref() {
+                    Some(role) => role.to_string(),
+                    None => w.display_name(),
+                };
+
+                let mut info = format!("{state} · {dur}");
+                if !cost.is_empty() {
+                    info.push_str(&format!(" · {cost}"));
+                }
+
+                let mut right = row![muted(info).size(style::fs(11)).wrapping(text::Wrapping::None)]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                if w.unread > 0 {
+                    right = right.push(
+                        container(text(w.unread.to_string()).size(style::fs(10)).font(bold()))
+                            .padding([1, 5])
+                            .style(style::badge(p.primary.base.color)),
+                    );
+                }
+
+                let line = row![
+                    dot(style::status_color(theme, w.status), 6.0),
+                    text(name).size(style::fs(12)).wrapping(text::Wrapping::None).width(Fill),
+                    right,
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+
+                let worker_btn = button(line)
+                    .on_press(Msg::SelectModule(Module::Worker(w.id.clone())))
+                    .style(style::session_item(is_selected))
+                    .width(Fill)
+                    .padding([5, 8]);
+
+                list = list.push(container(worker_btn).padding(Padding::ZERO.left(8)));
+            }
+        }
+    } else {
         let hint = if app.sessions.is_empty() {
             "No team sessions yet.\n\nClick New team and pick a project folder: its Coordinator starts and greets you here."
         } else {
-            "Nothing matches."
+            "Select a team from the header above."
         };
-        list = list.push(container(muted(hint).size(style::fs(13))).padding(12));
-    }
-
-    let new_team: Element<'a, Msg> = match &app.new_team {
-        Some(folder) => {
-            let input = text_input("Project folder", folder)
-                .padding([7, 10])
-                .size(style::fs(13))
-                .style(style::input);
-            let input = if app.starting_team {
-                input
-            } else {
-                input.on_input(Msg::NewTeamInput).on_submit(Msg::NewTeamStart)
-            };
-            let start = button(text(if app.starting_team { "Starting…" } else { "Start" }).size(style::fs(12)))
-                .style(style::primary_button)
-                .padding([6, 10])
-                .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamStart));
-            let cancel = button(text("Cancel").size(style::fs(12)))
-                .style(style::ghost)
-                .padding([6, 10])
-                .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamCancel));
-            let browse = button(text("Choose folder…").size(style::fs(12)))
-                .style(style::pill_button)
-                .padding([6, 10])
-                .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamBrowse));
-            let mut form = column![
-                muted("New team session: the Coordinator works in this folder").size(style::fs(11)),
-                input,
-                row![browse, space::horizontal(), cancel, start].spacing(6),
-            ]
-            .spacing(6);
-            let recent = app.recent_folders();
-            if !recent.is_empty() {
-                form = form.push(muted("Recent").size(style::fs(11)).font(bold()));
-                let home = jgt_core::paths::home_dir().display().to_string();
-                for folder in recent {
-                    // `~/font/app` reads better than the full path in a narrow sidebar.
-                    let label = match folder.strip_prefix(&home) {
-                        Some(rest) => format!("~{rest}"),
-                        None => folder.to_string(),
-                    };
-                    let picked = folder == folder_value(app);
-                    form = form.push(
-                        button(text(label).size(style::fs(12)).wrapping(text::Wrapping::None))
-                            .on_press_maybe((!app.starting_team).then(|| Msg::NewTeamInput(folder.to_string())))
-                            .style(style::session_item(picked))
-                            .width(Fill)
-                            .padding([4, 8]),
-                    );
-                }
-            }
-            container(form)
-            .padding([0, 12])
-            .into()
-        }
-        None => container(
-            button(text("New team").size(style::fs(13)).width(Fill).align_x(Alignment::Center))
+        let mut hint_col = column![muted(hint).size(style::fs(13))].spacing(8);
+        hint_col = hint_col.push(
+            button(text("New team").size(style::fs(13)).align_x(Alignment::Center))
                 .on_press(Msg::NewTeamOpen)
                 .style(style::primary_button)
-                .padding([6, 10])
-                .width(Fill),
-        )
-        .padding([0, 12])
-        .into(),
-    };
+                .padding([6, 12]),
+        );
+        list = list.push(container(hint_col).padding(12));
+    }
 
-    container(
-        column![
-            container(header).padding([14, 14]),
-            new_team,
-            container(search).padding([0, 12]),
-            scrollable(container(list).padding([6, 8])).height(Fill),
+    let mut sidebar_col = column![].spacing(8);
+    if let Some(folder) = &app.new_team {
+        let input = text_input("Project folder", folder)
+            .padding([7, 10])
+            .size(style::fs(13))
+            .style(style::input);
+        let input = if app.starting_team {
+            input
+        } else {
+            input.on_input(Msg::NewTeamInput).on_submit(Msg::NewTeamStart)
+        };
+        let start = button(text(if app.starting_team { "Starting…" } else { "Start" }).size(style::fs(12)))
+            .style(style::primary_button)
+            .padding([6, 10])
+            .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamStart));
+        let cancel = button(text("Cancel").size(style::fs(12)))
+            .style(style::ghost)
+            .padding([6, 10])
+            .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamCancel));
+        let browse = button(text("Choose folder…").size(style::fs(12)))
+            .style(style::pill_button)
+            .padding([6, 10])
+            .on_press_maybe((!app.starting_team).then_some(Msg::NewTeamBrowse));
+        let mut form = column![
+            muted("New team session: the Coordinator works in this folder").size(style::fs(11)),
+            input,
+            row![browse, space::horizontal(), cancel, start].spacing(6),
         ]
-        .spacing(8),
-    )
-    // Grows with the text size (310px at the default 16px).
-    .width(style::fs(14) * 310.0 / f32::from(jgt_core::config::Desktop::DEFAULT_TEXT_SIZE))
-    .height(Fill)
-    .style(style::sidebar)
-    .into()
+        .spacing(6);
+        let recent = app.recent_folders();
+        if !recent.is_empty() {
+            form = form.push(muted("Recent").size(style::fs(11)).font(bold()));
+            let home = jgt_core::paths::home_dir().display().to_string();
+            for folder in recent {
+                let label = match folder.strip_prefix(&home) {
+                    Some(rest) => format!("~{rest}"),
+                    None => folder.to_string(),
+                };
+                let picked = folder == folder_value(app);
+                form = form.push(
+                    button(text(label).size(style::fs(12)).wrapping(text::Wrapping::None))
+                        .on_press_maybe((!app.starting_team).then(|| Msg::NewTeamInput(folder.to_string())))
+                        .style(style::session_item(picked))
+                        .width(Fill)
+                        .padding([4, 8]),
+                );
+            }
+        }
+        sidebar_col = sidebar_col.push(container(form).padding([0, 10]));
+    }
+
+    sidebar_col = sidebar_col
+        .push(container(search).padding([0, 10]))
+        .push(scrollable(container(list).padding([4, 6])).height(Fill));
+
+    container(sidebar_col)
+        .width(style::fs(14) * 288.0 / f32::from(jgt_core::config::Desktop::DEFAULT_TEXT_SIZE))
+        .height(Fill)
+        .style(style::sidebar)
+        .into()
 }
 
 /// The folder typed or picked in the New team form.
@@ -496,13 +842,14 @@ fn session_item<'a>(
 // ── main area ───────────────────────────────────────────────────────────────
 
 fn main<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
-    let Some(session) = app.selected_session() else { return welcome(app) };
-    if has_board(session) && app.tab(&session.id) == Tab::Board {
-        return column![chat_header(app, session, theme), rule::horizontal(1).style(rule::weak), crate::board::board(app, session, theme)]
-            .width(Fill)
-            .height(Fill)
-            .into();
+    if app.module == Module::Board {
+        if let Some(ws) = app.workspace.as_deref() {
+            return crate::board::board(app, ws, theme);
+        } else {
+            return container(muted("No workspace selected.")).center(Fill).into();
+        }
     }
+    let Some(session) = app.selected_session() else { return welcome(app) };
     let thread = app.threads.get(&session.id);
     column![
         chat_header(app, session, theme),
@@ -602,16 +949,40 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
         );
     }
 
-    let listen = tip(
-        toggler(s.listen).label("Listen").text_size(style::fs(13)).size(16).on_toggle_maybe(
-            (s.status != SessionStatus::Ended && s.harness != Harness::Custom).then_some(Msg::SetListen),
-        ),
+    let listen_btn = tip(
+        button(
+            row![
+                icons::icon(icons::Icon::Listen, style::fs(14)),
+                text("Listen").size(style::fs(12)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .on_press_maybe(listen_enabled(s).then_some(Msg::SetListen(!s.listen)))
+        .style(style::segment_button(s.listen))
+        .padding([4, 10]),
         "When its turn ends, the agent keeps waiting for your messages instead of going idle",
     );
-    let mirror = tip(
-        toggler(s.mirror).label("All replies").text_size(style::fs(13)).size(16).on_toggle(Msg::SetMirror),
+    let replies_btn = tip(
+        button(
+            row![
+                icons::icon(icons::Icon::Replies, style::fs(14)),
+                text("Replies").size(style::fs(12)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        )
+        .on_press(Msg::SetMirror(!s.mirror))
+        .style(style::segment_button(s.mirror))
+        .padding([4, 10]),
         "Show every final reply here, not only replies to messages you sent from JG Team Dev",
     );
+    let segment_control = container(
+        row![listen_btn, replies_btn].spacing(2).align_y(Alignment::Center),
+    )
+    .padding(2)
+    .style(style::segmented_container);
+
     let archive = button(text(if s.archived { "Unarchive" } else { "Archive" }).size(style::fs(13)))
         .on_press(Msg::SetArchived(!s.archived))
         .style(style::ghost)
@@ -629,18 +1000,7 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
         button(text("Delete").size(style::fs(13))).on_press(Msg::DeleteAsk).style(style::ghost).padding([6, 10]).into()
     };
 
-    let mut controls = row![].spacing(14).align_y(Alignment::Center);
-    if has_board(s) {
-        let tab = app.tab(&s.id);
-        let tab_button = |label: &'static str, which: Tab| {
-            button(text(label).size(style::fs(13)).font(if tab == which { bold() } else { style::ui_font() }))
-                .on_press(Msg::SetTab(which))
-                .style(style::tab(tab == which))
-                .padding([6, 12])
-        };
-        controls = controls.push(row![tab_button("Chat", Tab::Chat), tab_button("Board", Tab::Board)].spacing(2));
-    }
-    let controls = controls.push(listen).push(mirror).push(archive).push(delete);
+    let controls = row![segment_control, archive, delete].spacing(12).align_y(Alignment::Center);
     // The title side takes what the controls leave and clips (long paths, large text).
     let top = row![column![title, subtitle].spacing(4).width(Fill).clip(true), controls]
         .spacing(16)
@@ -650,10 +1010,14 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
     if let Some(banner) = status_banner(app, s, theme) {
         col = col.push(banner);
     }
-    if let Some(team) = team_panel(app, s, theme) {
-        col = col.push(team);
-    }
     container(col).padding([12, 18]).width(Fill).style(style::header).into()
+}
+
+/// Pure helper: returns true if the Listen toggle is enabled for the session.
+///
+/// Listen is disabled when the session has ended or uses the Custom harness.
+pub fn listen_enabled(s: &Session) -> bool {
+    s.status != SessionStatus::Ended && s.harness != Harness::Custom
 }
 
 /// What a session runs on: `coder · OpenCode · <model> · high` for a worker (PRD H7), the
@@ -666,150 +1030,10 @@ fn runs_on(s: &Session) -> String {
     parts.join(" · ")
 }
 
-/// Coordinators with a folder get the Chat | Board tabs.
-fn has_board(s: &Session) -> bool {
-    crate::board::workspace(s).is_some()
-}
-
 /// `1m05s`, `2h03m`.
 fn duration(secs: i64) -> String {
     let secs = secs.max(0);
     if secs >= 3600 { format!("{}h{:02}m", secs / 3600, secs % 3600 / 60) } else { format!("{}m{:02}s", secs / 60, secs % 60) }
-}
-
-/// Partitions team workers for the team panel into active (working) and idle/done workers.
-pub fn partition_team_workers<'a>(
-    workers: &[&'a Session],
-    show_archived: bool,
-) -> (Vec<&'a Session>, Vec<&'a Session>) {
-    let mut active = Vec::new();
-    let mut idle = Vec::new();
-    for &w in workers {
-        if !w.archived || show_archived {
-            if w.status == SessionStatus::Active {
-                active.push(w);
-            } else {
-                idle.push(w);
-            }
-        }
-    }
-    (active, idle)
-}
-
-/// Decides which team worker rows to show in the team panel and returns `(visible_workers, hidden_idle_count)`.
-#[allow(dead_code)]
-pub fn team_panel_rows<'a>(
-    workers: &[&'a Session],
-    show_archived: bool,
-    collapsed_idle: bool,
-) -> (Vec<&'a Session>, usize) {
-    let (active, idle) = partition_team_workers(workers, show_archived);
-    if collapsed_idle {
-        let hidden = idle.len();
-        (active, hidden)
-    } else {
-        let mut all = active;
-        all.extend(idle);
-        (all, 0)
-    }
-}
-
-/// A Coordinator's workers: what each is doing, for how long, and what it cost.
-fn team_panel<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element<'a, Msg>> {
-    if !s.is_coordinator() {
-        return None;
-    }
-    let workers: Vec<&Session> = app.sessions.iter().filter(|w| w.parent_id.as_deref() == Some(s.id.as_str())).collect();
-    if workers.is_empty() {
-        return None;
-    }
-    let now = jgt_core::now_ms();
-    let (active_workers, idle_workers) = partition_team_workers(&workers, app.show_archived);
-    let archived = workers.iter().filter(|w| w.archived).count();
-    let working = workers.iter().filter(|w| w.status.is_connected()).count();
-    let cost: f64 = workers.iter().filter_map(|w| w.cost_usd).sum();
-
-    let mut summary = row![
-        muted("TEAM").size(style::fs(11)).font(bold()),
-        muted(format!("{working} working · {} done · ${cost:.2}", workers.len() - working)).size(style::fs(11)),
-        space::horizontal(),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    if archived > 0 {
-        let label = if app.show_archived { "Hide archived".to_string() } else { format!("{archived} archived") };
-        summary = summary.push(
-            tip(
-                button(text(label).size(style::fs(11))).on_press(Msg::ToggleArchived).style(style::ghost).padding([1, 6]),
-                "Worker chats of finished runs are archived: kept, but hidden",
-            ),
-        );
-    }
-
-    let mut list = column![summary].spacing(2);
-    for w in active_workers {
-        list = list.push(team_worker_row(w, now, theme));
-    }
-    if !idle_workers.is_empty() {
-        let count = idle_workers.len();
-        let label = if app.collapsed_idle {
-            format!("▸ Idle workers ({count})")
-        } else {
-            "▾ Idle workers".to_string()
-        };
-        let toggle_btn = tip(
-            button(text(label).size(style::fs(11)))
-                .on_press(Msg::ToggleIdleCollapse)
-                .style(style::ghost)
-                .padding([1, 6]),
-            if app.collapsed_idle { "Show idle workers" } else { "Hide idle workers" },
-        );
-        list = list.push(toggle_btn);
-        if !app.collapsed_idle {
-            for w in idle_workers {
-                list = list.push(team_worker_row(w, now, theme));
-            }
-        }
-    }
-    Some(container(list).padding([6, 8]).width(Fill).style(style::pill).into())
-}
-
-fn team_worker_row<'a>(w: &'a Session, now: i64, theme: &Theme) -> Element<'a, Msg> {
-    let (state, secs) = match w.status {
-        SessionStatus::Active => ("working", (now - w.created_at) / 1000),
-        SessionStatus::Idle | SessionStatus::Listening => ("idle", (now - w.created_at) / 1000),
-        _ => (
-            if w.status == SessionStatus::Ended { "ended" } else { "done" },
-            w.run_secs.unwrap_or((w.updated_at - w.created_at) / 1000),
-        ),
-    };
-    let detail = if w.status.is_connected() { w.status_text.clone().unwrap_or_default() } else { String::new() };
-    // A finished run whose harness reports no cost shows "—" (PRD H8).
-    let cost = match w.cost_usd {
-        Some(c) => format!("${c:.2}"),
-        None if w.status.is_connected() => String::new(),
-        None => "—".to_string(),
-    };
-    let runs_on = [Some(w.harness.label().to_string()), w.model.clone()].into_iter().flatten().collect::<Vec<_>>();
-    let line = row![
-        dot(style::status_color(theme, w.status), 7.0),
-        text(w.display_name()).size(style::fs(12)).wrapping(text::Wrapping::None).width(Fill),
-        muted(detail).size(style::fs(11)).wrapping(text::Wrapping::None),
-        container(text(runs_on.join(" · ")).size(style::fs(10)).wrapping(text::Wrapping::None))
-            .padding([1, 6])
-            .style(style::pill),
-        muted(state).size(style::fs(11)).width(56),
-        muted(duration(secs)).size(style::fs(11)).width(56),
-        muted(cost).size(style::fs(11)).width(48),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
-    button(container(line).clip(true))
-        .on_press(Msg::Select(w.id.clone()))
-        .style(style::session_item(false))
-        .width(Fill)
-        .padding([3, 8])
-        .into()
 }
 
 fn status_banner<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Option<Element<'a, Msg>> {
@@ -1556,22 +1780,27 @@ mod tests {
     }
 
     #[test]
-    fn team_panel_rows_handles_collapse() {
-        let w_active = test_session("w1", Some("coder"), Some("c1"), SessionStatus::Active, false);
-        let w_idle1 = test_session("w2", Some("tester"), Some("c1"), SessionStatus::Idle, false);
-        let w_idle2 = test_session("w3", Some("reviewer"), Some("c1"), SessionStatus::Ended, false);
-        let workers = [&w_active, &w_idle1, &w_idle2];
+    fn test_listen_enabled() {
+        let mut s = test_session("s1", Some("coder"), None, SessionStatus::Active, false);
+        s.harness = Harness::ClaudeCode;
+        assert!(listen_enabled(&s));
 
-        // Expanded: all shown, hidden count = 0
-        let (shown, hidden) = team_panel_rows(&workers, false, false);
-        assert_eq!(shown.len(), 3);
-        assert_eq!(hidden, 0);
+        s.status = SessionStatus::Listening;
+        assert!(listen_enabled(&s));
 
-        // Collapsed: only active shown, hidden count = 2
-        let (shown, hidden) = team_panel_rows(&workers, false, true);
-        assert_eq!(shown.len(), 1);
-        assert_eq!(shown[0].id, "w1");
-        assert_eq!(hidden, 2);
+        s.status = SessionStatus::Idle;
+        assert!(listen_enabled(&s));
+
+        s.status = SessionStatus::Ended;
+        assert!(!listen_enabled(&s));
+
+        s.status = SessionStatus::Active;
+        s.harness = Harness::Custom;
+        assert!(!listen_enabled(&s));
+
+        s.status = SessionStatus::Ended;
+        s.harness = Harness::Custom;
+        assert!(!listen_enabled(&s));
     }
 
     #[test]
@@ -1613,5 +1842,189 @@ mod tests {
             no_role_session,
         ];
         assert_eq!(count_coordinators(&two_coords), 2, "Both active and idle coordinators are counted");
+    }
+
+    fn test_session_full(
+        id: &str,
+        role: Option<&str>,
+        parent_id: Option<&str>,
+        cwd: Option<&str>,
+        status: SessionStatus,
+        archived: bool,
+        cost_usd: Option<f64>,
+    ) -> Session {
+        let mut s = test_session(id, role, parent_id, status, archived);
+        s.cwd = cwd.map(str::to_string);
+        s.cost_usd = cost_usd;
+        s
+    }
+
+    #[test]
+    fn team_summary_empty_and_unknown() {
+        assert_eq!(team_summary(&[], "/projects/alpha"), (0, 0.0));
+        assert_eq!(team_summary(&[], ""), (0, 0.0));
+
+        let c1 = test_session_full("c1", Some(jgt_core::COORDINATOR), None, Some("/projects/alpha"), SessionStatus::Active, false, None);
+        assert_eq!(team_summary(std::slice::from_ref(&c1), "/projects/beta"), (0, 0.0));
+        assert_eq!(team_summary(&[c1], "/projects/alpha"), (0, 0.0), "Coordinator without workers has 0 working and 0.0 cost");
+    }
+
+    #[test]
+    fn team_summary_counts_working_and_sums_cost_including_ended_and_archived() {
+        let c1 = test_session_full("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false, None);
+        let w_act = test_session_full("w1", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false, Some(0.25));
+        let w_list = test_session_full("w2", Some("tester"), Some("c1"), Some("/team1"), SessionStatus::Listening, false, Some(0.15));
+        let w_idle = test_session_full("w3", Some("reviewer"), Some("c1"), Some("/team1"), SessionStatus::Idle, false, Some(0.10));
+        let w_disc = test_session_full("w4", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Disconnected, false, Some(0.05));
+        let w_ended = test_session_full("w5", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Ended, false, Some(0.42));
+        let w_arch_ended = test_session_full("w6", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Ended, true, Some(0.08));
+        let w_arch_act = test_session_full("w7", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, true, Some(0.20));
+
+        // Other team sessions that should not be counted
+        let c2 = test_session_full("c2", Some(jgt_core::COORDINATOR), None, Some("/team2"), SessionStatus::Active, false, None);
+        let w_other = test_session_full("w_other", Some("coder"), Some("c2"), Some("/team2"), SessionStatus::Active, false, Some(9.99));
+        let s_solo = test_session_full("s_solo", None, None, Some("/team1"), SessionStatus::Active, false, Some(5.00));
+
+        let sessions = vec![c1, w_act, w_list, w_idle, w_disc, w_ended, w_arch_ended, w_arch_act, c2, w_other, s_solo];
+
+        let (working, cost) = team_summary(&sessions, "/team1");
+        // Working workers: w1 (Active), w2 (Listening), w3 (Idle), w7 (Archived Active) = 4
+        assert_eq!(working, 4, "Working workers must include connected statuses (Active, Listening, Idle) including archived active ones");
+        // Cost: 0.25 + 0.15 + 0.10 + 0.05 + 0.42 + 0.08 + 0.20 = 1.25
+        assert!((cost - 1.25).abs() < 1e-6, "Cost must sum all workers of the coordinator, including ended and archived");
+
+        // Normalization: trailing slash should produce identical results
+        let (working_norm, cost_norm) = team_summary(&sessions, "/team1/");
+        assert_eq!(working_norm, working);
+        assert!((cost_norm - cost).abs() < 1e-6);
+
+        // Check team2
+        let (t2_working, t2_cost) = team_summary(&sessions, "/team2");
+        assert_eq!(t2_working, 1);
+        assert!((t2_cost - 9.99).abs() < 1e-6);
+    }
+
+    #[test]
+    fn workspace_choice_display() {
+        let team = WorkspaceChoice::Team {
+            key: "/projects/alpha".to_string(),
+            name: "alpha".to_string(),
+        };
+        assert_eq!(team.to_string(), "alpha");
+
+        let new_team = WorkspaceChoice::NewTeam;
+        assert_eq!(new_team.to_string(), "New team…");
+    }
+
+    #[test]
+    fn app_header_and_view_render() {
+        let (mut app, _) = App::new(None);
+        let _ = app_header(&app);
+        let _ = view(&app);
+
+        // With settings open
+        app.show_settings = true;
+        let _ = view(&app);
+
+        // With archived chats shown
+        app.show_archived = true;
+        let _ = app_header(&app);
+
+        // With a selected workspace and session
+        let c1 = test_session_full("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false, None);
+        let w1 = test_session_full("w1", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false, Some(0.42));
+        app.sessions = vec![c1, w1];
+        app.workspace = Some("/team1".to_string());
+        let _ = app_header(&app);
+        let _ = view(&app);
+    }
+
+    #[test]
+    fn test_sidebar_workspace_model() {
+        let c1 = test_session_full("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false, None);
+        let w_act = test_session_full("w_act", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false, Some(0.5));
+        let w_idle = test_session_full("w_idle", Some("tester"), Some("c1"), Some("/team1"), SessionStatus::Idle, false, Some(0.2));
+        let sessions = vec![c1, w_act, w_idle];
+
+        let mut boards = HashMap::new();
+
+        // 1. Board not loaded yet: board_open_tasks is None
+        let model_unloaded = sidebar_workspace_model(&sessions, &boards, "/team1", false);
+        assert_eq!(model_unloaded.board_open_tasks, None);
+        assert_eq!(model_unloaded.coordinator.map(|s| s.id.as_str()), Some("c1"));
+        assert_eq!(model_unloaded.workers.len(), 2);
+        assert_eq!(model_unloaded.workers[0].id, "w_act");
+        assert_eq!(model_unloaded.workers[1].id, "w_idle");
+        assert!(!model_unloaded.workers_collapsed);
+
+        // 2. Board loaded with 3 tasks: 2 open, 1 done -> count must be 2
+        let t1 = jgt_core::Task::new("/team1", 1, "task 1", jgt_core::TaskStatus::Backlog);
+        let t2 = jgt_core::Task::new("/team1", 2, "task 2", jgt_core::TaskStatus::Working);
+        let t3 = jgt_core::Task::new("/team1", 3, "task 3", jgt_core::TaskStatus::Done);
+        let board = crate::board::Board::new(vec![t1, t2, t3]);
+        boards.insert("/team1".to_string(), board);
+
+        let model_loaded = sidebar_workspace_model(&sessions, &boards, "/team1", true);
+        assert_eq!(model_loaded.board_open_tasks, Some(2));
+        assert_eq!(model_loaded.coordinator.map(|s| s.id.as_str()), Some("c1"));
+        assert!(model_loaded.workers_collapsed);
+    }
+
+    #[test]
+    fn test_board_render_without_selected_coordinator() {
+        let (mut app, _) = App::new(None);
+        app.workspace = Some("/team1".to_string());
+        app.selected = None;
+        app.module = Module::Board;
+
+        let t1 = jgt_core::Task::new("/team1", 1, "task 1", jgt_core::TaskStatus::Backlog);
+        let board = crate::board::Board::new(vec![t1]);
+        app.boards.insert("/team1".to_string(), board);
+
+        let theme = app.theme();
+        // Render board directly with workspace without session
+        let _ = crate::board::board(&app, "/team1", &theme);
+
+        // Render main view and full view
+        let _ = main(&app, &theme);
+        let _ = view(&app);
+        let _ = sidebar(&app, &theme);
+    }
+
+    #[test]
+    fn test_sidebar_modules_render() {
+        let (mut app, _) = App::new(None);
+        let c1 = test_session_full("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false, None);
+        let w1 = test_session_full("w1", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false, Some(0.42));
+        app.sessions = vec![c1, w1];
+        app.workspace = Some("/team1".to_string());
+        app.module = Module::Coordinator;
+
+        let theme = app.theme();
+
+        // 1. Expanded workers
+        app.workers_collapsed = false;
+        let _ = sidebar(&app, &theme);
+
+        // 2. Collapsed workers
+        app.workers_collapsed = true;
+        let _ = sidebar(&app, &theme);
+
+        // 3. Board module selected
+        app.module = Module::Board;
+        let _ = sidebar(&app, &theme);
+
+        // 4. Worker module selected
+        app.module = Module::Worker("w1".to_string());
+        let _ = sidebar(&app, &theme);
+
+        // 5. Search active
+        app.search = "coder".to_string();
+        let _ = sidebar(&app, &theme);
+
+        // 6. Archived view active
+        app.search.clear();
+        app.show_archived = true;
+        let _ = sidebar(&app, &theme);
     }
 }

@@ -3,6 +3,7 @@
 mod app;
 mod board;
 mod hub;
+mod icons;
 mod style;
 mod view;
 
@@ -26,6 +27,7 @@ fn main() -> iced::Result {
     }
 
     iced::application(move || app::App::new(session.clone()), app::App::update, view::view)
+        .font(include_bytes!("../assets/material-symbols-outlined.ttf").as_slice())
         .default_font(style::ui_font())
         .title(app::App::title)
         .theme(app::App::theme)

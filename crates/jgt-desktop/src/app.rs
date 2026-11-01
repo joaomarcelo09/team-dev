@@ -72,12 +72,29 @@ pub struct Toast {
     pub since: Instant,
 }
 
-/// What a Coordinator's chat shows: the conversation or its workspace's Board.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Tab {
-    #[default]
-    Chat,
+/// Modules available for a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Module {
     Board,
+    #[default]
+    Coordinator,
+    Worker(String),
+}
+
+/// A team workspace: a project folder with its Coordinator.
+// used from step 4 on
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workspace {
+    pub key: String,
+    pub name: String,
+    pub coordinator_id: Option<String>,
+}
+
+impl std::fmt::Display for Workspace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +107,7 @@ pub enum ThemePref {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ThemeStyle {
     #[default]
+    Violet,
     Default,
     TokyoNight,
     Dracula,
@@ -98,14 +116,17 @@ pub enum ThemeStyle {
 impl ThemeStyle {
     pub fn parse(s: &str) -> Self {
         match s {
+            "jg-violet" => Self::Violet,
+            "default" => Self::Default,
             "tokyo-night" => Self::TokyoNight,
             "dracula" => Self::Dracula,
-            _ => Self::Default,
+            _ => Self::Violet,
         }
     }
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Violet => "jg-violet",
             Self::Default => "default",
             Self::TokyoNight => "tokyo-night",
             Self::Dracula => "dracula",
@@ -117,6 +138,8 @@ pub struct App {
     pub conn: Conn,
     pub sessions: Vec<Session>,
     pub selected: Option<String>,
+    pub workspace: Option<String>,
+    pub module: Module,
     pub threads: HashMap<String, Thread>,
     pub composer: text_editor::Content,
     /// Unsent text per session, kept while switching chats.
@@ -127,8 +150,8 @@ pub struct App {
     pub show_archived: bool,
     /// Coordinators whose workers are collapsed in the sidebar.
     pub collapsed_coordinators: HashSet<String>,
-    /// Whether idle/done workers in the team panel are collapsed.
-    pub collapsed_idle: bool,
+    /// Whether the Worker section in the sidebar is collapsed.
+    pub workers_collapsed: bool,
     pub rename: Option<String>,
     pub confirm_delete: bool,
     pub reconnecting: bool,
@@ -150,8 +173,6 @@ pub struct App {
     /// Folder typed in the "New team" form, while it is open.
     pub new_team: Option<String>,
     pub starting_team: bool,
-    /// Chat or Board per Coordinator session; Chat when absent.
-    pub tabs: HashMap<String, Tab>,
     /// The tasks of each Board opened so far, by workspace.
     pub boards: HashMap<String, crate::board::Board>,
     /// The task whose side panel is open.
@@ -196,6 +217,8 @@ pub enum Msg {
     Feed(Feed),
     SessionsLoaded(Result<Vec<Session>, String>),
     Select(String),
+    SelectWorkspace(String),
+    SelectModule(Module),
     ThreadLoaded { session: String, older: bool, result: Result<Vec<Message>, String> },
     LoadOlder,
     Scrolled(scrollable::Viewport),
@@ -218,7 +241,7 @@ pub enum Msg {
     NewTeamStart,
     NewTeamCancel,
     TeamStarted(Result<String, String>),
-    SetTab(Tab),
+    ToggleWorkers,
     BoardLoaded { workspace: String, result: Result<Vec<BoardTask>, String> },
     TaskEventsLoaded { task: String, result: Result<Vec<TaskEvent>, String> },
     OpenTask(String),
@@ -267,7 +290,6 @@ pub enum Msg {
     Search(String),
     ToggleArchived,
     ToggleCoordinatorCollapse(String),
-    ToggleIdleCollapse,
     Copy(String),
     Link(markdown::Uri),
     Window(window::Id, window::Event),
@@ -302,6 +324,8 @@ impl App {
             conn: Conn::Connecting,
             sessions: Vec::new(),
             selected: None,
+            workspace: None,
+            module: Module::Coordinator,
             threads: HashMap::new(),
             composer: text_editor::Content::new(),
             drafts: HashMap::new(),
@@ -309,7 +333,7 @@ impl App {
             search: String::new(),
             show_archived: false,
             collapsed_coordinators: HashSet::new(),
-            collapsed_idle: false,
+            workers_collapsed: false,
             rename: None,
             confirm_delete: false,
             reconnecting: false,
@@ -327,7 +351,6 @@ impl App {
             config_warnings: config.team.warnings(None),
             new_team: None,
             starting_team: false,
-            tabs: HashMap::new(),
             boards: HashMap::new(),
             open_task: None,
             task_events: HashMap::new(),
@@ -359,6 +382,7 @@ impl App {
 
     pub fn theme(&self) -> Theme {
         match self.theme_style {
+            ThemeStyle::Violet => crate::style::violet(),
             ThemeStyle::TokyoNight => crate::style::tokyo_night(),
             ThemeStyle::Dracula => crate::style::dracula(),
             ThemeStyle::Default => {
@@ -413,10 +437,6 @@ impl App {
         if !self.collapsed_coordinators.remove(id) {
             self.collapsed_coordinators.insert(id.to_string());
         }
-    }
-
-    pub fn toggle_idle_collapse(&mut self) {
-        self.collapsed_idle = !self.collapsed_idle;
     }
 
     pub fn is_coordinator_collapsed(&self, id: &str) -> bool {
@@ -474,6 +494,16 @@ impl App {
     }
 
     fn select(&mut self, id: String) -> Task<Msg> {
+        if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
+            self.workspace = session_workspace(s, &self.sessions);
+            self.module = if s.is_worker() {
+                Module::Worker(id.clone())
+            } else {
+                Module::Coordinator
+            };
+        }
+        self.close_task();
+        self.new_task = None;
         if self.selected.as_deref() == Some(id.as_str()) {
             return Task::none();
         }
@@ -485,8 +515,6 @@ impl App {
         self.selected = Some(id.clone());
         self.rename = None;
         self.confirm_delete = false;
-        self.close_task();
-        self.new_task = None;
         self.selecting_message = None;
         Task::batch([
             self.load_selected_board(),
@@ -497,25 +525,19 @@ impl App {
         ])
     }
 
-    /// The tab a session shows (only Coordinators have a Board).
-    pub fn tab(&self, session_id: &str) -> Tab {
-        self.tabs.get(session_id).copied().unwrap_or_default()
-    }
-
     fn load_board(&self, workspace: String) -> Task<Msg> {
         let w = workspace.clone();
         Task::perform(hub::tasks(workspace), move |result| Msg::BoardLoaded { workspace: w.clone(), result })
     }
 
-    /// Loads the selected Coordinator's Board when its Board tab is showing.
+    /// Loads the workspace Board when the Board module is showing.
     fn load_selected_board(&self) -> Task<Msg> {
-        match self.selected_session() {
-            Some(s) if self.tab(&s.id) == Tab::Board => match crate::board::workspace(s) {
-                Some(w) => self.load_board(w),
-                None => Task::none(),
-            },
-            _ => Task::none(),
+        if self.module == Module::Board
+            && let Some(ws) = self.workspace.clone().or_else(|| self.selected_session().and_then(crate::board::workspace))
+        {
+            return self.load_board(ws);
         }
+        Task::none()
     }
 
     fn load_task_events(&self, task: String) -> Task<Msg> {
@@ -620,7 +642,12 @@ impl App {
                     }
                 match self.start_session.take() {
                     Some(id) if self.sessions.iter().any(|s| s.id == id) => self.select(id),
-                    _ => Task::none(),
+                    _ => {
+                        if let Some(s) = self.selected.as_deref().and_then(|id| self.sessions.iter().find(|s| s.id == id)) {
+                            self.workspace = session_workspace(s, &self.sessions);
+                        }
+                        Task::none()
+                    }
                 }
             }
             Msg::SessionsLoaded(Err(e)) => {
@@ -628,6 +655,55 @@ impl App {
                 Task::none()
             }
             Msg::Select(id) => self.select(id),
+            Msg::SelectWorkspace(ws) => {
+                let ws_norm = jgt_core::team::normalize_folder(&ws).to_string();
+                self.workspace = Some(ws_norm.clone());
+                self.module = Module::Coordinator;
+                if let Some(coord) = coordinator_for(&self.sessions, &ws_norm) {
+                    let id = coord.id.clone();
+                    self.select(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Msg::SelectModule(module) => {
+                let prev_board = self.module == Module::Board;
+                self.module = module;
+                if prev_board && self.module != Module::Board {
+                    self.close_task();
+                    self.new_task = None;
+                }
+                match &self.module {
+                    Module::Board => {
+                        if self.workspace.is_none()
+                            && let Some(s) = self.selected_session()
+                        {
+                            self.workspace = session_workspace(s, &self.sessions);
+                        }
+                        if let Some(id) = &self.selected {
+                            self.drafts.insert(id.clone(), self.composer.text());
+                        }
+                        if let Some(ws) = self.workspace.clone() {
+                            self.load_board(ws)
+                        } else {
+                            Task::none()
+                        }
+                    }
+                    Module::Coordinator => {
+                        if let Some(ws) = &self.workspace
+                            && let Some(coord) = coordinator_for(&self.sessions, ws)
+                        {
+                            let id = coord.id.clone();
+                            return self.select(id);
+                        }
+                        Task::none()
+                    }
+                    Module::Worker(id) => {
+                        let id = id.clone();
+                        self.select(id)
+                    }
+                }
+            }
             Msg::ThreadLoaded { session, older, result } => match result {
                 Ok(messages) => {
                     let thread = self.threads.entry(session.clone()).or_default();
@@ -774,17 +850,9 @@ impl App {
                 }
                 Task::none()
             }
-            Msg::SetTab(tab) => {
-                let Some(id) = self.selected.clone() else { return Task::none() };
-                self.tabs.insert(id, tab);
-                match tab {
-                    Tab::Board => self.load_selected_board(),
-                    Tab::Chat => {
-                        self.close_task();
-                        self.new_task = None;
-                        self.snap()
-                    }
-                }
+            Msg::ToggleWorkers => {
+                self.workers_collapsed = !self.workers_collapsed;
+                Task::none()
             }
             Msg::BoardLoaded { workspace, result } => {
                 match result {
@@ -873,7 +941,7 @@ impl App {
                 Task::none()
             }
             Msg::ExportBoard => {
-                let Some(workspace) = self.selected_session().and_then(crate::board::workspace) else { return Task::none() };
+                let Some(workspace) = self.workspace.clone().or_else(|| self.selected_session().and_then(crate::board::workspace)) else { return Task::none() };
                 let Some(board) = self.boards.get(&workspace) else { return Task::none() };
                 let text = jgt_core::board::to_markdown(board.tasks());
                 let path = jgt_core::board::export_path(&workspace);
@@ -915,7 +983,7 @@ impl App {
                 Task::none()
             }
             Msg::NewTaskSave => {
-                let Some(workspace) = self.selected_session().and_then(crate::board::workspace) else { return Task::none() };
+                let Some(workspace) = self.workspace.clone().or_else(|| self.selected_session().and_then(crate::board::workspace)) else { return Task::none() };
                 let Some((column, title)) = self.new_task.take() else { return Task::none() };
                 let title = title.trim().to_string();
                 if title.is_empty() {
@@ -1072,10 +1140,6 @@ impl App {
             }
             Msg::ToggleCoordinatorCollapse(id) => {
                 self.toggle_coordinator_collapse(&id);
-                Task::none()
-            }
-            Msg::ToggleIdleCollapse => {
-                self.toggle_idle_collapse();
                 Task::none()
             }
             Msg::Copy(text) => {
@@ -1341,6 +1405,146 @@ pub(crate) fn apply_popups(config: &mut Config, enabled: bool) {
     config.notifications.enabled = enabled;
 }
 
+/// The workspace folder for `session`, if it belongs to a team.
+pub fn session_workspace(session: &Session, sessions: &[Session]) -> Option<String> {
+    if session.is_coordinator() {
+        return session
+            .cwd
+            .as_deref()
+            .map(jgt_core::team::normalize_folder)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string);
+    }
+    if session.is_worker() {
+        if let Some(parent_id) = session.parent_id.as_deref()
+            && let Some(parent) = sessions.iter().find(|p| p.id == parent_id && p.is_coordinator())
+        {
+            return parent
+                .cwd
+                .as_deref()
+                .map(jgt_core::team::normalize_folder)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string);
+        }
+        if let Some(folder) = session
+            .cwd
+            .as_deref()
+            .map(jgt_core::team::normalize_folder)
+            .filter(|k| !k.is_empty())
+            && coordinator_for(sessions, folder).is_some()
+        {
+            return Some(folder.to_string());
+        }
+    }
+    None
+}
+
+/// The Coordinator for `ws`: the newest live Coordinator of that folder.
+// used from step 4 on
+#[allow(dead_code)]
+pub fn coordinator_for<'a>(sessions: &'a [Session], ws: &str) -> Option<&'a Session> {
+    let ws_norm = jgt_core::team::normalize_folder(ws);
+    if ws_norm.is_empty() {
+        return None;
+    }
+    let mut coords: Vec<&'a Session> = sessions
+        .iter()
+        .filter(|s| {
+            s.is_coordinator()
+                && s.cwd.as_deref().map(jgt_core::team::normalize_folder) == Some(ws_norm)
+        })
+        .collect();
+    if coords.is_empty() {
+        return None;
+    }
+    coords.sort_by_key(|s| {
+        (
+            s.status != SessionStatus::Ended,
+            !s.archived,
+            s.last_message_at.unwrap_or(s.updated_at),
+            s.created_at,
+        )
+    });
+    coords.pop()
+}
+
+/// The workspaces represented in `sessions`: unique folders that have a Coordinator,
+/// sorted stably by name.
+// used from step 4 on
+#[allow(dead_code)]
+pub fn workspaces(sessions: &[Session]) -> Vec<Workspace> {
+    let mut keys: Vec<String> = sessions
+        .iter()
+        .filter(|s| s.is_coordinator())
+        .filter_map(|s| {
+            s.cwd
+                .as_deref()
+                .map(jgt_core::team::normalize_folder)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string)
+        })
+        .collect();
+    keys.sort();
+    keys.dedup();
+
+    let mut list = Vec::new();
+    for key in keys {
+        let coord = coordinator_for(sessions, &key);
+        let name = coord.and_then(|c| c.project()).unwrap_or_else(|| {
+            std::path::Path::new(&key)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| key.clone())
+        });
+        list.push(Workspace {
+            name,
+            coordinator_id: coord.map(|c| c.id.clone()),
+            key,
+        });
+    }
+
+    list.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.key.cmp(&b.key)));
+    list
+}
+
+/// Partitions team workers into active (working) and idle/done workers.
+// used from step 4 on
+#[allow(dead_code)]
+pub fn partition_team_workers<'a>(
+    workers: &[&'a Session],
+    show_archived: bool,
+) -> (Vec<&'a Session>, Vec<&'a Session>) {
+    let mut active = Vec::new();
+    let mut idle = Vec::new();
+    for &w in workers {
+        if !w.archived || show_archived {
+            if w.status == SessionStatus::Active {
+                active.push(w);
+            } else {
+                idle.push(w);
+            }
+        }
+    }
+    (active, idle)
+}
+
+/// The workers for `ws`: non-coordinator, non-archived sessions of that folder,
+/// in the same ordering the team panel uses.
+// used from step 4 on
+#[allow(dead_code)]
+pub fn workers_for<'a>(sessions: &'a [Session], ws: &str) -> Vec<&'a Session> {
+    let Some(coord) = coordinator_for(sessions, ws) else {
+        return Vec::new();
+    };
+    let workers: Vec<&Session> = sessions
+        .iter()
+        .filter(|s| !s.is_coordinator() && s.parent_id.as_deref() == Some(coord.id.as_str()))
+        .collect();
+    let (mut active, idle) = partition_team_workers(&workers, false);
+    active.extend(idle);
+    active
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1404,18 +1608,31 @@ mod tests {
 
     #[test]
     fn theme_style_parse_and_fallback() {
+        assert_eq!(ThemeStyle::parse("jg-violet"), ThemeStyle::Violet);
         assert_eq!(ThemeStyle::parse("default"), ThemeStyle::Default);
         assert_eq!(ThemeStyle::parse("tokyo-night"), ThemeStyle::TokyoNight);
         assert_eq!(ThemeStyle::parse("dracula"), ThemeStyle::Dracula);
 
-        // Unknown values fall back to default
-        assert_eq!(ThemeStyle::parse("unknown"), ThemeStyle::Default);
-        assert_eq!(ThemeStyle::parse("nord"), ThemeStyle::Default);
-        assert_eq!(ThemeStyle::parse(""), ThemeStyle::Default);
+        // Unknown values and empty string fall back to Violet
+        assert_eq!(ThemeStyle::parse("unknown"), ThemeStyle::Violet);
+        assert_eq!(ThemeStyle::parse("nord"), ThemeStyle::Violet);
+        assert_eq!(ThemeStyle::parse(""), ThemeStyle::Violet);
 
         // Round-trip through as_str
-        for style in [ThemeStyle::Default, ThemeStyle::TokyoNight, ThemeStyle::Dracula] {
+        for style in [ThemeStyle::Violet, ThemeStyle::Default, ThemeStyle::TokyoNight, ThemeStyle::Dracula] {
             assert_eq!(ThemeStyle::parse(style.as_str()), style);
+        }
+    }
+
+    #[test]
+    fn app_theme_violet_ignores_theme_pref() {
+        let (mut app, _) = App::new(None);
+        app.theme_style = ThemeStyle::Violet;
+        for pref in [ThemePref::Dark, ThemePref::Light, ThemePref::System] {
+            app.theme_pref = pref;
+            let theme = app.theme();
+            assert_eq!(theme.palette().background, iced::Color::from_rgb8(0x11, 0x13, 0x19));
+            assert_eq!(theme.palette().primary, iced::Color::from_rgb8(0x7c, 0x3a, 0xed));
         }
     }
 
@@ -1442,25 +1659,10 @@ mod tests {
     }
 
     #[test]
-    fn idle_collapse_toggles() {
-        let (mut app, _) = App::new(None);
-        // Default is expanded (collapsed_idle == false).
-        assert!(!app.collapsed_idle);
-
-        let _ = app.update(Msg::ToggleIdleCollapse);
-        assert!(app.collapsed_idle);
-
-        let _ = app.update(Msg::ToggleIdleCollapse);
-        assert!(!app.collapsed_idle);
-    }
-
-    #[test]
     fn collapsed_state_survives_sessions_refresh() {
         let (mut app, _) = App::new(None);
         let _ = app.update(Msg::ToggleCoordinatorCollapse("coord-1".to_string()));
-        let _ = app.update(Msg::ToggleIdleCollapse);
         assert!(app.is_coordinator_collapsed("coord-1"));
-        assert!(app.collapsed_idle);
 
         // Simulate session list refresh from hub.
         let session = serde_json::from_value::<Session>(serde_json::json!({
@@ -1474,6 +1676,303 @@ mod tests {
 
         let _ = app.update(Msg::SessionsLoaded(Ok(vec![session])));
         assert!(app.is_coordinator_collapsed("coord-1"), "Collapsed coordinators must survive session list reload");
-        assert!(app.collapsed_idle, "Idle collapsed flag must survive session list reload");
+    }
+
+    #[test]
+    fn leaving_board_closes_open_task_and_new_task() {
+        let (mut app, _) = App::new(None);
+        app.module = Module::Board;
+        app.open_task = Some("task-1".to_string());
+        app.new_task = Some((jgt_core::TaskStatus::Backlog, "New task".to_string()));
+
+        // Leaving board via SelectModule
+        let _ = app.update(Msg::SelectModule(Module::Coordinator));
+        assert!(app.open_task.is_none());
+        assert!(app.new_task.is_none());
+
+        // Re-open and test via select()
+        app.open_task = Some("task-2".to_string());
+        app.new_task = Some((jgt_core::TaskStatus::Backlog, "New task 2".to_string()));
+        let _ = app.select("some-session".to_string());
+        assert!(app.open_task.is_none());
+        assert!(app.new_task.is_none());
+    }
+
+    fn make_session(
+        id: &str,
+        role: Option<&str>,
+        parent_id: Option<&str>,
+        cwd: Option<&str>,
+        status: SessionStatus,
+        archived: bool,
+    ) -> Session {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "harness": jgt_core::Harness::ClaudeCode,
+            "external_id": format!("ext-{id}"),
+            "cwd": cwd.unwrap_or("/w/"),
+            "title": id,
+            "status": status,
+            "listen": false,
+            "mirror": false,
+            "archived": archived,
+            "unread": 0,
+            "queued": 0,
+            "created_at": 1000,
+            "updated_at": 2000,
+            "last_seen_at": 2000,
+            "awaiting_reply": false,
+            "role": role,
+            "parent_id": parent_id,
+        }))
+        .expect("test session")
+    }
+
+    #[test]
+    fn helpers_empty_sessions() {
+        let sessions: Vec<Session> = vec![];
+        assert_eq!(workspaces(&sessions), vec![]);
+        assert_eq!(coordinator_for(&sessions, "/w"), None);
+        assert!(workers_for(&sessions, "/w").is_empty());
+    }
+
+    #[test]
+    fn helpers_one_team() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/repo/team-a"), SessionStatus::Active, false);
+        let w1 = make_session("w1", Some("coder"), Some("c1"), Some("/repo/team-a"), SessionStatus::Active, false);
+        let sessions = vec![c1.clone(), w1.clone()];
+
+        let ws = workspaces(&sessions);
+        assert_eq!(ws.len(), 1);
+        assert_eq!(ws[0].key, "/repo/team-a");
+        assert_eq!(ws[0].name, "team-a");
+        assert_eq!(ws[0].coordinator_id.as_deref(), Some("c1"));
+
+        assert_eq!(coordinator_for(&sessions, "/repo/team-a").map(|s| s.id.as_str()), Some("c1"));
+        assert_eq!(coordinator_for(&sessions, "/repo/team-a/").map(|s| s.id.as_str()), Some("c1"));
+
+        let workers = workers_for(&sessions, "/repo/team-a");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w1");
+    }
+
+    #[test]
+    fn helpers_two_teams_sorted_stably_by_name() {
+        let c_zeta = make_session("c_zeta", Some(jgt_core::COORDINATOR), None, Some("/projects/zeta"), SessionStatus::Active, false);
+        let w_zeta = make_session("w_zeta", Some("coder"), Some("c_zeta"), Some("/projects/zeta"), SessionStatus::Active, false);
+        let c_alpha = make_session("c_alpha", Some(jgt_core::COORDINATOR), None, Some("/projects/alpha"), SessionStatus::Active, false);
+        let w_alpha = make_session("w_alpha", Some("reviewer"), Some("c_alpha"), Some("/projects/alpha"), SessionStatus::Active, false);
+        let sessions = vec![c_zeta, w_zeta, c_alpha, w_alpha];
+
+        let ws = workspaces(&sessions);
+        assert_eq!(ws.len(), 2);
+        assert_eq!(ws[0].name, "alpha");
+        assert_eq!(ws[0].key, "/projects/alpha");
+        assert_eq!(ws[0].coordinator_id.as_deref(), Some("c_alpha"));
+        assert_eq!(ws[1].name, "zeta");
+        assert_eq!(ws[1].key, "/projects/zeta");
+        assert_eq!(ws[1].coordinator_id.as_deref(), Some("c_zeta"));
+
+        assert_eq!(coordinator_for(&sessions, "/projects/alpha").map(|s| s.id.as_str()), Some("c_alpha"));
+        assert_eq!(coordinator_for(&sessions, "/projects/zeta").map(|s| s.id.as_str()), Some("c_zeta"));
+
+        let alpha_workers = workers_for(&sessions, "/projects/alpha");
+        assert_eq!(alpha_workers.len(), 1);
+        assert_eq!(alpha_workers[0].id, "w_alpha");
+
+        let zeta_workers = workers_for(&sessions, "/projects/zeta");
+        assert_eq!(zeta_workers.len(), 1);
+        assert_eq!(zeta_workers[0].id, "w_zeta");
+    }
+
+    #[test]
+    fn helpers_archived_workers_excluded() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team"), SessionStatus::Active, false);
+        let w_active = make_session("w1", Some("coder"), Some("c1"), Some("/team"), SessionStatus::Active, false);
+        let w_archived = make_session("w2", Some("tester"), Some("c1"), Some("/team"), SessionStatus::Ended, true);
+        let sessions = vec![c1, w_active, w_archived];
+
+        let workers = workers_for(&sessions, "/team");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w1");
+    }
+
+    #[test]
+    fn helpers_session_without_a_team() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team"), SessionStatus::Active, false);
+        let w1 = make_session("w1", Some("coder"), Some("c1"), Some("/team"), SessionStatus::Active, false);
+        let s_noteam = make_session("s_noteam", None, None, Some("/team"), SessionStatus::Active, false);
+        let sessions = vec![c1, w1, s_noteam.clone()];
+
+        let workers = workers_for(&sessions, "/team");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].id, "w1", "Session without a team must not be included in workers");
+        assert_eq!(session_workspace(&s_noteam, &sessions), None);
+
+        let no_coord_sessions = vec![s_noteam];
+        assert!(workspaces(&no_coord_sessions).is_empty(), "Session without a coordinator produces no workspaces");
+    }
+
+    #[test]
+    fn update_select_workspace_and_modules() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false);
+        let w1 = make_session("w1", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false);
+
+        let (mut app, _) = App::new(None);
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c1, w1])));
+        assert_eq!(app.workspace, None);
+        assert_eq!(app.module, Module::Coordinator);
+
+        // SelectWorkspace selects coordinator and sets module to Coordinator
+        let _ = app.update(Msg::SelectWorkspace("/team1/".to_string()));
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+        assert_eq!(app.module, Module::Coordinator);
+
+        // SelectModule(Board) preserves workspace and sets module to Board
+        let _ = app.update(Msg::SelectModule(Module::Board));
+        assert_eq!(app.module, Module::Board);
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+
+        // SelectModule(Worker) selects worker session
+        let _ = app.update(Msg::SelectModule(Module::Worker("w1".to_string())));
+        assert_eq!(app.module, Module::Worker("w1".to_string()));
+        assert_eq!(app.selected.as_deref(), Some("w1"));
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+
+        // SelectModule(Coordinator) switches back to coordinator
+        let _ = app.update(Msg::SelectModule(Module::Coordinator));
+        assert_eq!(app.module, Module::Coordinator);
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+    }
+
+    #[test]
+    fn session_startup_and_select_set_workspace_and_module() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false);
+        let w1 = make_session("w1", Some("coder"), Some("c1"), Some("/team1/.team/worktrees/jgt-25"), SessionStatus::Active, false);
+        let s_noteam = make_session("s_noteam", None, None, Some("/random"), SessionStatus::Active, false);
+
+        // --session with coordinator
+        let (mut app_coord, _) = App::new(Some("c1".to_string()));
+        let _ = app_coord.update(Msg::SessionsLoaded(Ok(vec![c1.clone(), w1.clone(), s_noteam.clone()])));
+        assert_eq!(app_coord.selected.as_deref(), Some("c1"));
+        assert_eq!(app_coord.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app_coord.module, Module::Coordinator);
+
+        // --session with worker
+        let (mut app_worker, _) = App::new(Some("w1".to_string()));
+        let _ = app_worker.update(Msg::SessionsLoaded(Ok(vec![c1.clone(), w1.clone(), s_noteam.clone()])));
+        assert_eq!(app_worker.selected.as_deref(), Some("w1"));
+        assert_eq!(app_worker.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app_worker.module, Module::Worker("w1".to_string()));
+
+        // Selecting a worker directly (e.g. sidebar click)
+        let _ = app_coord.update(Msg::Select("w1".to_string()));
+        assert_eq!(app_coord.selected.as_deref(), Some("w1"));
+        assert_eq!(app_coord.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app_coord.module, Module::Worker("w1".to_string()));
+
+        // Selecting a non-team session resets workspace
+        let _ = app_coord.update(Msg::Select("s_noteam".to_string()));
+        assert_eq!(app_coord.selected.as_deref(), Some("s_noteam"));
+        assert_eq!(app_coord.workspace, None);
+    }
+
+    #[test]
+    fn sessions_loaded_preserves_module_board_and_refreshes_workspace() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false);
+        let (mut app, _) = App::new(None);
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c1.clone()])));
+        let _ = app.update(Msg::Select("c1".to_string()));
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app.module, Module::Coordinator);
+
+        // Switch to Board
+        let _ = app.update(Msg::SelectModule(Module::Board));
+        assert_eq!(app.module, Module::Board);
+
+        // Sessions reload: Module::Board must survive and workspace is refreshed
+        let mut c1_updated = c1.clone();
+        c1_updated.cwd = Some("/team1_refreshed".to_string());
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c1_updated])));
+        assert_eq!(app.module, Module::Board, "Module::Board must survive SessionsLoaded reload");
+        assert_eq!(app.workspace.as_deref(), Some("/team1_refreshed"), "Workspace must be refreshed from session");
+
+        // Reload where selected session no longer exists: module and workspace must not be cleared
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![])));
+        assert_eq!(app.selected, None);
+        assert_eq!(app.module, Module::Board, "Module::Board must survive even if selected session vanished");
+        assert_eq!(app.workspace.as_deref(), Some("/team1_refreshed"), "Workspace must not be cleared unexpectedly");
+    }
+
+    #[test]
+    fn helpers_workers_for_orders_active_before_idle() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team"), SessionStatus::Active, false);
+        let w_idle = make_session("w_idle", Some("coder"), Some("c1"), Some("/team"), SessionStatus::Idle, false);
+        let w_act1 = make_session("w_act1", Some("tester"), Some("c1"), Some("/team"), SessionStatus::Active, false);
+        let w_ended = make_session("w_ended", Some("reviewer"), Some("c1"), Some("/team"), SessionStatus::Ended, false);
+        let w_act2 = make_session("w_act2", Some("coder"), Some("c1"), Some("/team"), SessionStatus::Active, false);
+        let w_arch = make_session("w_arch", Some("coder"), Some("c1"), Some("/team"), SessionStatus::Active, true);
+        let sessions = vec![c1, w_idle, w_act1, w_ended, w_act2, w_arch];
+
+        let workers = workers_for(&sessions, "/team");
+        let ids: Vec<&str> = workers.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["w_act1", "w_act2", "w_idle", "w_ended"]);
+    }
+
+    #[test]
+    fn toggle_workers_toggles_state() {
+        let (mut app, _) = App::new(None);
+        assert!(!app.workers_collapsed, "workers_collapsed must default to false (expanded)");
+
+        let _ = app.update(Msg::ToggleWorkers);
+        assert!(app.workers_collapsed, "ToggleWorkers must collapse workers");
+
+        let _ = app.update(Msg::ToggleWorkers);
+        assert!(!app.workers_collapsed, "ToggleWorkers must expand workers again");
+    }
+
+    #[test]
+    fn module_routing_and_drafts_survive_switching() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false);
+        let w1 = make_session("w1", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false);
+        let (mut app, _) = App::new(None);
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c1, w1])));
+
+        // Select Coordinator
+        let _ = app.update(Msg::SelectWorkspace("/team1".to_string()));
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+        assert_eq!(app.module, Module::Coordinator);
+
+        // Type a draft in Coordinator composer
+        app.composer = text_editor::Content::with_text("draft for coordinator");
+
+        // Switch to Board module: draft is saved and module is Board
+        let _ = app.update(Msg::SelectModule(Module::Board));
+        assert_eq!(app.module, Module::Board);
+        assert_eq!(app.drafts.get("c1").map(String::as_str), Some("draft for coordinator"));
+
+        // Switch to Worker module: loads worker, composer gets worker's draft
+        let _ = app.update(Msg::SelectModule(Module::Worker("w1".to_string())));
+        assert_eq!(app.selected.as_deref(), Some("w1"));
+        assert_eq!(app.module, Module::Worker("w1".to_string()));
+        assert_eq!(app.composer.text().trim(), "");
+
+        // Type draft in worker
+        app.composer = text_editor::Content::with_text("draft for worker");
+
+        // Switch back to Coordinator: coordinator's draft is restored
+        let _ = app.update(Msg::SelectModule(Module::Coordinator));
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+        assert_eq!(app.module, Module::Coordinator);
+        assert_eq!(app.composer.text().trim(), "draft for coordinator");
+        assert_eq!(app.drafts.get("w1").map(String::as_str), Some("draft for worker"));
+
+        // Switch back to Worker: worker's draft is restored
+        let _ = app.update(Msg::SelectModule(Module::Worker("w1".to_string())));
+        assert_eq!(app.selected.as_deref(), Some("w1"));
+        assert_eq!(app.module, Module::Worker("w1".to_string()));
+        assert_eq!(app.composer.text().trim(), "draft for worker");
     }
 }
