@@ -792,12 +792,36 @@ mod board {
         let d = t.create(ActorRequest::User, "d", Some(OnQueue)).unwrap();
         let order: Vec<_> = t.hub.tasks(WS, false).unwrap().into_iter().map(|x| (x.title, x.status, x.position)).collect();
         assert_eq!(order, [
-            ("a".to_string(), Backlog, 0),
-            ("c".to_string(), Backlog, 1),
-            ("b".to_string(), OnQueue, 0),
-            ("d".to_string(), OnQueue, 1),
+            ("c".to_string(), Backlog, 0),
+            ("a".to_string(), Backlog, 1),
+            ("d".to_string(), OnQueue, 0),
+            ("b".to_string(), OnQueue, 1),
         ]);
         let _ = (a, b, c, d);
+    }
+
+    #[test]
+    fn new_task_lands_at_top_and_renumbers() {
+        let t = team();
+        let first = t.create(ActorRequest::User, "first", None).unwrap();
+        assert_eq!(first.position, 0);
+
+        let second = t.create(ActorRequest::User, "second", None).unwrap();
+        assert_eq!(second.position, 0);
+        assert_eq!(t.get(&first).position, 1);
+
+        let third = t.create(ActorRequest::User, "third", None).unwrap();
+        assert_eq!(third.position, 0);
+        assert_eq!(t.get(&second).position, 1);
+        assert_eq!(t.get(&first).position, 2);
+
+        let backlog: Vec<(String, i64)> =
+            t.hub.tasks(WS, false).unwrap().into_iter().filter(|x| x.status == Backlog).map(|x| (x.title, x.position)).collect();
+        assert_eq!(backlog, [
+            ("third".to_string(), 0),
+            ("second".to_string(), 1),
+            ("first".to_string(), 2),
+        ]);
     }
 
     #[test]
@@ -834,15 +858,15 @@ mod board {
         };
         // A move out of Backlog.
         t.user_move(&b, OnQueue);
-        assert_eq!(column(Backlog), expect(&["a", "c", "d", "e"]));
+        assert_eq!(column(Backlog), expect(&["e", "d", "c", "a"]));
         // An edit of c keeps its place, as the app shows it.
         let mut req = PatchTaskRequest::new(ActorRequest::User);
         req.priority = Some(jgt_core::TaskPriority::High);
         t.hub.patch_task(&c.id, None, &req).unwrap();
-        assert_eq!(column(Backlog), expect(&["a", "c", "d", "e"]));
+        assert_eq!(column(Backlog), expect(&["e", "d", "c", "a"]));
         // A delete.
         t.hub.delete_task(&a.id, None, &ActorRequest::User).unwrap();
-        assert_eq!(column(Backlog), expect(&["c", "d", "e"]));
+        assert_eq!(column(Backlog), expect(&["e", "d", "c"]));
         // Archived tasks take no position: new tasks and moves number the others from 0.
         t.hub.db.board::<_, rusqlite::Error>(|bd| bd.set_columns(&d.id, &[("archived", &true as &dyn rusqlite::ToSql)])).unwrap();
         t.hub
@@ -852,7 +876,8 @@ mod board {
         t.user_move(&e, OnQueue);
         assert_eq!(column(Backlog), expect(&["c"]));
         let f = t.create(ActorRequest::User, "f", None).unwrap();
-        assert_eq!(f.position, 1);
+        assert_eq!(f.position, 0);
+        assert_eq!(column(Backlog), expect(&["f", "c"]));
         assert_eq!(column(OnQueue), expect(&["b", "e"]));
     }
 
@@ -1710,7 +1735,7 @@ mod board {
         t.decide(&task, Decision::Stop).unwrap();
         let backlog: Vec<(String, i64)> =
             t.hub.tasks(WS, false).unwrap().into_iter().filter(|x| x.status == Backlog).map(|x| (x.title, x.position)).collect();
-        assert_eq!(backlog, [("a".to_string(), 0), ("b".to_string(), 1), ("stopped".to_string(), 2)]);
+        assert_eq!(backlog, [("b".to_string(), 0), ("a".to_string(), 1), ("stopped".to_string(), 2)]);
         let _ = (a, b);
     }
 

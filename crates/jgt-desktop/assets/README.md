@@ -7,7 +7,7 @@ derived from Google's [Material Symbols](https://github.com/google/material-desi
 - **Source**: `variablefont/MaterialSymbolsOutlined[FILL,GRAD,opsz,wght].ttf` from `google/material-design-icons`
 - **Instance**: FILL=0, GRAD=0, opsz=24, wght=400 (pinned via `fontTools.varLib.instancer`)
 - **Family Name**: `MaterialSymbolsOutlined` / `Material Symbols Outlined`
-- **File size**: ~6.2 KB (subsetted to ~31 required glyphs in Unicode Private Use Area)
+- **File size**: ~6.6 KB (subsetted to ~33 required glyphs in Unicode Private Use Area)
 
 ## Production Commands
 The subset was produced in an isolated temporary environment outside the repository:
@@ -40,7 +40,7 @@ font.save('/tmp/jgt25-fonts/MaterialSymbolsOutlined-Static.ttf')
 /tmp/jgt25-fonts/venv/bin/pyftsubset \
   /tmp/jgt25-fonts/MaterialSymbolsOutlined-Static.ttf \
   --output-file=crates/jgt-desktop/assets/material-symbols-outlined.ttf \
-  --unicodes="U+E023,U+E0C9,U+E145,U+E149,U+E15F,U+E1A1,U+E2C7,U+E2C8,U+E2E6,U+E5CC,U+E5CD,U+E5CF,U+E5D7,U+E627,U+E668,U+E871,U+E8AF,U+E8B8,U+E91F,U+E97A,U+E9F4,U+EA0B,U+EA4A,U+EB7F,U+EF63,U+EF7A,U+F01F,U+F06C,U+F083,U+F0BE,U+F233" \
+  --unicodes="U+E023,U+E0C9,U+E145,U+E149,U+E15F,U+E1A1,U+E2C7,U+E2C8,U+E2E6,U+E5CC,U+E5CD,U+E5CF,U+E5D7,U+E5D8,U+E5DB,U+E627,U+E668,U+E871,U+E8AF,U+E8B8,U+E91F,U+E97A,U+E9F4,U+EA0B,U+EA4A,U+EB7F,U+EF63,U+EF7A,U+F01F,U+F06C,U+F083,U+F0BE,U+F233" \
   --layout-features='*'
 
 # 5. Verify cmap in subset font
@@ -48,7 +48,7 @@ font.save('/tmp/jgt25-fonts/MaterialSymbolsOutlined-Static.ttf')
 from fontTools.ttLib import TTFont
 font = TTFont('crates/jgt-desktop/assets/material-symbols-outlined.ttf')
 cmap = font.getBestCmap()
-assert len(cmap) == 31
+assert len(cmap) == 33
 "
 ```
 
@@ -77,6 +77,8 @@ assert len(cmap) == 31
 | Add | `U+E145` | `add` |
 | Close | `U+E5CD` | `close` |
 | Unfold More | `U+E5D7` | `unfold_more` |
+| Arrow Upward | `U+E5D8` | `arrow_upward` |
+| Arrow Downward | `U+E5DB` | `arrow_downward` |
 | Cost | `U+EF63` | `payments` |
 | Working | `U+E627` | `sync` |
 | Bolt (alt Working) | `U+EA0B` | `bolt` |

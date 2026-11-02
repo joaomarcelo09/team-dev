@@ -935,7 +935,7 @@ impl Board<'_> {
         stmt.query_map(params![workspace, include_archived], task_from_row)?.collect()
     }
 
-    /// Creates a task with the workspace's next key, at the end of its column.
+    /// Creates a task with the workspace's next key, at the top of its column.
     pub fn insert_task(&self, new: &NewTask) -> rusqlite::Result<Task> {
         let now = now_ms();
         self.c.execute(
@@ -946,12 +946,12 @@ impl Board<'_> {
             self.c.query_row("SELECT next FROM task_counters WHERE workspace = ?1", [new.workspace], |r| r.get(0))?;
         self.c.execute("UPDATE task_counters SET next = next + 1 WHERE workspace = ?1", [new.workspace])?;
         let id = ulid::Ulid::generate().to_string();
+        let mut ids = self.column_ids(new.workspace, new.status.as_str(), "")?;
+        ids.insert(0, id.clone());
         self.c.execute(
             "INSERT INTO tasks (id, workspace, number, title, description, status, position, priority, parent_id,
                 created_at, updated_at, round_limit)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6,
-                (SELECT COALESCE(MAX(position) + 1, 0) FROM tasks WHERE workspace = ?2 AND status = ?6 AND archived = 0),
-                ?7, ?8, ?9, ?9, ?10)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?9, ?10)",
             params![
                 id,
                 new.workspace,
@@ -965,6 +965,7 @@ impl Board<'_> {
                 jgt_core::ROUND_LIMIT
             ],
         )?;
+        self.renumber(&ids)?;
         self.task(&id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)
     }
 

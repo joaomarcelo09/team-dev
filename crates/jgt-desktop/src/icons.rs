@@ -55,6 +55,10 @@ pub enum Icon {
     Warning,
     /// Folder icon for workspace selector (`folder`, U+E2C7)
     Folder,
+    /// Arrow upward (`arrow_upward`, U+E5D8)
+    ArrowUpward,
+    /// Arrow downward (`arrow_downward`, U+E5DB)
+    ArrowDownward,
 }
 
 impl Icon {
@@ -77,6 +81,8 @@ impl Icon {
         Icon::Check,
         Icon::Warning,
         Icon::Folder,
+        Icon::ArrowUpward,
+        Icon::ArrowDownward,
     ];
 
     /// Unicode code point for this icon in the Private Use Area.
@@ -101,6 +107,8 @@ impl Icon {
             Icon::Check => '\u{e668}',
             Icon::Warning => '\u{f083}',
             Icon::Folder => '\u{e2c7}',
+            Icon::ArrowUpward => '\u{e5d8}',
+            Icon::ArrowDownward => '\u{e5db}',
         }
     }
 
@@ -132,6 +140,8 @@ impl Icon {
             Icon::Check => "\u{e668}",
             Icon::Warning => "\u{f083}",
             Icon::Folder => "\u{e2c7}",
+            Icon::ArrowUpward => "\u{e5d8}",
+            Icon::ArrowDownward => "\u{e5db}",
         }
     }
 }

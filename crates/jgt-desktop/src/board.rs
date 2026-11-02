@@ -3,7 +3,7 @@
 
 use crate::{
     app::{App, Msg},
-    style,
+    icons, style,
     view::{bold, clock, dot, muted, short_time, tip},
 };
 use iced::{
@@ -199,6 +199,64 @@ pub fn drop_move(board: &Board, id: &str, target: Target) -> Option<(TaskStatus,
     // Without the card itself, the cards below it move up by one.
     let i = if i > at { i - 1 } else { i };
     (i != at).then_some((to, Some(i as i64)))
+}
+
+/// Where a card's reorder button aims it: Top (`Some(0)`) when not first, Bottom (`None`) when first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReorderTarget {
+    Top,
+    Bottom,
+}
+
+impl ReorderTarget {
+    /// The position index expected by the hub: `Some(0)` for top, `None` for bottom (end of column).
+    pub const fn position(self) -> Option<i64> {
+        match self {
+            ReorderTarget::Top => Some(0),
+            ReorderTarget::Bottom => None,
+        }
+    }
+
+    /// The icon for this reorder action.
+    pub const fn icon(self) -> icons::Icon {
+        match self {
+            ReorderTarget::Top => icons::Icon::ArrowUpward,
+            ReorderTarget::Bottom => icons::Icon::ArrowDownward,
+        }
+    }
+
+    /// Tooltip explaining the action.
+    pub const fn tooltip(self) -> &'static str {
+        match self {
+            ReorderTarget::Top => "Send to top",
+            ReorderTarget::Bottom => "Send to bottom",
+        }
+    }
+}
+
+/// Decides whether a card moves to the top or bottom of its column:
+/// None when the card cannot move within its column (e.g. single card in the column or invalid index);
+/// Bottom when the card is currently first (index == 0);
+/// Top when the card is not first (index > 0).
+pub fn reorder_target(index: usize, len: usize) -> Option<ReorderTarget> {
+    if len <= 1 || index >= len {
+        return None;
+    }
+    Some(if index == 0 { ReorderTarget::Bottom } else { ReorderTarget::Top })
+}
+
+/// The move message produced by the reorder button.
+/// None when the card cannot move within its column (e.g. single card or in Done).
+pub fn reorder_msg(id: &str, status: TaskStatus, index: usize, len: usize) -> Option<Msg> {
+    if status == TaskStatus::Done {
+        return None;
+    }
+    let target = reorder_target(index, len)?;
+    Some(Msg::MoveTask {
+        id: id.to_string(),
+        to: status,
+        position: target.position(),
+    })
 }
 
 /// What Done shows of its `count` cards: the 20 newest unless `show_all`, and how many are hidden.
@@ -412,8 +470,8 @@ fn lane<'a>(app: &'a App, board: &'a Board, status: TaskStatus, theme: &Theme) -
     }
     let hidden = if status == TaskStatus::Done {
         let (shown, hidden) = done_shown(count, app.show_all_done);
-        for task in board.done().take(shown) {
-            list = list.push(card(app, task, at(0), theme));
+        for (i, task) in board.done().take(shown).enumerate() {
+            list = list.push(card(app, task, i, count, at(0), theme));
         }
         hidden
     } else {
@@ -421,7 +479,7 @@ fn lane<'a>(app: &'a App, board: &'a Board, status: TaskStatus, theme: &Theme) -
             if aimed == Some(Target::Before(status, i)) {
                 list = list.push(drop_line());
             }
-            list = list.push(card(app, task, at(i), theme));
+            list = list.push(card(app, task, i, count, at(i), theme));
         }
         0
     };
@@ -451,7 +509,7 @@ fn lane<'a>(app: &'a App, board: &'a Board, status: TaskStatus, theme: &Theme) -
     .into()
 }
 
-fn card<'a>(app: &'a App, task: &'a Task, at: Target, theme: &Theme) -> Element<'a, Msg> {
+fn card<'a>(app: &'a App, task: &'a Task, index: usize, len: usize, at: Target, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
     let open = app.open_task.as_deref() == Some(task.id.as_str());
     let mut info = column![
@@ -495,6 +553,11 @@ fn card<'a>(app: &'a App, task: &'a Task, at: Target, theme: &Theme) -> Element<
             .style(style::ghost)
             .padding([1, 8])
     };
+    let target_choice = if index == 0 { ReorderTarget::Bottom } else { ReorderTarget::Top };
+    let reorder_btn = button(icons::icon(target_choice.icon(), style::fs(12)))
+        .on_press_maybe(reorder_msg(&task.id, task.status, index, len))
+        .style(style::ghost)
+        .padding([1, 6]);
     let id = task.id.clone();
     let move_to = pick_list(&MOVE_TO[task.status.index()][..], None::<Column>, move |c: Column| Msg::MoveTask { id: id.clone(), to: c.0, position: None })
         .placeholder("Move to…")
@@ -503,6 +566,7 @@ fn card<'a>(app: &'a App, task: &'a Task, at: Target, theme: &Theme) -> Element<
     let controls = row![
         tip(arrow("←", task.status.prev()), "Move left"),
         tip(arrow("→", task.status.next()), "Move right"),
+        tip(reorder_btn, target_choice.tooltip()),
         space::horizontal(),
         move_to,
     ]
@@ -1152,5 +1216,61 @@ mod tests {
         // A comment nobody reads offers it too.
         let _ = app.update(Msg::Commented(Ok(Some("/w".into()))));
         assert_eq!(app.offer_team.as_deref(), Some("/w"));
+    }
+
+    #[test]
+    fn reorder_target_and_message() {
+        use TaskStatus::*;
+
+        // Single card: nowhere to move within column
+        assert_eq!(reorder_target(0, 1), None);
+        assert!(reorder_msg("t1", Backlog, 0, 1).is_none());
+
+        // Empty column or out of bounds
+        assert_eq!(reorder_target(0, 0), None);
+        assert_eq!(reorder_target(3, 3), None);
+        assert!(reorder_msg("t1", Backlog, 3, 3).is_none());
+
+        // Top card of multiple: moves to bottom (position None)
+        assert_eq!(reorder_target(0, 3), Some(ReorderTarget::Bottom));
+        assert_eq!(ReorderTarget::Bottom.position(), None);
+        assert_eq!(ReorderTarget::Bottom.icon(), icons::Icon::ArrowDownward);
+        assert_eq!(ReorderTarget::Bottom.tooltip(), "Send to bottom");
+        match reorder_msg("t1", Backlog, 0, 3) {
+            Some(Msg::MoveTask { id, to, position }) => {
+                assert_eq!(id, "t1");
+                assert_eq!(to, Backlog);
+                assert_eq!(position, None);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // Non-top cards of multiple: move to top (position Some(0))
+        assert_eq!(reorder_target(1, 3), Some(ReorderTarget::Top));
+        assert_eq!(ReorderTarget::Top.position(), Some(0));
+        assert_eq!(ReorderTarget::Top.icon(), icons::Icon::ArrowUpward);
+        assert_eq!(ReorderTarget::Top.tooltip(), "Send to top");
+        match reorder_msg("t2", Backlog, 1, 3) {
+            Some(Msg::MoveTask { id, to, position }) => {
+                assert_eq!(id, "t2");
+                assert_eq!(to, Backlog);
+                assert_eq!(position, Some(0));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        assert_eq!(reorder_target(2, 3), Some(ReorderTarget::Top));
+        match reorder_msg("t3", OnQueue, 2, 3) {
+            Some(Msg::MoveTask { id, to, position }) => {
+                assert_eq!(id, "t3");
+                assert_eq!(to, OnQueue);
+                assert_eq!(position, Some(0));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // Done column is ordered by date, manual reorder disabled
+        assert!(reorder_msg("t4", Done, 0, 3).is_none());
+        assert!(reorder_msg("t5", Done, 1, 3).is_none());
     }
 }
