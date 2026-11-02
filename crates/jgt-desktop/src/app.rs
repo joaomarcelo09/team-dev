@@ -159,6 +159,8 @@ pub struct App {
     pub focused: bool,
     pub window: Option<window::Id>,
     pub at_bottom: bool,
+    /// Session whose messages should snap to the end once loaded (e.g. freshly opened chat).
+    pub newly_opened: Option<String>,
     pub theme_pref: ThemePref,
     pub theme_style: ThemeStyle,
     pub system_mode: theme::Mode,
@@ -308,6 +310,36 @@ pub enum Msg {
     Done(Result<(), String>),
 }
 
+/// What to do with the chat scroll position when messages are loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollDecision {
+    SnapToEnd,
+    KeepPosition,
+}
+
+impl ScrollDecision {
+    pub fn should_snap(self) -> bool {
+        self == Self::SnapToEnd
+    }
+}
+
+/// Decides whether to snap to the latest messages or keep the current scroll position
+/// when messages finish loading for a thread.
+pub fn decide_thread_scroll(
+    is_selected: bool,
+    older: bool,
+    newly_opened: bool,
+    at_bottom: bool,
+) -> ScrollDecision {
+    if !is_selected || older {
+        ScrollDecision::KeepPosition
+    } else if newly_opened || at_bottom {
+        ScrollDecision::SnapToEnd
+    } else {
+        ScrollDecision::KeepPosition
+    }
+}
+
 impl App {
     pub fn new(start_session: Option<String>) -> (App, Task<Msg>) {
         let config = Config::load();
@@ -341,6 +373,7 @@ impl App {
             focused: true,
             window: None,
             at_bottom: true,
+            newly_opened: None,
             theme_pref,
             theme_style,
             system_mode: theme::Mode::Dark,
@@ -504,19 +537,23 @@ impl App {
         }
         self.close_task();
         self.new_task = None;
-        if self.selected.as_deref() == Some(id.as_str()) {
-            return Task::none();
+        if self.selected.as_deref() != Some(id.as_str()) {
+            if let Some(prev) = self.selected.take() {
+                self.drafts.insert(prev, self.composer.text());
+            }
+            let draft = self.drafts.remove(&id).unwrap_or_default();
+            self.composer = text_editor::Content::with_text(draft.trim_end_matches('\n'));
+            self.selected = Some(id.clone());
+        } else if let Some(draft) = self.drafts.remove(&id) {
+            self.composer = text_editor::Content::with_text(draft.trim_end_matches('\n'));
         }
-        if let Some(prev) = self.selected.take() {
-            self.drafts.insert(prev, self.composer.text());
-        }
-        let draft = self.drafts.remove(&id).unwrap_or_default();
-        self.composer = text_editor::Content::with_text(draft.trim_end_matches('\n'));
-        self.selected = Some(id.clone());
+        self.newly_opened = Some(id.clone());
+        self.at_bottom = true;
         self.rename = None;
         self.confirm_delete = false;
         self.selecting_message = None;
         Task::batch([
+            self.snap(),
             self.load_selected_board(),
             self.load_thread(id.clone()),
             self.mark_read_if_visible(&id),
@@ -716,12 +753,20 @@ impl App {
                     for m in messages {
                         thread.upsert(m);
                     }
-                    if !older && self.selected.as_deref() == Some(session.as_str()) {
+                    let is_selected = self.selected.as_deref() == Some(session.as_str());
+                    let is_newly_opened = self.newly_opened.as_deref() == Some(session.as_str());
+                    if is_newly_opened {
+                        self.newly_opened = None;
+                    }
+                    if decide_thread_scroll(is_selected, older, is_newly_opened, self.at_bottom).should_snap() {
                         return self.snap();
                     }
                     Task::none()
                 }
                 Err(e) => {
+                    if self.newly_opened.as_deref() == Some(session.as_str()) {
+                        self.newly_opened = None;
+                    }
                     self.toast(format!("Could not load messages: {e}"), true);
                     Task::none()
                 }
@@ -1974,5 +2019,106 @@ mod tests {
         assert_eq!(app.selected.as_deref(), Some("w1"));
         assert_eq!(app.module, Module::Worker("w1".to_string()));
         assert_eq!(app.composer.text().trim(), "draft for worker");
+    }
+
+    #[test]
+    fn decide_thread_scroll_pure_decision() {
+        // 1. Not selected session: never snaps
+        assert_eq!(
+            decide_thread_scroll(false, false, true, true),
+            ScrollDecision::KeepPosition
+        );
+        assert_eq!(
+            decide_thread_scroll(false, false, false, false),
+            ScrollDecision::KeepPosition
+        );
+
+        // 2. Loading older history: never snaps
+        assert_eq!(
+            decide_thread_scroll(true, true, true, true),
+            ScrollDecision::KeepPosition
+        );
+        assert_eq!(
+            decide_thread_scroll(true, true, false, true),
+            ScrollDecision::KeepPosition
+        );
+
+        // 3. Newly opened chat: always snaps to end, even if at_bottom is false
+        assert_eq!(
+            decide_thread_scroll(true, false, true, false),
+            ScrollDecision::SnapToEnd
+        );
+        assert_eq!(
+            decide_thread_scroll(true, false, true, true),
+            ScrollDecision::SnapToEnd
+        );
+
+        // 4. Already open chat and user is at bottom: snaps to end
+        assert_eq!(
+            decide_thread_scroll(true, false, false, true),
+            ScrollDecision::SnapToEnd
+        );
+
+        // 5. Already open chat and user has scrolled up: preserves position, does not snap
+        assert_eq!(
+            decide_thread_scroll(true, false, false, false),
+            ScrollDecision::KeepPosition
+        );
+    }
+
+    #[test]
+    fn open_chat_snaps_to_end_and_preserves_scrolled_position() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false);
+        let w1 = make_session("w1", Some("coder"), Some("c1"), Some("/team1"), SessionStatus::Active, false);
+        let (mut app, _) = App::new(None);
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c1, w1])));
+
+        // Select workspace -> opens Coordinator chat
+        let _ = app.update(Msg::SelectWorkspace("/team1".to_string()));
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+        assert_eq!(app.module, Module::Coordinator);
+        assert!(app.at_bottom, "at_bottom must be true on chat open");
+        assert_eq!(app.newly_opened.as_deref(), Some("c1"), "newly_opened must be marked on open");
+
+        // Simulate iced mounting scrollable initially at top (offset 0.0)
+        app.at_bottom = false;
+
+        // Thread finishes loading for newly opened session: snaps to end and clears newly_opened
+        let m1 = test_message(1, "hello", None);
+        let _ = app.update(Msg::ThreadLoaded {
+            session: "c1".to_string(),
+            older: false,
+            result: Ok(vec![m1.clone()]),
+        });
+        assert!(app.at_bottom, "snap() must set at_bottom to true on initial thread load");
+        assert_eq!(app.newly_opened, None, "newly_opened must be cleared after thread load");
+
+        // User scrolls up to read earlier history
+        app.at_bottom = false;
+
+        // Background reload arrives (e.g. reconnect or sync): must NOT snap, preserving user's position
+        let _ = app.update(Msg::ThreadLoaded {
+            session: "c1".to_string(),
+            older: false,
+            result: Ok(vec![m1]),
+        });
+        assert!(!app.at_bottom, "Background reload must not clobber scrolled-up position");
+
+        // Switch to Board module
+        let _ = app.update(Msg::SelectModule(Module::Board));
+        assert_eq!(app.module, Module::Board);
+
+        // Switch back to Coordinator module: even though c1 is already selected, it must snap to end on open!
+        let _ = app.update(Msg::SelectModule(Module::Coordinator));
+        assert_eq!(app.module, Module::Coordinator);
+        assert!(app.at_bottom, "Switching from Board to Coordinator must set at_bottom to true");
+        assert_eq!(app.newly_opened.as_deref(), Some("c1"), "Switching from Board to Coordinator must mark newly_opened");
+
+        // Switch to Worker module: must snap to end on open
+        let _ = app.update(Msg::SelectModule(Module::Worker("w1".to_string())));
+        assert_eq!(app.selected.as_deref(), Some("w1"));
+        assert_eq!(app.module, Module::Worker("w1".to_string()));
+        assert!(app.at_bottom, "Switching to Worker must set at_bottom to true");
+        assert_eq!(app.newly_opened.as_deref(), Some("w1"), "Switching to Worker must mark newly_opened");
     }
 }
