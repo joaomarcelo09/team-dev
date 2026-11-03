@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode;
 
+/// Built-in models/aliases for Claude Code (which has no `models` command).
+pub const MODELS: &[&str] = &["opus", "sonnet", "fable", "haiku"];
+
 /// Claude Code flags for a team session titled `title`, without `--bg`/`-p` and the prompt.
 /// `settings` come from `config.team.for_skill(<skill>, <folder>)`.
 pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Vec<String> {
@@ -147,11 +150,20 @@ impl HarnessAdapter for ClaudeCode {
     fn effort_args(&self, level: &str) -> Option<Vec<String>> {
         Some(vec!["--effort".into(), level.to_string()])
     }
+
+    fn models(&self, _config: &Config) -> Result<Vec<String>, String> {
+        Ok(MODELS.iter().map(|&s| s.to_string()).collect())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lists_builtin_models() {
+        assert_eq!(ClaudeCode.models(&Config::default()).unwrap(), ["opus", "sonnet", "fable", "haiku"]);
+    }
 
     #[test]
     fn workers_start_as_before_the_adapter() {

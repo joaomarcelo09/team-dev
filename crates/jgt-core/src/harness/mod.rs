@@ -2,9 +2,9 @@
 //! on it (PRD Part B, H4). One `HarnessAdapter` per harness; `worker-run` and the reconnect
 //! launcher go through it. The Coordinator stays on Claude Code (D2), whose hooks it needs.
 
-mod antigravity;
-mod claude_code;
-mod opencode;
+pub mod antigravity;
+pub mod claude_code;
+pub mod opencode;
 
 pub use antigravity::Antigravity;
 pub use claude_code::{ClaudeCode, session_args, session_args_for_role};
@@ -94,6 +94,8 @@ pub trait HarnessAdapter: Sync {
     fn parse_result(&self, stdout: &str, stderr: &str, ok: bool) -> Outcome;
     /// The flags for `level`, or `None` when the harness takes no effort setting.
     fn effort_args(&self, level: &str) -> Option<Vec<String>>;
+    /// Lists the models or aliases available for this harness.
+    fn models(&self, config: &Config) -> Result<Vec<String>, String>;
 }
 
 /// The adapter of `harness`, if jg-team-dev can run workers on it.
@@ -159,6 +161,129 @@ pub fn nearest_effort(harness: Harness, level: &str) -> Option<&'static str> {
     EFFORT_LEVELS[..=wanted].iter().rev().find_map(|l| levels.iter().find(|h| *h == l).copied()).or(levels.first().copied())
 }
 
+/// How long `models` commands may take before being stopped.
+pub const MODELS_TIMEOUT: Duration = Duration::from_secs(20);
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    if pid > 1 {
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
+
+fn kill_child_and_group(child: &mut std::process::Child) {
+    kill_process_group(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Runs `<program>` with `args` and `timeout`, prepending `program.parent()` to PATH.
+pub(crate) fn run_with_timeout(
+    program: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<String, String> {
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    if let Some(extra) = program.parent() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![extra.to_path_buf()];
+        paths.extend(std::env::split_paths(&path));
+        if let Ok(joined) = std::env::join_paths(paths) {
+            cmd.env("PATH", joined);
+        }
+    }
+
+    let mut child = cmd.spawn().map_err(|e| format!("could not start {}: {e}", program.display()))?;
+
+    let stdout_handle = child.stdout.take();
+    let stderr_handle = child.stderr.take();
+
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+
+    let _ = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(mut h) = stdout_handle {
+            let _ = std::io::Read::read_to_end(&mut h, &mut out);
+        }
+        let _ = stdout_tx.send(String::from_utf8_lossy(&out).into_owned());
+    });
+
+    let _ = std::thread::spawn(move || {
+        let mut err = Vec::new();
+        if let Some(mut h) = stderr_handle {
+            let _ = std::io::Read::read_to_end(&mut h, &mut err);
+        }
+        let _ = stderr_tx.send(String::from_utf8_lossy(&err).into_owned());
+    });
+
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    kill_child_and_group(&mut child);
+                    return Err("timed out".to_string());
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                kill_child_and_group(&mut child);
+                return Err(format!("failed waiting for {}: {e}", program.display()));
+            }
+        }
+    };
+
+    // Kill any background processes in the group so pipes close promptly.
+    kill_process_group(child.id());
+
+    let remaining = timeout.saturating_sub(start.elapsed()).min(Duration::from_millis(500));
+    let stdout = stdout_rx.recv_timeout(remaining).unwrap_or_default();
+    let stderr = stderr_rx.recv_timeout(remaining).unwrap_or_default();
+
+    if status.success() {
+        Ok(stdout)
+    } else {
+        let msg = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else if !stdout.trim().is_empty() {
+            stdout.trim().to_string()
+        } else {
+            format!("{} exited with {}", program.display(), status)
+        };
+        Err(msg)
+    }
+}
+
+/// Lists the models or aliases available for `harness`.
+///
+/// Claude Code returns built-in aliases (`opus`, `sonnet`, `fable`, `haiku`) without running a command.
+/// Antigravity runs `agy models` with a 20 s timeout and keeps the first column of lines that contain a tab.
+/// OpenCode runs `opencode models` with a 20 s timeout and keeps lines that contain `/`.
+pub fn models(harness: Harness, config: &Config) -> Result<Vec<String>, String> {
+    match adapter(harness) {
+        Some(a) => a.models(config),
+        None => Err(format!("{} does not support listing models", harness.label())),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,5 +294,56 @@ mod tests {
         assert_eq!(nearest_effort(Harness::Antigravity, "low"), Some("low"));
         assert_eq!(nearest_effort(Harness::Opencode, "high"), None);
         assert_eq!(nearest_effort(Harness::ClaudeCode, "bogus"), None);
+    }
+
+    #[test]
+    fn models_returns_builtin_for_claude_code() {
+        let list = models(Harness::ClaudeCode, &Config::default()).unwrap();
+        assert_eq!(list, ["opus", "sonnet", "fable", "haiku"]);
+    }
+
+    #[test]
+    fn models_returns_error_for_custom() {
+        let err = models(Harness::Custom, &Config::default()).unwrap_err();
+        assert!(err.contains("does not support listing models"), "{err}");
+    }
+
+    #[test]
+    fn run_with_timeout_times_out() {
+        let res = run_with_timeout(Path::new("sh"), &["-c", "sleep 1"], Duration::from_millis(50));
+        assert_eq!(res.unwrap_err(), "timed out");
+    }
+
+    #[test]
+    fn run_with_timeout_grandchild_pipe_does_not_block_on_timeout() {
+        let start = std::time::Instant::now();
+        let res = run_with_timeout(Path::new("sh"), &["-c", "sleep 5 & sleep 5"], Duration::from_millis(50));
+        assert_eq!(res.unwrap_err(), "timed out");
+        assert!(start.elapsed() < Duration::from_secs(2), "elapsed: {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn run_with_timeout_captures_failure_message() {
+        let res = run_with_timeout(Path::new("sh"), &["-c", "echo 'something broke' >&2; exit 2"], Duration::from_secs(5));
+        assert_eq!(res.unwrap_err(), "something broke");
+    }
+
+    #[test]
+    fn models_antigravity_returns_models_when_installed() {
+        let config = Config::default();
+        if Antigravity.find(&config).is_ok() {
+            let list = models(Harness::Antigravity, &config).unwrap();
+            assert_eq!(
+                list,
+                [
+                    "gemini-3.8-flash-high",
+                    "gemini-3.8-flash-medium",
+                    "gemini-3.8-flash-low",
+                    "claude-sonnet-4-6",
+                    "claude-opus-4-6-thinking",
+                    "gpt-oss-120b-medium",
+                ]
+            );
+        }
     }
 }

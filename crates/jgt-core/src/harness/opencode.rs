@@ -26,6 +26,23 @@ use std::{
 
 pub struct Opencode;
 
+/// Extracts model identifiers from `opencode models` output.
+///
+/// Keeps lines that contain `/` (`provider/model`), ignoring header or status lines.
+pub fn parse_models(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.contains('/') {
+                return None;
+            }
+            let token = line.split_whitespace().find(|w| w.contains('/'))?;
+            Some(token.to_string())
+        })
+        .collect()
+}
+
 /// `<files>/opencode`: our OpenCode config folder (`OPENCODE_CONFIG_DIR`), with one agent per skill.
 fn config_dir(files: &Path) -> PathBuf {
     files.join("opencode")
@@ -186,11 +203,45 @@ impl HarnessAdapter for Opencode {
     fn effort_args(&self, _level: &str) -> Option<Vec<String>> {
         None
     }
+
+    fn models(&self, config: &Config) -> Result<Vec<String>, String> {
+        let program = self.find(config)?;
+        let stdout = super::run_with_timeout(&program, &["models"], super::MODELS_TIMEOUT)?;
+        Ok(parse_models(&stdout))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_models_extracts_slash_containing_lines_and_skips_headers() {
+        let sample = "\
+OpenCode 1.18.35
+Available models:
+anthropic/claude-3-5-sonnet
+openai/gpt-4o
+google/gemini-1.5-pro
+deepseek/deepseek-chat
+";
+        let models = parse_models(sample);
+        assert_eq!(
+            models,
+            [
+                "anthropic/claude-3-5-sonnet",
+                "openai/gpt-4o",
+                "google/gemini-1.5-pro",
+                "deepseek/deepseek-chat",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_models_handles_descriptions_and_whitespace() {
+        let sample = "  anthropic/claude-3-5-sonnet (recommended)  \nopenai/gpt-4o\tDefault\n";
+        assert_eq!(parse_models(sample), ["anthropic/claude-3-5-sonnet", "openai/gpt-4o"]);
+    }
 
     #[test]
     fn the_smoke_run_output_parses() {

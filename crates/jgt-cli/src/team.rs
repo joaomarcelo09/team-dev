@@ -4,7 +4,7 @@
 use crate::settings;
 use anyhow::{Context, Result, bail};
 use jgt_core::{
-    COORDINATOR, Harness, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, procs, short_id,
+    COORDINATOR, Harness, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, TeamAgents, procs, short_id,
     api::{EndRequest, HealthResponse, PatchSessionRequest, SessionsResponse},
     config::Config,
     launch::{self, LaunchPlan},
@@ -359,6 +359,10 @@ pub async fn start(folder: Option<PathBuf>) -> Result<()> {
     let files = prepare_files()?;
 
     let config = Config::load();
+    let agents = TeamAgents::resolve(&config.team, &folder);
+    agents.write(&folder).with_context(|| format!("writing .team/agents.json for {}", folder.display()))?;
+    println!("{}", agents.describe());
+
     let claude = launch::find_program("claude", config.commands.claude.as_deref()).map_err(anyhow::Error::msg)?;
     let plan = coordinator_plan(claude.clone(), &folder, &files, &config, None);
     let mut output = tokio::task::spawn_blocking(move || launch::spawn(&plan)).await?.map_err(anyhow::Error::msg)?;
@@ -891,6 +895,52 @@ mod tests {
         assert!(res.is_err());
         let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(entries, vec![std::ffi::OsString::from("target_dir")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn team_agents_resolve_writes_file_and_locks_settings() {
+        let dir = temp("agents-lock");
+        let config = Config::default();
+
+        let agents = TeamAgents::resolve(&config.team, &dir);
+        agents.write(&dir).unwrap();
+
+        let agents_file = dir.join(".team/agents.json");
+        assert!(agents_file.is_file(), "agents.json must be written");
+
+        let desc = agents.describe();
+        assert!(desc.starts_with("Agents: coordinator · Claude Code · opus · medium"));
+        assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-high · high"));
+
+        // Modifying config afterwards does not affect worker settings in this folder:
+        let mut modified = config.clone();
+        modified.team.skills.insert(
+            "coder".into(),
+            jgt_core::config::SkillSettings {
+                model: Some("sonnet".into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+
+        let (settings, _) = modified.team.for_skill_checked("coder", &dir);
+        // Still the saved gemini-3.8-flash-high / high on Antigravity:
+        assert_eq!(settings.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+
+        // CLI flags --model and --effort still override (when Antigravity is installed):
+        if let Ok((settings, _)) = crate::workers::worker_settings(&modified, "coder", &dir, Some("custom-model"), Some("low"))
+            && settings.harness == Harness::Antigravity
+        {
+            assert_eq!(settings.describe("coder"), "coder · Antigravity · custom-model · low");
+        }
+
+        // Starting a new team (rewriting the file with modified config) updates it:
+        let new_agents = TeamAgents::resolve(&modified.team, &dir);
+        new_agents.write(&dir).unwrap();
+        let (settings, _) = modified.team.for_skill_checked("coder", &dir);
+        assert_eq!(settings.describe("coder"), "coder · Claude Code · sonnet · low");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
