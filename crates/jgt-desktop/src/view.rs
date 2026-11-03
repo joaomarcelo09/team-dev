@@ -1,7 +1,7 @@
 //! Everything on screen: the session sidebar, the chat, the composer.
 
 use crate::{
-    app::{App, Conn, MESSAGES_ID, Msg, ThemePref, ThemeStyle, Thread},
+    app::{AgentRow, App, Conn, MESSAGES_ID, Msg, ThemePref, ThemeStyle, Thread},
     icons, style,
 };
 
@@ -333,67 +333,80 @@ fn settings(app: &App) -> Element<'_, Msg> {
                 button(text("Close").size(style::fs(13))).on_press(Msg::ToggleSettings).style(style::ghost).padding([4, 8]),
             ]
             .align_y(Alignment::Center),
-            line(
-                "Theme",
-                row![
-                    theme_button("Auto", ThemePref::System),
-                    theme_button("Dark", ThemePref::Dark),
-                    theme_button("Light", ThemePref::Light)
-                ]
-                .spacing(6)
-                .into()
-            ),
-            line(
-                "Pop-ups",
-                button(text(if app.popups { "On" } else { "Off" }).size(style::fs(13)))
-                    .on_press(Msg::TogglePopups)
-                    .style(if app.popups { style::primary_button } else { style::pill_button })
-                    .padding([4, 12])
-                    .into(),
-            ),
-            muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
-                .size(style::fs(12)),
-            line(
-                "Style",
-                row![
-                    style_button("JG Violet", ThemeStyle::Violet),
-                    style_button("Default", ThemeStyle::Default),
-                    style_button("Tokyo Night", ThemeStyle::TokyoNight),
-                    style_button("Dracula", ThemeStyle::Dracula),
-                ]
-                .spacing(6)
-                .into()
-            ),
-            muted("JG Violet, Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
-                .size(style::fs(12)),
-            line(
-                "Zoom",
-                stepper(
-                    format!("{:.0}%", app.zoom * 100.0),
-                    Msg::Zoom(crate::app::Step::Down),
-                    Msg::Zoom(crate::app::Step::Up),
-                    Msg::Zoom(crate::app::Step::Reset)
+            scrollable(
+                container(
+                    column![
+                        line(
+                            "Theme",
+                            row![
+                                theme_button("Auto", ThemePref::System),
+                                theme_button("Dark", ThemePref::Dark),
+                                theme_button("Light", ThemePref::Light)
+                            ]
+                            .spacing(6)
+                            .into()
+                        ),
+                        line(
+                            "Pop-ups",
+                            button(text(if app.popups { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::TogglePopups)
+                                .style(if app.popups { style::primary_button } else { style::pill_button })
+                                .padding([4, 12])
+                                .into(),
+                        ),
+                        muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
+                            .size(style::fs(12)),
+                        line(
+                            "Style",
+                            row![
+                                style_button("JG Violet", ThemeStyle::Violet),
+                                style_button("Default", ThemeStyle::Default),
+                                style_button("Tokyo Night", ThemeStyle::TokyoNight),
+                                style_button("Dracula", ThemeStyle::Dracula),
+                            ]
+                            .spacing(6)
+                            .into()
+                        ),
+                        muted("JG Violet, Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
+                            .size(style::fs(12)),
+                        line(
+                            "Zoom",
+                            stepper(
+                                format!("{:.0}%", app.zoom * 100.0),
+                                Msg::Zoom(crate::app::Step::Down),
+                                Msg::Zoom(crate::app::Step::Up),
+                                Msg::Zoom(crate::app::Step::Reset)
+                            )
+                            .into()
+                        ),
+                        line(
+                            "Text size",
+                            stepper(
+                                app.text_size.to_string(),
+                                Msg::TextSize(crate::app::Step::Down),
+                                Msg::TextSize(crate::app::Step::Up),
+                                Msg::TextSize(crate::app::Step::Reset)
+                            )
+                            .into()
+                        ),
+                        muted("Zoom scales the whole window (Ctrl + / Ctrl − / Ctrl 0). Text size changes only the letters.")
+                            .size(style::fs(12)),
+                        rule::horizontal(1).style(rule::weak),
+                        agents_section(app),
+                        config_banner(app),
+                    ]
+                    .spacing(16),
                 )
-                .into()
-            ),
-            line(
-                "Text size",
-                stepper(
-                    app.text_size.to_string(),
-                    Msg::TextSize(crate::app::Step::Down),
-                    Msg::TextSize(crate::app::Step::Up),
-                    Msg::TextSize(crate::app::Step::Reset)
-                )
-                .into()
-            ),
-            muted("Zoom scales the whole window (Ctrl + / Ctrl − / Ctrl 0). Text size changes only the letters.")
-                .size(style::fs(12)),
-            config_banner(app),
+                .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 0.0 }),
+            )
+            .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::default()))
+            .width(Fill),
         ]
         .spacing(16),
     )
     .padding(22)
-    .max_width(style::fs(14) * 34.0)
+    .max_width(style::fs(14) * 46.0)
+    .max_height(style::fs(14) * 42.0)
     .style(style::card(Color::TRANSPARENT));
     let backdrop = iced::widget::mouse_area(
         container(Space::new()).width(Fill).height(Fill).style(|_: &Theme| container::Style {
@@ -402,7 +415,7 @@ fn settings(app: &App) -> Element<'_, Msg> {
         }),
     )
     .on_press(Msg::ToggleSettings);
-    stack![backdrop, container(iced::widget::opaque(card)).center(Fill)].into()
+    stack![backdrop, container(iced::widget::opaque(card)).center(Fill).padding(16)].into()
 }
 
 /// The `[team]` config's warnings (unknown harness, effort the harness lacks, …): the team still
@@ -416,6 +429,213 @@ fn config_banner(app: &App) -> Element<'_, Msg> {
         col = col.push(text(format!("⚠ {w}")).size(style::fs(12)));
     }
     container(col).padding([8, 12]).width(Fill).style(style::banner(Color::from_rgb(0.85, 0.55, 0.1))).into()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HarnessChoice(pub Harness);
+
+impl std::fmt::Display for HarnessChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.label())
+    }
+}
+
+pub const AGENT_ROLES: &[&str] = &[
+    jgt_core::COORDINATOR,
+    "planner",
+    "coder",
+    "verifier",
+    "reviewer",
+    "tester",
+    "git-coder",
+];
+
+pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
+    let role_width = style::fs(14) * 7.0;
+    let harness_width = style::fs(14) * 9.5;
+    let model_width = style::fs(14) * 11.0;
+    let suggestions_width = style::fs(14) * 12.0;
+
+    let mut section = column![
+        text("Agents").size(style::fs(16)).font(bold()),
+    ]
+    .spacing(10);
+
+    if let Some(locked) = &app.agents_locked {
+        // M6: Locked mode
+        section = section.push(
+            muted("Locked: this team started with these settings. Changes apply when a team starts.")
+                .size(style::fs(12)),
+        );
+
+        let col_header = row![
+            muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
+            muted("HARNESS").size(style::fs(11)).font(bold()).width(harness_width),
+            muted("MODEL").size(style::fs(11)).font(bold()),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+        section = section.push(col_header);
+
+        for &role in AGENT_ROLES {
+            let (harness_label, model_text) = if let Some(setting) = locked.roles.get(role) {
+                (setting.harness.label(), setting.model.as_str())
+            } else if let Some(agent) = app.agents.iter().find(|a| a.role == role) {
+                (agent.harness.label(), agent.model.as_str())
+            } else {
+                ("Claude Code", "opus")
+            };
+
+            let r = row![
+                text(role).size(style::fs(13)).font(bold()).width(role_width),
+                container(text(harness_label).size(style::fs(13))).width(harness_width).align_y(Alignment::Center),
+                text(model_text).size(style::fs(13)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            section = section.push(r);
+
+            if role == jgt_core::COORDINATOR {
+                section = section.push(
+                    muted("The Coordinator always runs on Claude Code (only Claude can be the coordinator).")
+                        .size(style::fs(12)),
+                );
+            }
+        }
+
+        return section.into();
+    }
+
+    // M5: Editable mode
+    section = section.push(
+        muted("Applies to teams started from now on.").size(style::fs(12)),
+    );
+
+    let col_header = row![
+        muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
+        muted("HARNESS").size(style::fs(11)).font(bold()).width(harness_width),
+        muted("MODEL").size(style::fs(11)).font(bold()).width(model_width),
+        muted("SUGGESTIONS").size(style::fs(11)).font(bold()).width(suggestions_width),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+    section = section.push(col_header);
+
+    for &role in AGENT_ROLES {
+        let is_coordinator = role == jgt_core::COORDINATOR;
+        let default_row;
+        let agent = if let Some(a) = app.agents.iter().find(|a| a.role == role) {
+            a
+        } else {
+            default_row = AgentRow {
+                role: role.to_string(),
+                harness: Harness::ClaudeCode,
+                model: "opus".to_string(),
+                effort: "medium".to_string(),
+            };
+            &default_row
+        };
+
+        // Harness control
+        let harness_control: Element<'_, Msg> = if is_coordinator {
+            container(text("Claude Code").size(style::fs(13)))
+                .width(harness_width)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            let mut harness_options = app.installed_harnesses.clone();
+            if !harness_options.contains(&agent.harness) {
+                harness_options.push(agent.harness);
+            }
+            let choices: Vec<HarnessChoice> = harness_options.into_iter().map(HarnessChoice).collect();
+            let selected = Some(HarnessChoice(agent.harness));
+            let r_name = role.to_string();
+            pick_list(choices, selected, move |choice| {
+                Msg::SetAgentHarness(r_name.clone(), choice.0)
+            })
+            .text_size(style::fs(13))
+            .padding([4, 8])
+            .width(harness_width)
+            .into()
+        };
+
+        // Model text input
+        let r_name = role.to_string();
+        let model_input = text_input("Model…", &agent.model)
+            .on_input(move |m| Msg::SetAgentModel(r_name.clone(), m))
+            .size(style::fs(13))
+            .padding([4, 8])
+            .style(style::input)
+            .width(model_width);
+
+        // Model suggestions control
+        let r_name = role.to_string();
+        let suggestions_control: Element<'_, Msg> = match app.harness_models.get(&agent.harness) {
+            None => container(muted("Loading models…").size(style::fs(12)))
+                .width(suggestions_width)
+                .align_y(Alignment::Center)
+                .into(),
+            Some(Err(err)) => container(
+                muted(format!("Couldn't list models ({err}); type a name"))
+                    .size(style::fs(11))
+                    .wrapping(text::Wrapping::Word),
+            )
+            .width(suggestions_width)
+            .align_y(Alignment::Center)
+            .into(),
+            Some(Ok(suggestions)) if suggestions.is_empty() => container(
+                muted("No suggestions").size(style::fs(12)),
+            )
+            .width(suggestions_width)
+            .align_y(Alignment::Center)
+            .into(),
+            Some(Ok(suggestions)) => {
+                let selected = suggestions.iter().find(|s| *s == &agent.model).cloned();
+                pick_list(suggestions.as_slice(), selected, move |m| {
+                    Msg::SetAgentModel(r_name.clone(), m)
+                })
+                .placeholder("Suggestions…")
+                .text_size(style::fs(13))
+                .padding([4, 8])
+                .width(suggestions_width)
+                .into()
+            }
+        };
+
+        let r = row![
+            text(role).size(style::fs(13)).font(bold()).width(role_width),
+            harness_control,
+            model_input,
+            suggestions_control,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        section = section.push(r);
+
+        if is_coordinator {
+            section = section.push(
+                muted("The Coordinator always runs on Claude Code (only Claude can be the coordinator).")
+                    .size(style::fs(12)),
+            );
+        }
+    }
+
+    // Save button
+    let save_row = row![
+        button(text("Save").size(style::fs(13)))
+            .on_press(Msg::SaveAgents)
+            .style(style::primary_button)
+            .padding([5, 18]),
+        muted("Applies to teams started from now on.").size(style::fs(12)),
+    ]
+    .spacing(12)
+    .align_y(Alignment::Center);
+
+    section = section.push(save_row);
+
+    section.into()
 }
 
 // ── sidebar ─────────────────────────────────────────────────────────────────
@@ -2026,5 +2246,124 @@ mod tests {
         app.search.clear();
         app.show_archived = true;
         let _ = sidebar(&app, &theme);
+    }
+
+    #[test]
+    fn test_settings_agents_unlocked_renders() {
+        let (mut app, _) = App::new(None);
+        app.show_settings = true;
+        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Antigravity];
+        app.agents = AGENT_ROLES
+            .iter()
+            .map(|&role| AgentRow {
+                role: role.to_string(),
+                harness: if role == jgt_core::COORDINATOR {
+                    Harness::ClaudeCode
+                } else {
+                    Harness::Antigravity
+                },
+                model: if role == jgt_core::COORDINATOR {
+                    "opus".into()
+                } else {
+                    "gemini-3.8-flash-high".into()
+                },
+                effort: "high".into(),
+            })
+            .collect();
+
+        app.harness_models.insert(
+            Harness::ClaudeCode,
+            Ok(vec!["opus".into(), "sonnet".into(), "fable".into(), "haiku".into()]),
+        );
+        app.harness_models.insert(
+            Harness::Antigravity,
+            Ok(vec!["gemini-3.8-flash-high".into()]),
+        );
+
+        assert!(app.agents_locked.is_none());
+        assert_eq!(HarnessChoice(Harness::ClaudeCode).to_string(), "Claude Code");
+        assert_eq!(HarnessChoice(Harness::Antigravity).to_string(), "Antigravity");
+
+        let _ = agents_section(&app);
+        let _ = settings(&app);
+        let _ = view(&app);
+    }
+
+    #[test]
+    fn test_settings_agents_locked_renders() {
+        use jgt_core::TeamAgents;
+
+        let (mut app, _) = App::new(None);
+        app.show_settings = true;
+
+        let mut roles = std::collections::BTreeMap::new();
+        for &role in AGENT_ROLES {
+            roles.insert(
+                role.to_string(),
+                jgt_core::AgentSetting {
+                    harness: if role == jgt_core::COORDINATOR {
+                        Harness::ClaudeCode
+                    } else {
+                        Harness::Antigravity
+                    },
+                    model: if role == jgt_core::COORDINATOR {
+                        "opus".into()
+                    } else {
+                        "gemini-3.8-flash-high".into()
+                    },
+                    effort: "medium".into(),
+                },
+            );
+        }
+        app.agents_locked = Some(TeamAgents { roles });
+
+        assert!(app.agents_locked.is_some());
+        let _ = agents_section(&app);
+        let _ = settings(&app);
+        let _ = view(&app);
+    }
+
+    #[test]
+    fn test_settings_agents_loading_and_error_states() {
+        let (mut app, _) = App::new(None);
+        app.show_settings = true;
+        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Opencode];
+
+        app.agents = vec![
+            AgentRow {
+                role: "coordinator".into(),
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "medium".into(),
+            },
+            AgentRow {
+                role: "planner".into(),
+                harness: Harness::Opencode,
+                model: "custom-model".into(),
+                effort: "low".into(),
+            },
+            AgentRow {
+                role: "coder".into(),
+                harness: Harness::Custom,
+                model: "unknown".into(),
+                effort: "high".into(),
+            },
+        ];
+
+        // Opencode returned an error
+        app.harness_models.insert(
+            Harness::Opencode,
+            Err("opencode not found".into()),
+        );
+        // Custom is None (still loading)
+        // ClaudeCode returned empty suggestions
+        app.harness_models.insert(
+            Harness::ClaudeCode,
+            Ok(vec![]),
+        );
+
+        let _ = agents_section(&app);
+        let _ = settings(&app);
+        let _ = view(&app);
     }
 }

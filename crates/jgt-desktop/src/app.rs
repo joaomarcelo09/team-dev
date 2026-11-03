@@ -8,13 +8,14 @@ use iced::{
     keyboard, window,
 };
 use jgt_core::{
-    Decision, Direction, Event, Message, MessageKind, Question, ReconnectMode, Session, SessionStatus, Task as BoardTask,
-    TaskEvent, TaskPriority, TaskStatus,
+    Decision, Direction, Event, Harness, Message, MessageKind, Question, ReconnectMode, Session, SessionStatus, Task as BoardTask,
+    TaskEvent, TaskPriority, TaskStatus, TeamAgents,
     api::{MoveResponse, PatchSessionRequest},
     config::{Config, Desktop as DesktopConfig},
 };
 use std::{
     collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -79,6 +80,17 @@ pub enum Module {
     #[default]
     Coordinator,
     Worker(String),
+}
+
+/// What the settings form currently shows for one role.
+// used by M5
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRow {
+    pub role: String,
+    pub harness: Harness,
+    pub model: String,
+    pub effort: String,
 }
 
 /// A team workspace: a project folder with its Coordinator.
@@ -172,6 +184,22 @@ pub struct App {
     pub show_settings: bool,
     /// Problems in the `[team]` config (unknown harness or effort, …), shown as a banner in Settings.
     pub config_warnings: Vec<String>,
+    /// What the Settings agents form currently shows for each role.
+    // used by M5
+    #[allow(dead_code)]
+    pub agents: Vec<AgentRow>,
+    /// Harnesses whose program is installed here, for Settings.
+    // used by M5
+    #[allow(dead_code)]
+    pub installed_harnesses: Vec<Harness>,
+    /// Listed models or aliases per harness, populated asynchronously.
+    // used by M5
+    #[allow(dead_code)]
+    pub harness_models: HashMap<Harness, Result<Vec<String>, String>>,
+    /// Saved team agents if the selected workspace has a connected Coordinator, locking Settings.
+    // used by M5
+    #[allow(dead_code)]
+    pub agents_locked: Option<TeamAgents>,
     /// Folder typed in the "New team" form, while it is open.
     pub new_team: Option<String>,
     pub starting_team: bool,
@@ -300,6 +328,16 @@ pub enum Msg {
     SetStyle(ThemeStyle),
     ToggleSettings,
     TogglePopups,
+    // used by M5
+    #[allow(dead_code)]
+    SetAgentHarness(String, Harness),
+    // used by M5
+    #[allow(dead_code)]
+    SetAgentModel(String, String),
+    ModelsListed(Harness, Result<Vec<String>, String>),
+    // used by M5
+    #[allow(dead_code)]
+    SaveAgents,
     Zoom(Step),
     TextSize(Step),
     Key(keyboard::Event),
@@ -382,6 +420,10 @@ impl App {
             popups: config.notifications.enabled,
             show_settings: false,
             config_warnings: config.team.warnings(None),
+            agents: Vec::new(),
+            installed_harnesses: Vec::new(),
+            harness_models: HashMap::new(),
+            agents_locked: None,
             new_team: None,
             starting_team: false,
             boards: HashMap::new(),
@@ -1249,14 +1291,109 @@ impl App {
                     let config = Config::load();
                     self.popups = config.notifications.enabled;
                     self.config_warnings = config.team.warnings(None);
+                    self.agents_locked = agents_locked_for(self);
+
+                    self.agents = if self.agents_locked.is_some() {
+                        let folder: PathBuf = self
+                            .workspace
+                            .as_ref()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(jgt_core::paths::home_dir);
+                        jgt_core::config::roles()
+                            .map(|role| {
+                                let settings = config.team.for_skill(role, &folder);
+                                AgentRow {
+                                    role: role.to_string(),
+                                    harness: settings.harness,
+                                    model: settings.model,
+                                    effort: settings.effort,
+                                }
+                            })
+                            .collect()
+                    } else {
+                        jgt_core::config::roles()
+                            .map(|role| {
+                                let settings = config.team.for_user(role);
+                                AgentRow {
+                                    role: role.to_string(),
+                                    harness: settings.harness,
+                                    model: settings.model,
+                                    effort: settings.effort,
+                                }
+                            })
+                            .collect()
+                    };
+
+                    self.installed_harnesses = jgt_core::harness::installed(&config);
+                    self.harness_models.clear();
+
+                    let tasks = self
+                        .installed_harnesses
+                        .iter()
+                        .copied()
+                        .map(|h| {
+                            let cfg = config.clone();
+                            Task::perform(
+                                async move {
+                                    match tokio::task::spawn_blocking(move || {
+                                        jgt_core::harness::models(h, &cfg)
+                                    })
+                                    .await
+                                    {
+                                        Ok(res) => res,
+                                        Err(e) => Err(format!("failed to list models: {e}")),
+                                    }
+                                },
+                                move |res| Msg::ModelsListed(h, res),
+                            )
+                        })
+                        .collect::<Vec<_>>();
+
+                    Task::batch(tasks)
+                } else {
+                    Task::none()
                 }
-                Task::none()
             }
             Msg::TogglePopups => {
                 self.popups = !self.popups;
                 let mut config = Config::load();
                 apply_popups(&mut config, self.popups);
                 let _ = config.save();
+                Task::perform(hub::reload_config(), Msg::Done)
+            }
+            Msg::SetAgentHarness(role, harness) => {
+                if role == jgt_core::model::COORDINATOR {
+                    return Task::none();
+                }
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
+                    agent.harness = harness;
+                    let first_model = self
+                        .harness_models
+                        .get(&harness)
+                        .and_then(|r| r.as_ref().ok())
+                        .and_then(|models| models.first())
+                        .cloned()
+                        .unwrap_or_default();
+                    agent.model = first_model;
+                }
+                Task::none()
+            }
+            Msg::SetAgentModel(role, model) => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
+                    agent.model = model;
+                }
+                Task::none()
+            }
+            Msg::ModelsListed(harness, result) => {
+                self.harness_models.insert(harness, result);
+                Task::none()
+            }
+            Msg::SaveAgents => {
+                let mut config = Config::load();
+                apply_agents(&mut config, &self.agents);
+                let _ = config.save();
+                self.config_warnings = config.team.warnings(None);
+                self.toast("Applies to teams started from now on", false);
                 Task::perform(hub::reload_config(), Msg::Done)
             }
             Msg::Zoom(step) => {
@@ -1450,6 +1587,16 @@ pub(crate) fn apply_popups(config: &mut Config, enabled: bool) {
     config.notifications.enabled = enabled;
 }
 
+/// Applies agent row settings to `config.team.skills`, keeping other skill settings intact.
+pub(crate) fn apply_agents(config: &mut Config, agents: &[AgentRow]) {
+    for agent in agents {
+        let skill = config.team.skills.entry(agent.role.clone()).or_default();
+        skill.harness = Some(agent.harness.as_str().to_string());
+        skill.model = Some(agent.model.clone());
+        skill.effort = Some(agent.effort.clone());
+    }
+}
+
 /// The workspace folder for `session`, if it belongs to a team.
 pub fn session_workspace(session: &Session, sessions: &[Session]) -> Option<String> {
     if session.is_coordinator() {
@@ -1511,6 +1658,19 @@ pub fn coordinator_for<'a>(sessions: &'a [Session], ws: &str) -> Option<&'a Sess
         )
     });
     coords.pop()
+}
+
+/// Saved agents if the selected workspace has a connected Coordinator session (user decision 1a).
+// used from M4 on
+#[allow(dead_code)]
+pub fn agents_locked_for(app: &App) -> Option<TeamAgents> {
+    let ws = app.workspace.as_deref()?;
+    let coord = coordinator_for(&app.sessions, ws)?;
+    if coord.status.is_connected() {
+        TeamAgents::load(Path::new(ws))
+    } else {
+        None
+    }
 }
 
 /// The workspaces represented in `sessions`: unique folders that have a Coordinator,
@@ -2120,5 +2280,313 @@ mod tests {
         assert_eq!(app.module, Module::Worker("w1".to_string()));
         assert!(app.at_bottom, "Switching to Worker must set at_bottom to true");
         assert_eq!(app.newly_opened.as_deref(), Some("w1"), "Switching to Worker must mark newly_opened");
+    }
+
+    #[test]
+    fn test_agents_locked_for() {
+        let dir = std::env::temp_dir().join(format!("jgt-locked-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut expected = TeamAgents::default();
+        expected.roles.insert(
+            "coder".into(),
+            jgt_core::AgentSetting {
+                harness: Harness::Antigravity,
+                model: "gemini-3.8-flash-high".into(),
+                effort: "high".into(),
+            },
+        );
+        expected.write(&dir).unwrap();
+
+        let ws = dir.display().to_string();
+
+        // 1. Running team: coordinator connected -> locked (Some(expected))
+        let (mut app, _) = App::new(None);
+        app.workspace = Some(ws.clone());
+        app.sessions = vec![make_session(
+            "c1",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(&ws),
+            SessionStatus::Active,
+            false,
+        )];
+        assert_eq!(agents_locked_for(&app), Some(expected.clone()));
+
+        // Also test Listening status (connected)
+        app.sessions[0].status = SessionStatus::Listening;
+        assert_eq!(agents_locked_for(&app), Some(expected));
+
+        // 2. Ended team: coordinator not connected -> editable (None)
+        app.sessions[0].status = SessionStatus::Ended;
+        assert_eq!(agents_locked_for(&app), None);
+
+        // 3. No workspace: None -> editable (None)
+        app.workspace = None;
+        app.sessions[0].status = SessionStatus::Active;
+        assert_eq!(agents_locked_for(&app), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn test_save_agents_keeps_other_config() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+
+        let dir = std::env::temp_dir().join(format!("jgt-save-agents-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let initial_toml = r#"
+[desktop]
+theme = "dark"
+style = "dracula"
+zoom = 1.2
+text_size = 14
+
+[notifications]
+enabled = false
+
+[team.skills.coder]
+harness = "claude-code"
+model = "haiku"
+effort = "low"
+allowed_tools = ["Bash"]
+"#;
+        std::fs::write(dir.join("config.toml"), initial_toml).unwrap();
+
+        let prev = std::env::var_os("JGT_CONFIG_DIR");
+        unsafe {
+            std::env::set_var("JGT_CONFIG_DIR", &dir);
+        }
+
+        let (mut app, _) = App::new(None);
+        app.agents = vec![
+            AgentRow {
+                role: "coder".into(),
+                harness: Harness::Antigravity,
+                model: "gemini-3.8-flash-high".into(),
+                effort: "high".into(),
+            },
+            AgentRow {
+                role: "coordinator".into(),
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "medium".into(),
+            },
+        ];
+
+        let _ = app.update(Msg::SaveAgents);
+
+        assert_eq!(
+            app.toast.as_ref().map(|t| (t.text.as_str(), t.error)),
+            Some(("Applies to teams started from now on", false))
+        );
+
+        let saved = Config::load();
+        // Desktop config is preserved
+        assert_eq!(saved.desktop.style, "dracula");
+        assert_eq!(saved.desktop.zoom, 1.2);
+        assert_eq!(saved.desktop.text_size, 14);
+        assert_eq!(saved.desktop.theme, "dark");
+        assert!(!saved.notifications.enabled);
+
+        // Coder settings updated, keeping allowed_tools intact
+        let coder = saved.team.skills.get("coder").expect("coder skill must exist");
+        assert_eq!(coder.harness.as_deref(), Some("antigravity"));
+        assert_eq!(coder.model.as_deref(), Some("gemini-3.8-flash-high"));
+        assert_eq!(coder.effort.as_deref(), Some("high"));
+        assert_eq!(coder.allowed_tools, Some(vec!["Bash".into()]));
+
+        // Coordinator settings written
+        let coord = saved.team.skills.get("coordinator").expect("coordinator skill must exist");
+        assert_eq!(coord.harness.as_deref(), Some("claude-code"));
+        assert_eq!(coord.model.as_deref(), Some("opus"));
+        assert_eq!(coord.effort.as_deref(), Some("medium"));
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("JGT_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_set_agent_harness_and_model_messages() {
+        let (mut app, _) = App::new(None);
+        app.harness_models.insert(
+            Harness::Antigravity,
+            Ok(vec!["gemini-3.8-flash-high".into(), "gemini-1.5-pro".into()]),
+        );
+        app.agents = vec![
+            AgentRow {
+                role: "coder".into(),
+                harness: Harness::ClaudeCode,
+                model: "sonnet".into(),
+                effort: "high".into(),
+            },
+            AgentRow {
+                role: "coordinator".into(),
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "medium".into(),
+            },
+        ];
+
+        // SetAgentHarness on worker: changes harness and resets model to first suggestion
+        let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::Antigravity));
+        assert_eq!(app.agents[0].harness, Harness::Antigravity);
+        assert_eq!(app.agents[0].model, "gemini-3.8-flash-high");
+        assert_eq!(app.agents[0].effort, "high"); // effort kept
+
+        // SetAgentHarness on coordinator: ignored!
+        let _ = app.update(Msg::SetAgentHarness("coordinator".into(), Harness::Antigravity));
+        assert_eq!(app.agents[1].harness, Harness::ClaudeCode);
+        assert_eq!(app.agents[1].model, "opus");
+
+        // SetAgentModel on worker: updates model
+        let _ = app.update(Msg::SetAgentModel("coder".into(), "custom-gemini".into()));
+        assert_eq!(app.agents[0].model, "custom-gemini");
+
+        // SetAgentModel on coordinator: updates model
+        let _ = app.update(Msg::SetAgentModel("coordinator".into(), "fable".into()));
+        assert_eq!(app.agents[1].model, "fable");
+
+        // ModelsListed updates harness_models
+        let _ = app.update(Msg::ModelsListed(Harness::Opencode, Ok(vec!["anthropic/claude-3".into()])));
+        assert_eq!(
+            app.harness_models.get(&Harness::Opencode),
+            Some(&Ok(vec!["anthropic/claude-3".into()]))
+        );
+    }
+
+    #[test]
+    fn test_toggle_settings_populates_agents() {
+        let (mut app, _) = App::new(None);
+        assert!(!app.show_settings);
+        assert!(app.agents.is_empty());
+
+        let _ = app.update(Msg::ToggleSettings);
+        assert!(app.show_settings);
+        assert_eq!(app.agents.len(), 7);
+        let roles: Vec<&str> = app.agents.iter().map(|a| a.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["coordinator", "planner", "coder", "verifier", "reviewer", "tester", "git-coder"]
+        );
+        // Coordinator harness is always Claude Code
+        assert_eq!(app.agents[0].harness, Harness::ClaudeCode);
+
+        // Toggle closed
+        let _ = app.update(Msg::ToggleSettings);
+        assert!(!app.show_settings);
+    }
+
+    #[test]
+    fn test_toggle_settings_with_ended_team_uses_user_config() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+
+        let base_dir = std::env::temp_dir().join(format!("jgt-ended-test-{}", std::process::id()));
+        let config_dir = base_dir.join("config");
+        let ws_dir = base_dir.join("workspace");
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&ws_dir).unwrap();
+
+        // 1. User config: coder uses claude-code with haiku
+        let user_toml = r#"
+[team.skills.coder]
+harness = "claude-code"
+model = "haiku"
+effort = "low"
+"#;
+        std::fs::write(config_dir.join("config.toml"), user_toml).unwrap();
+
+        let prev = std::env::var_os("JGT_CONFIG_DIR");
+        unsafe {
+            std::env::set_var("JGT_CONFIG_DIR", &config_dir);
+        }
+
+        // 2. Workspace has saved agents.json from a team
+        let mut saved_agents = TeamAgents::default();
+        saved_agents.roles.insert(
+            "coder".into(),
+            jgt_core::AgentSetting {
+                harness: Harness::Antigravity,
+                model: "gemini-3.8-flash-high".into(),
+                effort: "high".into(),
+            },
+        );
+        saved_agents.write(&ws_dir).unwrap();
+
+        // Workspace also has project .team/config.toml
+        std::fs::write(
+            ws_dir.join(".team").join("config.toml"),
+            "[team.skills.coder]\nmodel = \"project-model\"\n",
+        )
+        .unwrap();
+
+        // 3. App has this workspace selected and an ended coordinator session
+        let (mut app, _) = App::new(None);
+        let ws = ws_dir.display().to_string();
+        app.workspace = Some(ws.clone());
+        app.sessions = vec![make_session(
+            "c1",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(&ws),
+            SessionStatus::Ended,
+            false,
+        )];
+
+        // 4. ToggleSettings: Settings opens in editable (unlocked) mode
+        let _ = app.update(Msg::ToggleSettings);
+        assert!(app.show_settings);
+        assert!(app.agents_locked.is_none());
+
+        // 5. The rows equal the user config alone
+        let config = Config::load();
+        let expected_agents: Vec<AgentRow> = jgt_core::config::roles()
+            .map(|role| {
+                let s = config.team.for_user(role);
+                AgentRow {
+                    role: role.to_string(),
+                    harness: s.harness,
+                    model: s.model,
+                    effort: s.effort,
+                }
+            })
+            .collect();
+        assert_eq!(app.agents, expected_agents);
+
+        let coder_row = app.agents.iter().find(|a| a.role == "coder").unwrap();
+        assert_eq!(coder_row.harness, Harness::ClaudeCode);
+        assert_eq!(coder_row.model, "haiku");
+        assert_eq!(coder_row.effort, "low");
+
+        // Coordinator is Claude Code
+        let coord_row = app.agents.iter().find(|a| a.role == "coordinator").unwrap();
+        assert_eq!(coord_row.harness, Harness::ClaudeCode);
+
+        // 6. Contrast: when team is running (Active coordinator), Settings opens locked with agents.json
+        let _ = app.update(Msg::ToggleSettings); // close
+        assert!(!app.show_settings);
+
+        app.sessions[0].status = SessionStatus::Active;
+        let _ = app.update(Msg::ToggleSettings); // open again
+        assert!(app.show_settings);
+        assert!(app.agents_locked.is_some());
+        let coder_locked = app.agents.iter().find(|a| a.role == "coder").unwrap();
+        assert_eq!(coder_locked.harness, Harness::Antigravity);
+        assert_eq!(coder_locked.model, "gemini-3.8-flash-high");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("JGT_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&base_dir);
     }
 }

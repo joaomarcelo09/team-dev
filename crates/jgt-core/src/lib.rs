@@ -1,5 +1,6 @@
 //! Shared types and helpers for every jg-team-dev component.
 
+pub mod agents;
 pub mod api;
 pub mod board;
 pub mod config;
@@ -11,6 +12,7 @@ pub mod paths;
 pub mod procs;
 pub mod team;
 
+pub use agents::{AgentSetting, AgentSettings, TeamAgents};
 pub use client::{ClientError, HubClient};
 pub use model::*;
 

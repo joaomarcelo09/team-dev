@@ -31,6 +31,21 @@ use std::{
 
 pub struct Antigravity;
 
+/// Extracts model identifiers from `agy models` output.
+///
+/// Keeps the first column of lines that contain a tab, ignoring header or status lines like
+/// "Fetching available models...".
+pub fn parse_models(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (first, _) = line.split_once('\t')?;
+            let model = first.trim();
+            (!model.is_empty()).then(|| model.to_string())
+        })
+        .collect()
+}
+
 /// `agy --print-timeout`: the longest a worker turn may take; agy stops it itself.
 const PRINT_TIMEOUT: &str = "2h";
 
@@ -157,11 +172,48 @@ impl HarnessAdapter for Antigravity {
     fn effort_args(&self, level: &str) -> Option<Vec<String>> {
         Some(vec!["--effort".into(), level.to_string()])
     }
+
+    fn models(&self, config: &Config) -> Result<Vec<String>, String> {
+        let program = self.find(config)?;
+        let stdout = super::run_with_timeout(&program, &["models"], super::MODELS_TIMEOUT)?;
+        Ok(parse_models(&stdout))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_models_extracts_tab_delimited_ids_and_skips_fetching_line() {
+        let sample = "\
+Fetching available models...
+gemini-3.8-flash-high\tGemini 3.8 Flash (High)
+gemini-3.8-flash-medium\tGemini 3.8 Flash (Medium)
+gemini-3.8-flash-low\tGemini 3.8 Flash (Low)
+claude-sonnet-4-6\tClaude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking\tClaude Opus 4.6 (Thinking)
+gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
+";
+        let models = parse_models(sample);
+        assert_eq!(
+            models,
+            [
+                "gemini-3.8-flash-high",
+                "gemini-3.8-flash-medium",
+                "gemini-3.8-flash-low",
+                "claude-sonnet-4-6",
+                "claude-opus-4-6-thinking",
+                "gpt-oss-120b-medium",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_models_ignores_lines_without_tabs() {
+        let sample = "⠋ Fetching available models...⠙ Fetching available models...\n\nNo models\n";
+        assert!(parse_models(sample).is_empty());
+    }
 
     #[test]
     fn the_smoke_run_output_parses() {

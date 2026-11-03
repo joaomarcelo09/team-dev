@@ -1,5 +1,6 @@
 //! `~/.config/jg-team-dev/config.toml`, shared by the hub, the CLI and the app.
 
+pub use crate::agents::{agents_path, AgentSetting, AgentSettings, TeamAgents};
 use crate::model::Harness;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -236,18 +237,56 @@ fn set(value: &str) -> Option<String> {
 }
 
 impl Team {
-    /// Settings for `skill` in `folder`. Harness, model and effort come whole from the first of:
-    /// the project's `[team.skills.<skill>]`, the user's `[team.skills.<skill>]`, the role's
-    /// built-in default (`role_defaults`), the project's `[team]`, the user's `[team]`, then
-    /// `claude-code` with `DEFAULT_MODEL` and `DEFAULT_EFFORT` (`run_unit`). The other settings:
-    /// the most specific wins, field by field. Invalid values are replaced (see `check`).
+    /// Settings for `skill` in `folder`. When `<folder>/.team/agents.json` exists (saved when the
+    /// team started), its harness, model and effort replace the resolved ones. Otherwise harness,
+    /// model and effort come whole from the first of: the project's `[team.skills.<skill>]`, the
+    /// user's `[team.skills.<skill>]`, the role's built-in default (`role_defaults`), the
+    /// project's `[team]`, the user's `[team]`, then `claude-code` with `DEFAULT_MODEL` and
+    /// `DEFAULT_EFFORT` (`run_unit`). The other settings: the most specific wins, field by field.
+    /// Invalid values are replaced (see `check`).
     pub fn for_skill(&self, skill: &str, folder: &Path) -> SessionSettings {
-        self.resolve(skill, &project_team(folder)).0
+        self.resolve_for_folder(skill, folder).0
     }
 
     /// Like `for_skill`, with a warning for each setting that was invalid and replaced.
     pub fn for_skill_checked(&self, skill: &str, folder: &Path) -> (SessionSettings, Vec<String>) {
+        self.resolve_for_folder(skill, folder)
+    }
+
+    /// Settings for `skill` resolved from the user config alone without any project folder
+    /// (no workspace `agents.json` and no project `config.toml`).
+    /// The Coordinator is kept on Claude Code.
+    pub fn for_user(&self, skill: &str) -> SessionSettings {
+        self.resolve_without_project(skill).0
+    }
+
+    /// Like `for_user`, with any warnings for invalid settings.
+    pub fn resolve_without_project(&self, skill: &str) -> (SessionSettings, Vec<String>) {
+        self.resolve(skill, &ProjectTeam::default())
+    }
+
+    pub(crate) fn resolve_unlocked(&self, skill: &str, folder: &Path) -> (SessionSettings, Vec<String>) {
         self.resolve(skill, &project_team(folder))
+    }
+
+    fn resolve_for_folder(&self, skill: &str, folder: &Path) -> (SessionSettings, Vec<String>) {
+        let (mut settings, mut warnings) = self.resolve_unlocked(skill, folder);
+        if let Some(saved) = TeamAgents::load(folder).and_then(|mut a| a.roles.remove(skill)) {
+            let harness = if skill == crate::model::COORDINATOR && saved.harness != Harness::ClaudeCode {
+                warnings.push(format!(
+                    "coordinator: the Coordinator runs on Claude Code only, not {}; using claude-code",
+                    saved.harness.label()
+                ));
+                Harness::ClaudeCode
+            } else {
+                saved.harness
+            };
+            let effort = check_effort(skill, harness, Some(&saved.effort), &mut warnings);
+            settings.harness = harness;
+            settings.model = saved.model;
+            settings.effort = effort;
+        }
+        (settings, warnings)
     }
 
     /// The warnings of every role in `folder` (`None`: the user config alone), for the app's
@@ -703,5 +742,194 @@ mod tests {
         assert_eq!(old_cfg.desktop.style, "default");
 
         assert_eq!(Config::default().desktop.style, "jg-violet");
+    }
+
+    #[test]
+    fn with_no_agents_file_result_is_unchanged() {
+        let root = std::env::temp_dir().join(format!("jgt-no-agents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        assert_eq!(agents_path(&root), None);
+        assert_eq!(TeamAgents::load(&root), None);
+
+        let cfg = Config::default();
+        let coder = cfg.team.for_skill("coder", &root);
+        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+
+        let coord = cfg.team.for_skill(COORDINATOR, &root);
+        assert_eq!(coord.describe(COORDINATOR), "coordinator · Claude Code · opus · medium");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn saved_agents_file_wins_over_changed_user_config() {
+        let root = std::env::temp_dir().join(format!("jgt-agents-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut agents = TeamAgents::default();
+        agents.roles.insert(
+            "coder".into(),
+            AgentSetting {
+                harness: Harness::Opencode,
+                model: "qwen-coder".into(),
+                effort: "medium".into(),
+            },
+        );
+        agents.write(&root).unwrap();
+
+        let user: Config = toml::from_str(
+            r#"
+            [team.skills.coder]
+            harness = "claude-code"
+            model = "sonnet"
+            effort = "low"
+            allowed_tools = ["Bash(cargo test:*)"]
+            "#,
+        )
+        .unwrap();
+
+        let coder = user.team.for_skill("coder", &root);
+        // The saved file wins for harness, model and effort:
+        assert_eq!(coder.harness, Harness::Opencode);
+        assert_eq!(coder.model, "qwen-coder");
+        assert_eq!(coder.effort, "medium");
+        // Non-agent settings still come from the config:
+        assert_eq!(coder.allowed_tools, ["Bash(cargo test:*)"]);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agents_file_is_found_from_a_worktree() {
+        let root = std::env::temp_dir().join(format!("jgt-agents-wt-{}", std::process::id()));
+        let wt = root.join(".team/worktrees/fix-jgt");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&wt).unwrap();
+
+        assert_eq!(agents_path(&wt), None);
+
+        let mut agents = TeamAgents::default();
+        agents.roles.insert(
+            "coder".into(),
+            AgentSetting {
+                harness: Harness::ClaudeCode,
+                model: "haiku".into(),
+                effort: "low".into(),
+            },
+        );
+        agents.write(&root).unwrap();
+
+        assert_eq!(agents_path(&wt), Some(root.join(".team/agents.json")));
+        assert_eq!(TeamAgents::load(&wt).unwrap().roles["coder"].model, "haiku");
+
+        let coder = Config::default().team.for_skill("coder", &wt);
+        assert_eq!(coder.harness, Harness::ClaudeCode);
+        assert_eq!(coder.model, "haiku");
+        assert_eq!(coder.effort, "low");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coordinator_is_claude_code_only_even_if_saved_otherwise() {
+        let root = std::env::temp_dir().join(format!("jgt-agents-coord-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut agents = TeamAgents::default();
+        agents.roles.insert(
+            COORDINATOR.into(),
+            AgentSetting {
+                harness: Harness::Opencode,
+                model: "other-model".into(),
+                effort: "medium".into(),
+            },
+        );
+        agents.write(&root).unwrap();
+
+        let (coord, warnings) = Config::default().team.for_skill_checked(COORDINATOR, &root);
+        assert_eq!(coord.harness, Harness::ClaudeCode);
+        assert_eq!(coord.model, "other-model");
+        assert!(warnings.iter().any(|w| w.contains("Claude Code only")), "{warnings:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn team_agents_resolve_and_roundtrip() {
+        let root = std::env::temp_dir().join(format!("jgt-agents-rt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let team = Config::default().team;
+        let resolved = TeamAgents::resolve(&team, &root);
+        assert_eq!(resolved.roles.len(), 7);
+        assert_eq!(resolved.roles[COORDINATOR].harness, Harness::ClaudeCode);
+        assert_eq!(resolved.roles["coder"].harness, Harness::Antigravity);
+
+        let desc = resolved.describe();
+        assert!(desc.starts_with("Agents: coordinator · Claude Code · opus · medium, planner · "));
+        assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-high · high"));
+
+        resolved.write(&root).unwrap();
+        let loaded = TeamAgents::load(&root).unwrap();
+        assert_eq!(loaded, resolved);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn for_user_ignores_project_and_agents_and_forces_coordinator_to_claude_code() {
+        let root = std::env::temp_dir().join(format!("jgt-user-alone-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(".team")).unwrap();
+
+        let mut agents = TeamAgents::default();
+        agents.roles.insert(
+            "coder".into(),
+            AgentSetting {
+                harness: Harness::Antigravity,
+                model: "gemini-saved".into(),
+                effort: "high".into(),
+            },
+        );
+        agents.write(&root).unwrap();
+
+        std::fs::write(root.join(".team/config.toml"), "[team.skills.coder]\nmodel = \"project-model\"\n").unwrap();
+
+        let user: Config = toml::from_str(
+            r#"
+            [team.skills.coder]
+            harness = "claude-code"
+            model = "user-model"
+            effort = "low"
+
+            [team.skills.coordinator]
+            harness = "opencode"
+            model = "user-coord"
+            effort = "medium"
+            "#,
+        )
+        .unwrap();
+
+        // for_skill reads the workspace's agents.json
+        assert_eq!(user.team.for_skill("coder", &root).model, "gemini-saved");
+
+        // for_user reads the USER config alone, ignoring agents.json and project config.toml
+        let coder = user.team.for_user("coder");
+        assert_eq!(coder.harness, Harness::ClaudeCode);
+        assert_eq!(coder.model, "user-model");
+        assert_eq!(coder.effort, "low");
+
+        // Coordinator is forced to Claude Code
+        let (coord, warnings) = user.team.resolve_without_project(COORDINATOR);
+        assert_eq!(coord.harness, Harness::ClaudeCode);
+        assert_eq!(coord.model, "user-coord");
+        assert!(warnings.iter().any(|w| w.contains("Claude Code only")), "{warnings:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
