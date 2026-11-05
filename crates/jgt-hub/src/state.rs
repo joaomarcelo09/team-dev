@@ -320,6 +320,51 @@ impl Hub {
         Ok(())
     }
 
+    pub fn delete_workspace(&self, folder: &str) -> HubResult<()> {
+        let ws_norm = jgt_core::team::normalize_folder(folder);
+        if ws_norm.is_empty() {
+            return Ok(());
+        }
+
+        let all = self.db.sessions(true)?;
+        let matching: Vec<_> = all
+            .iter()
+            .filter(|s| jgt_core::team::session_workspace(s, &all).as_deref() == Some(ws_norm))
+            .cloned()
+            .collect();
+
+        for session in &matching {
+            if session.status.is_connected() {
+                if let Some(pid) = session.pid
+                    && procs::is_alive(pid, session.pid_start)
+                {
+                    procs::kill(pid);
+                }
+                let _ = self.mark_ended(session, "team deleted");
+            }
+            self.db.delete_session(&session.id)?;
+            self.emit(Event::SessionRemoved { id: session.id.clone() });
+        }
+
+        let tasks = self.db.board(|b| {
+            let tasks = b.tasks(ws_norm, true)?;
+            for task in &tasks {
+                b.delete_task(&task.id)?;
+            }
+            Ok::<_, HubError>(tasks)
+        })?;
+
+        for task in tasks {
+            self.emit(Event::TaskRemoved {
+                id: task.id,
+                workspace: task.workspace,
+            });
+        }
+
+        self.bump();
+        Ok(())
+    }
+
     // ── messages ────────────────────────────────────────────────────────────
 
     pub fn agent_message(&self, id: &str, req: &AgentMessageRequest) -> HubResult<Message> {

@@ -38,6 +38,20 @@ pub fn is_alive(pid: i64, start: Option<i64>) -> bool {
     }
 }
 
+/// Kills the process (and its process group on Unix) if it is alive.
+#[cfg(unix)]
+pub fn kill(pid: i64) {
+    if pid > 1 {
+        unsafe {
+            let _ = libc::kill(-(pid as i32), libc::SIGKILL);
+            let _ = libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn kill(_pid: i64) {}
+
 /// The PID of the harness that spawned this process: the first ancestor that is not a
 /// shell or other wrapper. Claude Code and opencode run hooks and MCP servers as children.
 pub fn harness_pid() -> Option<i64> {

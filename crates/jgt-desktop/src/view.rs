@@ -173,7 +173,7 @@ pub fn app_header<'a>(app: &'a App) -> Element<'a, Msg> {
 
     let selector = pick_list(
         choices,
-        selected,
+        selected.clone(),
         move |choice| match choice {
             WorkspaceChoice::Team { key, .. } => Msg::SelectWorkspace(key),
             WorkspaceChoice::NewTeam => Msg::NewTeamOpen,
@@ -190,7 +190,33 @@ pub fn app_header<'a>(app: &'a App) -> Element<'a, Msg> {
         color: Some(theme.extended_palette().primary.base.color),
     });
 
-    let ws_selector = row![folder_icon, selector].spacing(6).align_y(Alignment::Center);
+    let mut ws_selector = row![folder_icon, selector].spacing(6).align_y(Alignment::Center);
+
+    if let Some(WorkspaceChoice::Team { name, .. }) = &selected {
+        let delete_team: Element<'a, Msg> = if app.confirm_delete_team {
+            row![
+                muted(format!("Delete team “{name}” and all its chats and tasks?")).size(style::fs(13)),
+                button(text("Delete").size(style::fs(13)))
+                    .on_press(Msg::DeleteTeamConfirm)
+                    .style(style::danger_button)
+                    .padding([6, 12]),
+                button(text("Cancel").size(style::fs(13)))
+                    .on_press(Msg::DeleteTeamCancel)
+                    .style(style::ghost)
+                    .padding([6, 10]),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center)
+            .into()
+        } else {
+            button(text("Delete team").size(style::fs(13)))
+                .on_press(Msg::DeleteTeamAsk)
+                .style(style::ghost)
+                .padding([6, 10])
+                .into()
+        };
+        ws_selector = ws_selector.push(delete_team);
+    }
 
     let (working, cost) = app
         .workspace
