@@ -1,0 +1,50 @@
+# Maintainer: joaogomes <jmjoao73@hotmail.com>
+
+pkgname=jg-team-dev
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Chat with a Claude Code Coordinator that runs a team of worker sessions"
+arch=('x86_64')
+url="https://github.com/joaomarcelo09/team-dev"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'fontconfig' 'ttf-liberation')
+makedepends=('cargo')
+optdepends=(
+  'vulkan-icd-loader: GPU-accelerated rendering'
+  'claude-code: Claude Code agent sessions'
+)
+install=jg-team-dev.install
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Run `updpkgsums` after tagging and releasing a version
+sha256sums=('SKIP')
+
+prepare() {
+  cd "$srcdir/team-dev-$pkgver"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo fetch --locked
+}
+
+build() {
+  cd "$srcdir/team-dev-$pkgver"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo build --release --locked --workspace
+}
+
+check() {
+  cd "$srcdir/team-dev-$pkgver"
+  export CARGO_TARGET_DIR="$srcdir/target"
+  cargo test --release --locked --workspace
+}
+
+package() {
+  local root="$srcdir/team-dev-$pkgver"
+  install -Dm755 "$srcdir/target/release/jg-team-dev" "$pkgdir/usr/bin/jg-team-dev"
+  install -Dm755 "$srcdir/target/release/jg-team-dev-hub" "$pkgdir/usr/bin/jg-team-dev-hub"
+  install -Dm755 "$srcdir/target/release/jg-team-dev-desktop" "$pkgdir/usr/bin/jg-team-dev-desktop"
+  install -Dm644 "$root/packaging/jg-team-dev-hub.service" "$pkgdir/usr/lib/systemd/user/jg-team-dev-hub.service"
+  install -Dm644 "$root/packaging/jg-team-dev.desktop" "$pkgdir/usr/share/applications/jg-team-dev.desktop"
+  install -Dm644 "$root/packaging/jg-team-dev.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/jg-team-dev.svg"
+  install -Dm644 "$root/README.md" "$pkgdir/usr/share/doc/jg-team-dev/README.md"
+  install -Dm644 "$root/LICENSE" "$pkgdir/usr/share/licenses/jg-team-dev/LICENSE"
+}
