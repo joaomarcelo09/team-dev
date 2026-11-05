@@ -152,6 +152,67 @@ pub async fn wake(client: &crate::HubClient, session: &crate::Session) -> Result
     Ok(())
 }
 
+/// The workspace folder for `session`, if it belongs to a team.
+pub fn session_workspace(session: &crate::Session, sessions: &[crate::Session]) -> Option<String> {
+    if session.is_coordinator() {
+        return session
+            .cwd
+            .as_deref()
+            .map(normalize_folder)
+            .filter(|k| !k.is_empty())
+            .map(str::to_string);
+    }
+    if session.is_worker() {
+        if let Some(parent_id) = session.parent_id.as_deref()
+            && let Some(parent) = sessions.iter().find(|p| p.id == parent_id && p.is_coordinator())
+        {
+            return parent
+                .cwd
+                .as_deref()
+                .map(normalize_folder)
+                .filter(|k| !k.is_empty())
+                .map(str::to_string);
+        }
+        if let Some(folder) = session
+            .cwd
+            .as_deref()
+            .map(normalize_folder)
+            .filter(|k| !k.is_empty())
+            && coordinator_for(sessions, folder).is_some()
+        {
+            return Some(folder.to_string());
+        }
+    }
+    None
+}
+
+/// The Coordinator for `ws`: the newest live Coordinator of that folder.
+pub fn coordinator_for<'a>(sessions: &'a [crate::Session], ws: &str) -> Option<&'a crate::Session> {
+    let ws_norm = normalize_folder(ws);
+    if ws_norm.is_empty() {
+        return None;
+    }
+    let mut coords: Vec<&'a crate::Session> = sessions
+        .iter()
+        .filter(|s| {
+            s.is_coordinator()
+                && s.cwd.as_deref().map(normalize_folder) == Some(ws_norm)
+        })
+        .collect();
+    if coords.is_empty() {
+        return None;
+    }
+    coords.sort_by_key(|s| {
+        (
+            s.status != crate::SessionStatus::Ended,
+            !s.archived,
+            s.last_message_at.unwrap_or(s.updated_at),
+            s.created_at,
+        )
+    });
+    coords.pop()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1898,4 +1898,85 @@ mod board {
         assert_eq!(reopened.done_at, None);
         assert_eq!(t.hub.tasks(WS, false).unwrap().len(), 1);
     }
+
+    #[test]
+    fn delete_workspace_removes_sessions_and_tasks_but_keeps_counters() {
+        let hub = hub();
+        let folder_a = "/tmp/test/folder-a";
+        let folder_b = "/tmp/test/folder-b";
+
+        let coord_a = session(&hub, "coord_a", jgt_core::COORDINATOR, folder_a, None);
+        let worker_a = session(&hub, "worker_a", "coder", folder_a, Some(&coord_a.id));
+        let archived_a = session(&hub, "archived_a", "reviewer", folder_a, Some(&coord_a.id));
+        hub.patch(&archived_a.id, &PatchSessionRequest { archived: Some(true), ..Default::default() }, true).unwrap();
+
+        let coord_b = session(&hub, "coord_b", jgt_core::COORDINATOR, folder_b, None);
+        let worker_b = session(&hub, "worker_b", "coder", folder_b, Some(&coord_b.id));
+
+        let task_a1 = hub.create_task(&CreateTaskRequest {
+            actor: ActorRequest::User,
+            workspace: folder_a.into(),
+            title: "task a1".into(),
+            description: String::new(),
+            priority: None,
+            status: None,
+            parent_id: None,
+        }).unwrap();
+        let task_a2 = hub.create_task(&CreateTaskRequest {
+            actor: ActorRequest::User,
+            workspace: folder_a.into(),
+            title: "task a2".into(),
+            description: String::new(),
+            priority: None,
+            status: None,
+            parent_id: None,
+        }).unwrap();
+        assert_eq!((task_a1.key.as_str(), task_a2.key.as_str()), ("JGT-1", "JGT-2"));
+
+        let task_b1 = hub.create_task(&CreateTaskRequest {
+            actor: ActorRequest::User,
+            workspace: folder_b.into(),
+            title: "task b1".into(),
+            description: String::new(),
+            priority: None,
+            status: None,
+            parent_id: None,
+        }).unwrap();
+        assert_eq!(task_b1.key.as_str(), "JGT-1");
+
+        let all_sessions = hub.db.sessions(true).unwrap();
+        assert!(all_sessions.iter().any(|s| s.id == coord_a.id));
+        assert!(all_sessions.iter().any(|s| s.id == worker_a.id));
+        assert!(all_sessions.iter().any(|s| s.id == archived_a.id));
+        assert!(all_sessions.iter().any(|s| s.id == coord_b.id));
+        assert!(all_sessions.iter().any(|s| s.id == worker_b.id));
+
+        assert_eq!(hub.tasks(folder_a, true).unwrap().len(), 2);
+        assert_eq!(hub.tasks(folder_b, true).unwrap().len(), 1);
+
+        hub.delete_workspace(&format!("{folder_a}/")).unwrap();
+
+        let remaining_sessions = hub.db.sessions(true).unwrap();
+        assert!(!remaining_sessions.iter().any(|s| s.id == coord_a.id));
+        assert!(!remaining_sessions.iter().any(|s| s.id == worker_a.id));
+        assert!(!remaining_sessions.iter().any(|s| s.id == archived_a.id));
+
+        assert!(hub.tasks(folder_a, true).unwrap().is_empty());
+
+        assert!(remaining_sessions.iter().any(|s| s.id == coord_b.id));
+        assert!(remaining_sessions.iter().any(|s| s.id == worker_b.id));
+        assert_eq!(hub.tasks(folder_b, true).unwrap().len(), 1);
+        assert_eq!(hub.task(&task_b1.id, Some(folder_b)).unwrap().id, task_b1.id);
+
+        let task_a3 = hub.create_task(&CreateTaskRequest {
+            actor: ActorRequest::User,
+            workspace: folder_a.into(),
+            title: "task a3".into(),
+            description: String::new(),
+            priority: None,
+            status: None,
+            parent_id: None,
+        }).unwrap();
+        assert_eq!(task_a3.key, "JGT-3");
+    }
 }

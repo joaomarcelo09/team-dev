@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use jgt_core::{Event, Harness, api::*};
 use serde::Deserialize;
@@ -56,6 +56,7 @@ pub fn router(hub: SharedHub) -> Router {
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/register", post(register))
         .route("/v1/sessions/{id}", get(get_session).patch(patch_session).delete(delete_session))
+        .route("/v1/workspaces", delete(delete_workspace))
         .route("/v1/sessions/{id}/claim-coordinator", post(claim_coordinator_handler))
         .route("/v1/sessions/{id}/state", post(set_state))
         .route("/v1/sessions/{id}/end", post(end_session))
@@ -148,6 +149,19 @@ async fn patch_session(
 
 async fn delete_session(State(hub): State<SharedHub>, Path(id): Path<String>) -> Result<StatusCode, HubError> {
     hub.delete(&id)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct WorkspaceQuery {
+    folder: String,
+}
+
+async fn delete_workspace(
+    State(hub): State<SharedHub>,
+    Query(q): Query<WorkspaceQuery>,
+) -> Result<StatusCode, HubError> {
+    hub.delete_workspace(&q.folder)?;
     Ok(StatusCode::NO_CONTENT)
 }
 

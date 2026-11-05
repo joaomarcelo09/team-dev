@@ -98,6 +98,14 @@ pub async fn delete(session_id: String) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+pub async fn delete_workspace(folder: String) -> Result<(), String> {
+    client()
+        .delete::<serde_json::Value>(&format!("/v1/workspaces?folder={}", encode_query(&folder)))
+        .await
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 pub async fn mark_read(session_id: String) -> Result<(), String> {
     client()
         .post::<_, serde_json::Value>(&format!("/v1/sessions/{session_id}/read"), &())

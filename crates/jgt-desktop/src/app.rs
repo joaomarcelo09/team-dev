@@ -166,6 +166,7 @@ pub struct App {
     pub workers_collapsed: bool,
     pub rename: Option<String>,
     pub confirm_delete: bool,
+    pub confirm_delete_team: bool,
     pub reconnecting: bool,
     pub toast: Option<Toast>,
     pub focused: bool,
@@ -317,6 +318,10 @@ pub enum Msg {
     DeleteCancel,
     DeleteConfirm,
     Deleted(Result<(), String>),
+    DeleteTeamAsk,
+    DeleteTeamCancel,
+    DeleteTeamConfirm,
+    TeamDeleted(Result<(), String>),
     Search(String),
     ToggleArchived,
     ToggleCoordinatorCollapse(String),
@@ -406,6 +411,7 @@ impl App {
             workers_collapsed: false,
             rename: None,
             confirm_delete: false,
+            confirm_delete_team: false,
             reconnecting: false,
             toast: None,
             focused: true,
@@ -593,6 +599,7 @@ impl App {
         self.at_bottom = true;
         self.rename = None;
         self.confirm_delete = false;
+        self.confirm_delete_team = false;
         self.selecting_message = None;
         Task::batch([
             self.snap(),
@@ -736,6 +743,7 @@ impl App {
             Msg::Select(id) => self.select(id),
             Msg::SelectWorkspace(ws) => {
                 let ws_norm = jgt_core::team::normalize_folder(&ws).to_string();
+                self.confirm_delete_team = false;
                 self.workspace = Some(ws_norm.clone());
                 self.module = Module::Coordinator;
                 if let Some(coord) = coordinator_for(&self.sessions, &ws_norm) {
@@ -1216,6 +1224,58 @@ impl App {
                 self.toast(e, true);
                 Task::none()
             }
+            Msg::DeleteTeamAsk => {
+                self.confirm_delete_team = true;
+                Task::none()
+            }
+            Msg::DeleteTeamCancel => {
+                self.confirm_delete_team = false;
+                Task::none()
+            }
+            Msg::DeleteTeamConfirm => {
+                self.confirm_delete_team = false;
+                match self.workspace.clone() {
+                    Some(ws) => Task::perform(hub::delete_workspace(ws), Msg::TeamDeleted),
+                    None => Task::none(),
+                }
+            }
+            Msg::TeamDeleted(Ok(())) => {
+                self.toast("Team deleted", false);
+                if let Some(ws) = self.workspace.take() {
+                    self.boards.remove(&ws);
+                    self.boards.remove(&format!("{ws}/"));
+                    if let Some(s) = self.selected_session()
+                        && session_workspace(s, &self.sessions).as_deref() == Some(&ws)
+                    {
+                        self.selected = None;
+                    }
+                    if let Some(id) = &self.selected
+                        && !self.sessions.iter().any(|s| s.id == *id)
+                    {
+                        self.selected = None;
+                    }
+                    let other = workspaces(&self.sessions).into_iter().find(|w| w.key != ws);
+                    let select_task = if let Some(other) = other {
+                        self.workspace = Some(other.key.clone());
+                        self.module = Module::Coordinator;
+                        if let Some(coord) = coordinator_for(&self.sessions, &other.key) {
+                            self.select(coord.id.clone())
+                        } else {
+                            Task::none()
+                        }
+                    } else {
+                        self.workspace = None;
+                        Task::none()
+                    };
+                    Task::batch([select_task, Task::perform(hub::sessions(), Msg::SessionsLoaded)])
+                } else {
+                    Task::perform(hub::sessions(), Msg::SessionsLoaded)
+                }
+            }
+            Msg::TeamDeleted(Err(e)) => {
+                self.toast(e, true);
+                Task::none()
+            }
             Msg::Done(Ok(())) => Task::none(),
             Msg::Search(text) => {
                 self.search = text;
@@ -1597,68 +1657,7 @@ pub(crate) fn apply_agents(config: &mut Config, agents: &[AgentRow]) {
     }
 }
 
-/// The workspace folder for `session`, if it belongs to a team.
-pub fn session_workspace(session: &Session, sessions: &[Session]) -> Option<String> {
-    if session.is_coordinator() {
-        return session
-            .cwd
-            .as_deref()
-            .map(jgt_core::team::normalize_folder)
-            .filter(|k| !k.is_empty())
-            .map(str::to_string);
-    }
-    if session.is_worker() {
-        if let Some(parent_id) = session.parent_id.as_deref()
-            && let Some(parent) = sessions.iter().find(|p| p.id == parent_id && p.is_coordinator())
-        {
-            return parent
-                .cwd
-                .as_deref()
-                .map(jgt_core::team::normalize_folder)
-                .filter(|k| !k.is_empty())
-                .map(str::to_string);
-        }
-        if let Some(folder) = session
-            .cwd
-            .as_deref()
-            .map(jgt_core::team::normalize_folder)
-            .filter(|k| !k.is_empty())
-            && coordinator_for(sessions, folder).is_some()
-        {
-            return Some(folder.to_string());
-        }
-    }
-    None
-}
-
-/// The Coordinator for `ws`: the newest live Coordinator of that folder.
-// used from step 4 on
-#[allow(dead_code)]
-pub fn coordinator_for<'a>(sessions: &'a [Session], ws: &str) -> Option<&'a Session> {
-    let ws_norm = jgt_core::team::normalize_folder(ws);
-    if ws_norm.is_empty() {
-        return None;
-    }
-    let mut coords: Vec<&'a Session> = sessions
-        .iter()
-        .filter(|s| {
-            s.is_coordinator()
-                && s.cwd.as_deref().map(jgt_core::team::normalize_folder) == Some(ws_norm)
-        })
-        .collect();
-    if coords.is_empty() {
-        return None;
-    }
-    coords.sort_by_key(|s| {
-        (
-            s.status != SessionStatus::Ended,
-            !s.archived,
-            s.last_message_at.unwrap_or(s.updated_at),
-            s.created_at,
-        )
-    });
-    coords.pop()
-}
+pub use jgt_core::team::{coordinator_for, session_workspace};
 
 /// Saved agents if the selected workspace has a connected Coordinator session (user decision 1a).
 // used from M4 on
@@ -2109,6 +2108,37 @@ mod tests {
         assert_eq!(app.selected, None);
         assert_eq!(app.module, Module::Board, "Module::Board must survive even if selected session vanished");
         assert_eq!(app.workspace.as_deref(), Some("/team1_refreshed"), "Workspace must not be cleared unexpectedly");
+    }
+
+    #[test]
+    fn team_delete_ask_cancel_and_selection_reset() {
+        let c1 = make_session("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false);
+        let c2 = make_session("c2", Some(jgt_core::COORDINATOR), None, Some("/team2"), SessionStatus::Active, false);
+
+        let (mut app, _) = App::new(None);
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c1.clone(), c2.clone()])));
+        let _ = app.update(Msg::SelectWorkspace("/team1".to_string()));
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+
+        // DeleteTeamAsk sets confirmation flag
+        let _ = app.update(Msg::DeleteTeamAsk);
+        assert!(app.confirm_delete_team);
+
+        // DeleteTeamCancel clears confirmation flag
+        let _ = app.update(Msg::DeleteTeamCancel);
+        assert!(!app.confirm_delete_team);
+
+        // TeamDeleted when another team (/team2) exists: switches to /team2
+        let _ = app.update(Msg::TeamDeleted(Ok(())));
+        assert_eq!(app.workspace.as_deref(), Some("/team2"));
+        assert_eq!(app.selected.as_deref(), Some("c2"));
+
+        // Update sessions so only /team2 exists, then delete /team2
+        let _ = app.update(Msg::SessionsLoaded(Ok(vec![c2])));
+        let _ = app.update(Msg::TeamDeleted(Ok(())));
+        assert_eq!(app.workspace, None);
+        assert_eq!(app.selected, None);
     }
 
     #[test]
