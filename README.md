@@ -182,6 +182,41 @@ runs without one. `jg-team-dev worker … --model <m> --effort <e>` overrides on
 Settings apply when a team starts (saved in `.team/agents.json` when the Coordinator starts);
 editing `config.toml` afterwards does not change a running team.
 
+## Installation
+
+### From AUR (Arch Linux)
+
+Once published, the AUR package can be installed using an AUR helper:
+
+```sh
+yay -S jg-team-dev
+# or
+paru -S jg-team-dev
+```
+
+### From Source (makepkg)
+
+To build and install the package locally from this repository:
+
+```sh
+cd packaging && makepkg -si
+```
+
+### Runtime Requirements
+
+- **Claude Code** (`claude-code`): required for agent sessions.
+- **Vulkan driver** (`vulkan-icd-loader`): optional, enables GPU-accelerated rendering.
+
+### First Start
+
+1. Enable and start the background hub service:
+   ```sh
+   systemctl --user enable --now jg-team-dev-hub
+   ```
+2. Open **JG Team Dev** from your application launcher or run `jg-team-dev-desktop`.
+
+For packaging and publishing instructions, see the [AUR Maintainer Guide](docs/AUR.md).
+
 ## Development
 
 ```sh
