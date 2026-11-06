@@ -50,9 +50,9 @@ fn users_own_move(from: TaskStatus, to: TaskStatus) -> bool {
     )
 }
 
-/// Roles whose results the hub records: the verifier does both jobs in one pass (PRD E3).
-const TEST_ROLES: &[&str] = &["tester", "verifier"];
-const REVIEW_ROLES: &[&str] = &["reviewer", "verifier"];
+/// Roles whose results the hub records: coder records tests, reviewer records reviews.
+const TEST_ROLES: &[&str] = &["coder"];
+const REVIEW_ROLES: &[&str] = &["reviewer"];
 
 /// What a Board write changed, published once its transaction committed.
 #[derive(Default)]
@@ -110,7 +110,7 @@ fn validate_findings(input: &[FindingInput]) -> HubResult<Vec<Finding>> {
         .map(|(i, f)| {
             let n = i + 1;
             let label = f.severity.as_deref().map(Severity::from_label);
-            // A verifier's `severity: critical` is enough; a reviewer marks `critical` itself.
+            // `severity: critical` is enough; otherwise mark `critical` directly.
             let critical = f.critical.or(label.map(|l| l == Severity::Critical)).ok_or_else(|| {
                 HubError::BadRequest(format!("finding {n}: mark it critical or non-critical (K17)"))
             })?;
@@ -781,8 +781,7 @@ impl Hub {
         Ok(session)
     }
 
-    /// Records the test (task in Testing) or the review (task in Review) of the current pass. A
-    /// verifier's one result is recorded twice: its test in Testing, its review in Review.
+    /// Records the test (task in Testing) or the review (task in Review) of the current pass.
     pub fn record_results(&self, id: &str, workspace: Option<&str>, req: &ResultRequest) -> HubResult<Task> {
         let task = self.task(id, workspace)?;
         let actor = self.writer(&req.actor, &task.workspace)?;
@@ -810,12 +809,7 @@ impl Hub {
                     let meta = json!({
                         "status": test.status, "worker": test.worker, "failures": test.failures, "role": worker.role,
                     });
-                    let body = match worker.role.as_deref() {
-                        Some("verifier") => format!("verified by verifier {}: {}", jgt_core::short_id(&worker.id), test.summary)
-                            .trim()
-                            .to_string(),
-                        _ => test.summary.clone(),
-                    };
+                    let body = test.summary.clone();
                     changes.log(b, &task.id, TaskEventKind::TestResult, &actor, &body, meta)?;
                     Ok(())
                 })?;
@@ -863,12 +857,7 @@ impl Hub {
                     });
                     task.review_result = Some(result);
                     b.save(&task)?;
-                    let body = match worker.role.as_deref() {
-                        Some("verifier") => {
-                            format!("verified by verifier {} — round {round}: {}", jgt_core::short_id(&worker.id), review.decision)
-                        }
-                        _ => format!("round {round}: {}", review.decision),
-                    };
+                    let body = format!("round {round}: {}", review.decision);
                     changes.log(b, &task.id, TaskEventKind::ReviewResult, &actor, &body, meta)?;
                     Ok(())
                 })?;

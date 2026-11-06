@@ -273,7 +273,7 @@ pub struct MoveResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TestResultInput {
     pub status: TestStatus,
-    /// Hub id of the tester session.
+    /// Hub id of the coder session.
     pub worker: String,
     #[serde(default)]
     pub summary: String,
