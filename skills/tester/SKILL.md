@@ -18,6 +18,20 @@ description: jg-team-dev tester worker. Runs independent validation from a valid
 - If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when you
   were started with `--task-id`); never move cards: the Coordinator does.
 
+## Secrets and .env files
+
+- Never read, open, print, copy, write, edit or commit: `.env` and `.env.*` files (except
+  `.env.example`, `.env.sample` and `.env.template`, which hold no real values), private keys
+  (`*.pem`, `*.key`, `id_rsa*`), credential files (`credentials*`, `*.p12`, `.npmrc`/`.pypirc`
+  with tokens, cloud CLI config) or any other secret or sensitive value.
+- Do not dump the environment (`env`, `printenv`, `set`, `echo $TOKEN`) and do not put secret
+  values in logs, briefs, chat messages, result files or test fixtures.
+- If the task seems to need a secret, stop and report it (status `environment_blocked`);
+  never go looking for it. Use `.env.example` and placeholders instead.
+- If you come across a secret by accident, do not repeat it: name only the file and variable.
+- Never read `.env` to run checks: missing secrets mean `environment_blocked`, not a failure to
+  work around. Scan the diff for a committed secret and report it as a `critical` `secret` finding (in `failures`).
+
 ## How you work
 
 - You are a fresh Claude Code session started headless by the Coordinator. You know nothing but

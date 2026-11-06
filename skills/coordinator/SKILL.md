@@ -67,6 +67,20 @@ is thrown away when it finishes. So work costs far less in a worker than in you:
   back to. Open a worker's `Full result` file only when its digest is not enough, and read only
   the part you need.
 
+## Secrets and .env files
+
+- Never read, open, print, copy, write, edit or commit: `.env` and `.env.*` files (except
+  `.env.example`, `.env.sample` and `.env.template`, which hold no real values), private keys
+  (`*.pem`, `*.key`, `id_rsa*`), credential files (`credentials*`, `*.p12`, `.npmrc`/`.pypirc`
+  with tokens, cloud CLI config) or any other secret or sensitive value.
+- Do not dump the environment (`env`, `printenv`, `set`, `echo $TOKEN`) and do not put secret
+  values in logs, briefs, chat messages, result files or test fixtures.
+- If the task seems to need a secret, stop and `chat_ask` the user how to proceed; never go
+  looking for it. Use `.env.example` and placeholders instead.
+- If you come across a secret by accident, do not repeat it: name only the file and variable.
+- Never put secret values in briefs, task details or chat; when a task needs one, `chat_ask` the
+  user how to proceed.
+
 ## Workers
 
 You run a team of workers. Each is a fresh session with one skill and a clean context: it knows
