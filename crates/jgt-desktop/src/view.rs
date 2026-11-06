@@ -1740,22 +1740,45 @@ fn question_view<'a>(
 
     match &m.question {
         Some(q) if q.status == QuestionStatus::Pending && s.status != SessionStatus::Ended => {
-            let mut buttons = row![].spacing(8);
-            for option in &q.options {
-                let style = match option.as_str() {
-                    "Allow" | "Yes" => style::success_button,
-                    "Deny" | "No" => style::danger_button,
-                    _ => style::pill_button,
-                };
-                buttons = buttons.push(
-                    button(text(option.as_str()).size(style::fs(13)))
+            if permission {
+                let mut buttons = row![].spacing(8);
+                for option in &q.options {
+                    let style = match option.as_str() {
+                        "Allow" | "Yes" => style::success_button,
+                        "Deny" | "No" => style::danger_button,
+                        _ => style::pill_button,
+                    };
+                    buttons = buttons.push(
+                        button(text(option.as_str()).size(style::fs(13)))
+                            .on_press(Msg::Answer { question: q.id.clone(), answer: option.clone() })
+                            .style(style)
+                            .padding([6, 14]),
+                    );
+                }
+                col = col.push(buttons);
+            } else {
+                let mut buttons = column![].spacing(6).width(Fill);
+                for option in &q.options {
+                    let style = match option.as_str() {
+                        "Allow" | "Yes" => style::success_button,
+                        "Deny" | "No" => style::danger_button,
+                        _ => style::pill_button,
+                    };
+                    buttons = buttons.push(
+                        button(
+                            text(option.as_str())
+                                .size(style::fs(13))
+                                .width(Fill)
+                                .align_x(iced::alignment::Horizontal::Left)
+                                .wrapping(iced::widget::text::Wrapping::Word),
+                        )
                         .on_press(Msg::Answer { question: q.id.clone(), answer: option.clone() })
                         .style(style)
-                        .padding([6, 14]),
-                );
-            }
-            col = col.push(buttons);
-            if !permission {
+                        .padding([6, 14])
+                        .width(Fill),
+                    );
+                }
+                col = col.push(buttons);
                 let draft = app.answers.get(&q.id).map(String::as_str).unwrap_or("");
                 let qid = q.id.clone();
                 let qid2 = q.id.clone();
@@ -2437,5 +2460,66 @@ mod tests {
                 "Row width ({total_row_width}px) exceeds usable width ({usable_width}px) at fs(14)={fs14}"
             );
         }
+    }
+
+    #[test]
+    fn test_question_view_renders_short_and_long_options_and_permissions() {
+        let (app, _) = App::new(None);
+        let s = test_session("s1", Some("coordinator"), None, SessionStatus::Active, false);
+        let thread = Thread::default();
+        let theme = app.theme();
+        let mut md_style = markdown::Style::from_palette(theme.palette());
+        md_style.font = style::ui_font();
+        let settings = markdown::Settings::with_text_size(style::fs(14), md_style);
+
+        let make_msg = |id: i64, kind: MessageKind, q: Option<jgt_core::Question>| Message {
+            id,
+            session_id: "s1".to_string(),
+            direction: Direction::FromAgent,
+            kind,
+            body: "Test message body".to_string(),
+            created_at: 1000,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: q,
+        };
+
+        let make_q = |id: &str, kind: MessageKind, options: Vec<&str>| jgt_core::Question {
+            id: id.to_string(),
+            session_id: "s1".to_string(),
+            message_id: 1,
+            options: options.into_iter().map(String::from).collect(),
+            status: QuestionStatus::Pending,
+            answer: None,
+            answered_at: None,
+            created_at: 1000,
+            expires_at: None,
+            prompt: "Prompt".to_string(),
+            kind,
+        };
+
+        // 1. Permission message (options in a row)
+        let perm_q = make_q("q1", MessageKind::Permission, vec!["Allow", "Deny"]);
+        let perm_msg = make_msg(1, MessageKind::Permission, Some(perm_q));
+        let _ = question_view(&app, &s, &thread, &perm_msg, None, settings, &theme);
+
+        // 2. Question with long pre-made options (column with wrapping text)
+        let long_q = make_q(
+            "q2",
+            MessageKind::Question,
+            vec![
+                "Strategy A: Make the options wrap/stack so long labels are fully readable inside the card with Fill width",
+                "Strategy B: Implement a custom wrapping layout widget that measures text dimensions dynamically",
+            ],
+        );
+        let long_q_msg = make_msg(2, MessageKind::Question, Some(long_q));
+        let _ = question_view(&app, &s, &thread, &long_q_msg, None, settings, &theme);
+
+        // 3. Question with short options
+        let short_q = make_q("q3", MessageKind::Question, vec!["Yes", "No"]);
+        let short_q_msg = make_msg(3, MessageKind::Question, Some(short_q));
+        let _ = question_view(&app, &s, &thread, &short_q_msg, None, settings, &theme);
     }
 }
