@@ -339,6 +339,9 @@ pub enum Msg {
     // used by M5
     #[allow(dead_code)]
     SetAgentModel(String, String),
+    // used by M5
+    #[allow(dead_code)]
+    SetAgentEffort(String, String),
     ModelsListed(Harness, Result<Vec<String>, String>),
     // used by M5
     #[allow(dead_code)]
@@ -1435,12 +1438,23 @@ impl App {
                         .cloned()
                         .unwrap_or_default();
                     agent.model = first_model;
+                    let levels = jgt_core::harness::effort_levels(harness);
+                    if !levels.is_empty() && !levels.contains(&agent.effort.as_str()) {
+                        let effort = jgt_core::harness::nearest_effort(harness, &agent.effort).unwrap_or(levels[0]);
+                        agent.effort = effort.to_string();
+                    }
                 }
                 Task::none()
             }
             Msg::SetAgentModel(role, model) => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
                     agent.model = model;
+                }
+                Task::none()
+            }
+            Msg::SetAgentEffort(role, effort) => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
+                    agent.effort = effort;
                 }
                 Task::none()
             }
@@ -2490,6 +2504,53 @@ allowed_tools = ["Bash"]
         assert_eq!(
             app.harness_models.get(&Harness::Opencode),
             Some(&Ok(vec!["anthropic/claude-3".into()]))
+        );
+
+        // SetAgentEffort on worker: updates effort
+        let _ = app.update(Msg::SetAgentEffort("coder".into(), "xhigh".into()));
+        assert_eq!(app.agents[0].effort, "xhigh");
+
+        // SetAgentEffort on coordinator: updates effort
+        let _ = app.update(Msg::SetAgentEffort("coordinator".into(), "low".into()));
+        assert_eq!(app.agents[1].effort, "low");
+
+        // Harness without levels (Opencode) keeps effort intact
+        let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::Opencode));
+        assert_eq!(app.agents[0].harness, Harness::Opencode);
+        assert_eq!(app.agents[0].effort, "xhigh");
+
+        // Harness switch clamps effort when switching to a harness with levels and effort is not one of them
+        app.agents[0].effort = "unsupported".into();
+        let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::Antigravity));
+        assert_eq!(app.agents[0].harness, Harness::Antigravity);
+        assert_eq!(app.agents[0].effort, "low");
+    }
+
+    #[test]
+    fn test_apply_agents_writes_effort() {
+        let mut config = Config::default();
+        let agents = vec![
+            AgentRow {
+                role: "coder".into(),
+                harness: Harness::Antigravity,
+                model: "gemini-3.8-flash-high".into(),
+                effort: "xhigh".into(),
+            },
+            AgentRow {
+                role: "coordinator".into(),
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "low".into(),
+            },
+        ];
+        apply_agents(&mut config, &agents);
+        assert_eq!(
+            config.team.skills.get("coder").and_then(|s| s.effort.as_deref()),
+            Some("xhigh")
+        );
+        assert_eq!(
+            config.team.skills.get("coordinator").and_then(|s| s.effort.as_deref()),
+            Some("low")
         );
     }
 
