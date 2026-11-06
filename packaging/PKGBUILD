@@ -5,15 +5,16 @@
 
 pkgname=jg-team-dev
 pkgver=0.1.0
-pkgrel=8
+pkgrel=12
 pkgdesc="Chat with a Claude Code Coordinator that runs a team of worker sessions"
 arch=('x86_64')
 license=('MIT')
-depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'fontconfig' 'ttf-liberation')
-makedepends=('cargo')
+depends=('gcc-libs' 'glibc' 'libxkbcommon' 'wayland' 'fontconfig' 'ttf-liberation' 'alsa-lib')
+makedepends=('cargo' 'cmake' 'clang')
 optdepends=(
   'vulkan-icd-loader: GPU-accelerated rendering'
   'claude-code: Claude Code agent sessions'
+  'piper-tts: local speech for the call mode'
 )
 install=jg-team-dev.install
 options=('!lto' '!debug')
@@ -25,13 +26,17 @@ _root() {
 build() {
   cd "$(_root)"
   export CARGO_TARGET_DIR="$(_root)/target"
-  cargo build --release --locked --workspace
+  # whisper.cpp / ggml requires AVX2 (CPUs from 2013+).
+  # makepkg default CFLAGS (-march=x86-64) disables SIMD in whisper-rs-sys unless overridden.
+  export GGML_NATIVE=OFF GGML_AVX=ON GGML_AVX2=ON GGML_FMA=ON GGML_F16C=ON
+  cargo build --release --locked --workspace --features jgt-desktop/voice
 }
 
 check() {
   cd "$(_root)"
   export CARGO_TARGET_DIR="$(_root)/target"
-  cargo test --release --locked --workspace
+  export GGML_NATIVE=OFF GGML_AVX=ON GGML_AVX2=ON GGML_FMA=ON GGML_F16C=ON
+  cargo test --release --locked --workspace --features jgt-desktop/voice
 }
 
 package() {

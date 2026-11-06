@@ -9,6 +9,55 @@ mod view;
 
 use jgt_core::{HubClient, api::HealthResponse};
 
+const MAX_LOG_SIZE_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
+/// Truncates the log file if its size exceeds `max_bytes`.
+pub(crate) fn rotate_if_needed(path: &std::path::Path, max_bytes: u64) {
+    if let Ok(metadata) = std::fs::metadata(path)
+        && metadata.len() > max_bytes
+    {
+        let _ = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path);
+    }
+}
+
+/// Installs a tracing subscriber appending to `~/.local/share/jg-team-dev/logs/desktop.log`.
+pub(crate) fn init_logging() {
+    let log_dir = jgt_core::paths::data_dir().join("logs");
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Failed to create log directory {}: {e}", log_dir.display());
+    }
+
+    let log_file_path = log_dir.join("desktop.log");
+    rotate_if_needed(&log_file_path, MAX_LOG_SIZE_BYTES);
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("jgt_desktop=info,jgt_voice=debug"));
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+    {
+        Ok(file) => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(file)
+                .with_ansi(false)
+                .try_init();
+        }
+        Err(e) => {
+            eprintln!("Failed to open log file {}: {e}", log_file_path.display());
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_ansi(false)
+                .try_init();
+        }
+    }
+}
+
 fn main() -> iced::Result {
     let mut args = std::env::args().skip(1);
     let mut session = None;
@@ -22,6 +71,10 @@ fn main() -> iced::Result {
             _ => {}
         }
     }
+
+    init_logging();
+    tracing::info!("jg-team-dev-desktop starting (version {})", env!("CARGO_PKG_VERSION"));
+
     if focus_running_instance(session.clone()) {
         return Ok(());
     }
@@ -58,4 +111,30 @@ fn focus_running_instance(session: Option<String>) -> bool {
             _ => false,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rotate_if_needed_truncates_large_file() {
+        let temp_dir = std::env::temp_dir().join(format!("jgt-log-test-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let log_path = temp_dir.join("desktop.log");
+
+        // Write 100 bytes
+        std::fs::write(&log_path, vec![b'a'; 100]).unwrap();
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 100);
+
+        // Threshold 200: should NOT truncate
+        rotate_if_needed(&log_path, 200);
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 100);
+
+        // Threshold 50: SHOULD truncate
+        rotate_if_needed(&log_path, 50);
+        assert_eq!(std::fs::metadata(&log_path).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

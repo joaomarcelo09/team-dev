@@ -233,6 +233,191 @@ pub struct App {
     /// Highest message id seen, so only new messages mark the window urgent.
     last_message_id: i64,
     start_session: Option<String>,
+    #[cfg(feature = "voice")]
+    pub call: Option<CallState>,
+    #[cfg(feature = "voice")]
+    next_call_id: u64,
+    #[cfg(feature = "voice")]
+    pub voice_enabled: bool,
+    #[cfg(feature = "voice")]
+    pub voice_speak_updates: bool,
+    #[cfg(feature = "voice")]
+    pub voice_echo: String,
+    #[cfg(feature = "voice")]
+    pub voice_download_state: VoiceDownloadState,
+}
+
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum VoiceDownloadState {
+    Idle,
+    Confirming,
+    Downloading {
+        progress: Option<jgt_voice::Progress>,
+    },
+    Failed(String),
+    Completed,
+}
+
+#[cfg(feature = "voice")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallStatus {
+    Listening,
+    Hearing,
+    Transcribing,
+    Sent(String),
+    Speaking,
+    Muted,
+    NoAudio,
+    Error(String),
+}
+
+#[cfg(feature = "voice")]
+impl CallStatus {
+    pub fn label(&self) -> String {
+        match self {
+            CallStatus::Listening => "Listening…".into(),
+            CallStatus::Hearing => "Hearing you…".into(),
+            CallStatus::Transcribing => "Transcribing…".into(),
+            CallStatus::Sent(preview) => format!("Sent: {preview}"),
+            CallStatus::Speaking => "Speaking…".into(),
+            CallStatus::Muted => "Muted".into(),
+            CallStatus::NoAudio => "No audio from the microphone".into(),
+            CallStatus::Error(msg) => msg.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "voice")]
+pub struct CallState {
+    pub workspace: String,
+    pub session_id: String,
+    pub muted: bool,
+    pub status: CallStatus,
+    pub started_at: i64,
+    pub handle: Option<jgt_voice::CallHandle>,
+    pub id: u64,
+    pub echo_mode: String,
+}
+
+#[cfg(feature = "voice")]
+pub fn call_status_label(status: &CallStatus) -> String {
+    status.label()
+}
+
+#[cfg(feature = "voice")]
+pub fn on_voice_event(
+    current_status: &CallStatus,
+    current_muted: bool,
+    event: &jgt_voice::VoiceEvent,
+) -> (CallStatus, bool) {
+    match event {
+        jgt_voice::VoiceEvent::Listening => (CallStatus::Listening, false),
+        jgt_voice::VoiceEvent::Hearing => {
+            if current_muted {
+                (current_status.clone(), true)
+            } else {
+                (CallStatus::Hearing, false)
+            }
+        }
+        jgt_voice::VoiceEvent::Transcribing => {
+            if current_muted {
+                (current_status.clone(), true)
+            } else {
+                (CallStatus::Transcribing, false)
+            }
+        }
+        jgt_voice::VoiceEvent::NoAudio => (CallStatus::NoAudio, current_muted),
+        jgt_voice::VoiceEvent::Muted => (CallStatus::Muted, true),
+        jgt_voice::VoiceEvent::UserSpeech(text) => {
+            let preview: String = text.chars().take(40).collect();
+            (CallStatus::Sent(preview), current_muted)
+        }
+        jgt_voice::VoiceEvent::Speaking => (CallStatus::Speaking, current_muted),
+        jgt_voice::VoiceEvent::SpeakingDone => {
+            if current_muted {
+                (CallStatus::Muted, true)
+            } else {
+                (CallStatus::Listening, false)
+            }
+        }
+        jgt_voice::VoiceEvent::Error => (
+            CallStatus::Error("Voice error encountered in call session".into()),
+            current_muted,
+        ),
+    }
+}
+
+#[cfg(feature = "voice")]
+pub fn toggle_mute(
+    current_status: &CallStatus,
+    currently_muted: bool,
+) -> (jgt_voice::VoiceControl, CallStatus, bool) {
+    let new_muted = !currently_muted;
+    let control = if new_muted {
+        jgt_voice::VoiceControl::Mute
+    } else {
+        jgt_voice::VoiceControl::Unmute
+    };
+    let new_status = if new_muted {
+        match current_status {
+            CallStatus::Listening
+            | CallStatus::Hearing
+            | CallStatus::Transcribing
+            | CallStatus::NoAudio => CallStatus::Muted,
+            _ => current_status.clone(),
+        }
+    } else if *current_status == CallStatus::Muted {
+        CallStatus::Listening
+    } else {
+        current_status.clone()
+    };
+    (control, new_status, new_muted)
+}
+
+#[cfg(feature = "voice")]
+pub fn should_speak_message(
+    message: &Message,
+    coordinator_session_id: &str,
+    call_started_at: i64,
+    speak_updates: bool,
+) -> bool {
+    if !speak_updates {
+        return false;
+    }
+    if message.session_id != coordinator_session_id {
+        return false;
+    }
+    if message.direction != Direction::FromAgent {
+        return false;
+    }
+    if message.created_at < call_started_at {
+        return false;
+    }
+    matches!(
+        message.kind,
+        MessageKind::Text | MessageKind::Reply | MessageKind::Notify | MessageKind::Question
+    )
+}
+
+#[cfg(feature = "voice")]
+pub fn voice_readiness(config: &jgt_core::config::Config) -> Result<(), String> {
+    if !config.voice.enabled {
+        return Err("Voice call mode is disabled (config.voice.enabled = false)".into());
+    }
+    if let Err(e) = jgt_voice::check_whisper(&config.voice.stt_model) {
+        return Err(e.to_string());
+    }
+    if let Err(e) = jgt_voice::check_piper(&config.voice.tts_voice) {
+        return Err(e.to_string());
+    }
+    let cmd = config.voice.tts_command.split_whitespace().next().unwrap_or(&config.voice.tts_command);
+    if jgt_core::launch::which(cmd).is_none() {
+        return Err(format!(
+            "Piper TTS command '{cmd}' not found; install it (`pip install piper-tts` or the distro package)"
+        ));
+    }
+    Ok(())
 }
 
 /// A step for the zoom and text-size controls.
@@ -351,6 +536,30 @@ pub enum Msg {
     DismissToast,
     Tick,
     Done(Result<(), String>),
+    #[cfg(feature = "voice")]
+    VoiceCallStart,
+    #[cfg(feature = "voice")]
+    VoiceCallToggleMute,
+    #[cfg(feature = "voice")]
+    VoiceCallEnd,
+    #[cfg(feature = "voice")]
+    Voice(jgt_voice::VoiceEvent),
+    #[cfg(feature = "voice")]
+    VoiceToggleEnabled,
+    #[cfg(feature = "voice")]
+    VoiceToggleSpeakUpdates,
+    #[cfg(feature = "voice")]
+    VoiceSetEcho(String),
+    #[cfg(feature = "voice")]
+    VoiceDownloadPromptConfirm,
+    #[cfg(feature = "voice")]
+    VoiceDownloadCancel,
+    #[cfg(feature = "voice")]
+    VoiceDownloadStart,
+    #[cfg(feature = "voice")]
+    VoiceDownloadProgress(jgt_voice::Progress),
+    #[cfg(feature = "voice")]
+    VoiceDownloadDone(Result<(), String>),
 }
 
 /// What to do with the chat scroll position when messages are loaded.
@@ -448,6 +657,18 @@ impl App {
             selecting_message: None,
             last_message_id: 0,
             start_session,
+            #[cfg(feature = "voice")]
+            call: None,
+            #[cfg(feature = "voice")]
+            next_call_id: 1,
+            #[cfg(feature = "voice")]
+            voice_enabled: config.voice.enabled,
+            #[cfg(feature = "voice")]
+            voice_speak_updates: config.voice.speak_updates,
+            #[cfg(feature = "voice")]
+            voice_echo: config.voice.echo.clone(),
+            #[cfg(feature = "voice")]
+            voice_download_state: VoiceDownloadState::Idle,
         };
         let tasks = Task::batch([
             iced::system::theme().map(Msg::SystemTheme),
@@ -484,12 +705,52 @@ impl App {
             iced::system::theme_changes().map(Msg::SystemTheme),
             keyboard::listen().map(Msg::Key),
         ];
+        #[cfg(feature = "voice")]
+        if let Some(call) = &self.call {
+            subs.push(Subscription::run_with(call.id, voice_subscription).map(Msg::Voice));
+        }
         // The Team panel counts running workers' time.
         if self.toast.is_some() || self.sessions.iter().any(|s| s.is_worker() && s.status.is_connected()) {
             subs.push(iced::time::every(Duration::from_secs(1)).map(|_| Msg::Tick));
         }
         Subscription::batch(subs)
     }
+
+    #[cfg(feature = "voice")]
+    pub fn end_call(&mut self) {
+        if let Some(call) = self.call.take()
+            && let Some(handle) = &call.handle
+        {
+            let _ = handle.send(jgt_voice::VoiceControl::End);
+        }
+        if let Ok(mut g) = VOICE_RECEIVER.lock() {
+            g.take();
+        }
+    }
+}
+
+#[cfg(feature = "voice")]
+static VOICE_RECEIVER: std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<jgt_voice::VoiceEvent>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(feature = "voice")]
+fn voice_subscription(_id: &u64) -> futures::stream::BoxStream<'static, jgt_voice::VoiceEvent> {
+    use futures::StreamExt;
+    iced::stream::channel(64, async |mut output: futures::channel::mpsc::Sender<jgt_voice::VoiceEvent>| {
+        let rx = VOICE_RECEIVER.lock().ok().and_then(|mut g| g.take());
+        if let Some(mut rx) = rx {
+            use futures::SinkExt;
+            while let Some(ev) = rx.recv().await {
+                if output.send(ev).await.is_err() {
+                    break;
+                }
+            }
+        }
+    })
+    .boxed()
+}
+
+impl App {
 
     pub fn scale_factor(&self) -> f32 {
         self.zoom
@@ -575,9 +836,24 @@ impl App {
     }
 
     fn select(&mut self, id: String) -> Task<Msg> {
-        if let Some(s) = self.sessions.iter().find(|s| s.id == id) {
-            self.workspace = session_workspace(s, &self.sessions);
-            self.module = if s.is_worker() {
+        let session_info = self
+            .sessions
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| (session_workspace(s, &self.sessions), s.is_worker()));
+        if let Some((next_ws, is_worker)) = session_info {
+            #[cfg(feature = "voice")]
+            if let Some(call) = &self.call {
+                if let Some(ref nws) = next_ws {
+                    if call.workspace != *nws {
+                        self.end_call();
+                    }
+                } else {
+                    self.end_call();
+                }
+            }
+            self.workspace = next_ws;
+            self.module = if is_worker {
                 Module::Worker(id.clone())
             } else {
                 Module::Coordinator
@@ -743,6 +1019,12 @@ impl App {
             Msg::Select(id) => self.select(id),
             Msg::SelectWorkspace(ws) => {
                 let ws_norm = jgt_core::team::normalize_folder(&ws).to_string();
+                #[cfg(feature = "voice")]
+                if let Some(call) = &self.call
+                    && call.workspace != ws_norm
+                {
+                    self.end_call();
+                }
                 self.confirm_delete_team = false;
                 self.workspace = Some(ws_norm.clone());
                 self.module = Module::Coordinator;
@@ -1328,6 +1610,11 @@ impl App {
                         self.focused = false;
                         self.presence()
                     }
+                    window::Event::CloseRequested | window::Event::Closed => {
+                        #[cfg(feature = "voice")]
+                        self.end_call();
+                        Task::none()
+                    }
                     _ => Task::none(),
                 }
             }
@@ -1350,6 +1637,13 @@ impl App {
                 if self.show_settings {
                     let config = Config::load();
                     self.popups = config.notifications.enabled;
+                    #[cfg(feature = "voice")]
+                    {
+                        self.voice_enabled = config.voice.enabled;
+                        self.voice_speak_updates = config.voice.speak_updates;
+                        self.voice_echo = config.voice.echo.clone();
+                        self.voice_download_state = VoiceDownloadState::Idle;
+                    }
                     self.config_warnings = config.team.warnings(None);
                     self.agents_locked = agents_locked_for(self);
 
@@ -1511,6 +1805,174 @@ impl App {
                 }
                 Task::none()
             }
+            #[cfg(feature = "voice")]
+            Msg::VoiceCallStart => {
+                let Some(session) = self.selected_session() else { return Task::none(); };
+                if !session.is_coordinator() {
+                    return Task::none();
+                }
+                let Some(ws) = self.workspace.clone() else { return Task::none(); };
+                let session_id = session.id.clone();
+
+                self.end_call();
+
+                let config = Config::load();
+                match jgt_voice::VoiceCall::start(&config.voice) {
+                    Ok((rx, handle)) => {
+                        let id = self.next_call_id;
+                        self.next_call_id += 1;
+                        if let Ok(mut g) = VOICE_RECEIVER.lock() {
+                            *g = Some(rx);
+                        }
+                        let echo_mode = jgt_voice::EchoMode::parse(&config.voice.echo).as_str().to_string();
+                        self.call = Some(CallState {
+                            workspace: ws,
+                            session_id,
+                            muted: false,
+                            status: CallStatus::Listening,
+                            started_at: jgt_core::now_ms(),
+                            handle: Some(handle),
+                            id,
+                            echo_mode,
+                        });
+                    }
+                    Err(e) => {
+                        let err_msg = e.to_string();
+                        self.toast(format!("Voice call failed to start: {err_msg}"), true);
+                        let id = self.next_call_id;
+                        self.next_call_id += 1;
+                        self.call = Some(CallState {
+                            workspace: ws,
+                            session_id,
+                            muted: false,
+                            status: CallStatus::Error(err_msg),
+                            started_at: jgt_core::now_ms(),
+                            handle: None,
+                            id,
+                            echo_mode: String::new(),
+                        });
+                    }
+                }
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceCallToggleMute => {
+                if let Some(call) = self.call.as_mut() {
+                    let (control, new_status, new_muted) = toggle_mute(&call.status, call.muted);
+                    if let Some(handle) = &call.handle {
+                        let _ = handle.send(control);
+                    }
+                    call.muted = new_muted;
+                    call.status = new_status;
+                }
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceCallEnd => {
+                self.end_call();
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::Voice(ev) => {
+                let Some(call) = self.call.as_mut() else { return Task::none(); };
+                let (new_status, new_muted) = on_voice_event(&call.status, call.muted, &ev);
+                call.status = new_status;
+                call.muted = new_muted;
+                match ev {
+                    jgt_voice::VoiceEvent::UserSpeech(text) => {
+                        let Some(coord) = coordinator_for(&self.sessions, &call.workspace).cloned() else {
+                            return Task::none();
+                        };
+                        if coord.status == SessionStatus::Ended {
+                            return Task::none();
+                        }
+                        Task::perform(hub::send_and_wake(coord, text), Msg::Sent)
+                    }
+                    jgt_voice::VoiceEvent::Error => {
+                        if let Some(handle) = &call.handle {
+                            handle.stop();
+                        }
+                        call.handle = None;
+                        self.toast("Voice error encountered in call session", true);
+                        Task::none()
+                    }
+                    _ => Task::none(),
+                }
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceToggleEnabled => {
+                self.voice_enabled = !self.voice_enabled;
+                let mut config = Config::load();
+                config.voice.enabled = self.voice_enabled;
+                let _ = config.save();
+                Task::perform(hub::reload_config(), Msg::Done)
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceToggleSpeakUpdates => {
+                self.voice_speak_updates = !self.voice_speak_updates;
+                let mut config = Config::load();
+                config.voice.speak_updates = self.voice_speak_updates;
+                let _ = config.save();
+                Task::perform(hub::reload_config(), Msg::Done)
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceSetEcho(mode) => {
+                self.voice_echo = mode.clone();
+                let mut config = Config::load();
+                config.voice.echo = mode;
+                let _ = config.save();
+                Task::perform(hub::reload_config(), Msg::Done)
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceDownloadPromptConfirm => {
+                self.voice_download_state = VoiceDownloadState::Confirming;
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceDownloadCancel => {
+                self.voice_download_state = VoiceDownloadState::Idle;
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceDownloadStart => {
+                self.voice_download_state = VoiceDownloadState::Downloading { progress: None };
+                let stream = iced::stream::channel(16, async move |mut output: futures::channel::mpsc::Sender<Msg>| {
+                    use futures::SinkExt;
+                    let config = Config::load();
+                    let cfg = config.voice.clone();
+                    let out_prog = std::sync::Mutex::new(output.clone());
+                    let res = jgt_voice::download_models(&cfg, move |prog| {
+                        if let Ok(mut g) = out_prog.lock() {
+                            let _ = g.try_send(Msg::VoiceDownloadProgress(prog));
+                        }
+                    })
+                    .await;
+                    match res {
+                        Ok(()) => {
+                            let _ = output.send(Msg::VoiceDownloadDone(Ok(()))).await;
+                        }
+                        Err(e) => {
+                            let _ = output.send(Msg::VoiceDownloadDone(Err(e.to_string()))).await;
+                        }
+                    }
+                });
+                Task::stream(stream)
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceDownloadProgress(prog) => {
+                self.voice_download_state = VoiceDownloadState::Downloading { progress: Some(prog) };
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceDownloadDone(Ok(())) => {
+                self.voice_download_state = VoiceDownloadState::Completed;
+                Task::none()
+            }
+            #[cfg(feature = "voice")]
+            Msg::VoiceDownloadDone(Err(e)) => {
+                self.voice_download_state = VoiceDownloadState::Failed(e);
+                Task::none()
+            }
         }
     }
 
@@ -1539,6 +2001,12 @@ impl App {
                 self.mark_read_if_visible(&id)
             }
             Event::SessionRemoved { id } => {
+                #[cfg(feature = "voice")]
+                if let Some(call) = &self.call
+                    && call.session_id == id
+                {
+                    self.end_call();
+                }
                 self.sessions.retain(|s| s.id != id);
                 self.threads.remove(&id);
                 if self.selected.as_deref() == Some(id.as_str()) {
@@ -1547,6 +2015,24 @@ impl App {
                 Task::none()
             }
             Event::Message { message } => {
+                #[cfg(feature = "voice")]
+                if let Some(call) = self.call.as_mut()
+                    && let Some(coord) = coordinator_for(&self.sessions, &call.workspace)
+                {
+                    let coord_id = coord.id.clone();
+                    let config = Config::load();
+                    if should_speak_message(&message, &coord_id, call.started_at, config.voice.speak_updates) {
+                        let spoken = jgt_voice::speech_text(&message.body, &message.meta);
+                        if !spoken.trim().is_empty()
+                            && let Some(handle) = &call.handle
+                        {
+                            let _ = handle.send(jgt_voice::VoiceControl::Speak(spoken));
+                        }
+                    } else if matches!(call.status, CallStatus::Sent(_)) && message.session_id == coord_id {
+                        call.status = if call.muted { CallStatus::Muted } else { CallStatus::Listening };
+                    }
+                }
+
                 let attention = self.attention(&message);
                 let session = message.session_id.clone();
                 let is_selected = self.selected.as_deref() == Some(session.as_str());
@@ -2618,5 +3104,295 @@ effort = "low"
             None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_call_status_mapping() {
+        assert_eq!(call_status_label(&CallStatus::Listening), "Listening…");
+        assert_eq!(call_status_label(&CallStatus::Hearing), "Hearing you…");
+        assert_eq!(call_status_label(&CallStatus::Transcribing), "Transcribing…");
+        assert_eq!(call_status_label(&CallStatus::Sent("hello".into())), "Sent: hello");
+        assert_eq!(call_status_label(&CallStatus::Speaking), "Speaking…");
+        assert_eq!(call_status_label(&CallStatus::Muted), "Muted");
+        assert_eq!(call_status_label(&CallStatus::NoAudio), "No audio from the microphone");
+        assert_eq!(call_status_label(&CallStatus::Error("mic error".into())), "mic error");
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_state_transitions() {
+        // Listening
+        let (status, muted) = on_voice_event(&CallStatus::Muted, true, &jgt_voice::VoiceEvent::Listening);
+        assert_eq!(status, CallStatus::Listening);
+        assert!(!muted);
+
+        // Hearing (onset)
+        let (status, muted) = on_voice_event(&CallStatus::Listening, false, &jgt_voice::VoiceEvent::Hearing);
+        assert_eq!(status, CallStatus::Hearing);
+        assert!(!muted);
+
+        // Transcribing (utterance handed to STT)
+        let (status, muted) = on_voice_event(&CallStatus::Hearing, false, &jgt_voice::VoiceEvent::Transcribing);
+        assert_eq!(status, CallStatus::Transcribing);
+        assert!(!muted);
+
+        // NoAudio
+        let (status, muted) = on_voice_event(&CallStatus::Listening, false, &jgt_voice::VoiceEvent::NoAudio);
+        assert_eq!(status, CallStatus::NoAudio);
+        assert!(!muted);
+
+        // Muted
+        let (status, muted) = on_voice_event(&CallStatus::Listening, false, &jgt_voice::VoiceEvent::Muted);
+        assert_eq!(status, CallStatus::Muted);
+        assert!(muted);
+
+        // UserSpeech -> Sent (preview first 40 chars, preserves muted flag)
+        let (status, muted) = on_voice_event(&CallStatus::Listening, false, &jgt_voice::VoiceEvent::UserSpeech("hi".into()));
+        assert_eq!(status, CallStatus::Sent("hi".into()));
+        assert!(!muted);
+
+        let long_text = "This is a very long transcript that exceeds forty characters and should be truncated";
+        let (status, _) = on_voice_event(&CallStatus::Transcribing, false, &jgt_voice::VoiceEvent::UserSpeech(long_text.into()));
+        assert_eq!(status, CallStatus::Sent(long_text.chars().take(40).collect()));
+
+        let (status, muted) = on_voice_event(&CallStatus::Muted, true, &jgt_voice::VoiceEvent::UserSpeech("hi".into()));
+        assert_eq!(status, CallStatus::Sent("hi".into()));
+        assert!(muted);
+
+        // Speaking -> Speaking (preserves muted flag)
+        let (status, muted) = on_voice_event(&CallStatus::Sent("hi".into()), false, &jgt_voice::VoiceEvent::Speaking);
+        assert_eq!(status, CallStatus::Speaking);
+        assert!(!muted);
+
+        let (status, muted) = on_voice_event(&CallStatus::Sent("hi".into()), true, &jgt_voice::VoiceEvent::Speaking);
+        assert_eq!(status, CallStatus::Speaking);
+        assert!(muted);
+
+        // SpeakingDone: goes back to Listening if unmuted, Muted if muted
+        let (status, muted) = on_voice_event(&CallStatus::Speaking, false, &jgt_voice::VoiceEvent::SpeakingDone);
+        assert_eq!(status, CallStatus::Listening);
+        assert!(!muted);
+
+        let (status, muted) = on_voice_event(&CallStatus::Speaking, true, &jgt_voice::VoiceEvent::SpeakingDone);
+        assert_eq!(status, CallStatus::Muted);
+        assert!(muted);
+
+        // Error
+        let (status, muted) = on_voice_event(&CallStatus::Listening, false, &jgt_voice::VoiceEvent::Error);
+        assert!(matches!(status, CallStatus::Error(_)));
+        assert!(!muted);
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_toggle_mute() {
+        // Toggling when unmuted and Listening -> Muted
+        let (control, status, muted) = toggle_mute(&CallStatus::Listening, false);
+        assert_eq!(control, jgt_voice::VoiceControl::Mute);
+        assert_eq!(status, CallStatus::Muted);
+        assert!(muted);
+
+        // Toggling when muted and Muted -> Listening
+        let (control, status, muted) = toggle_mute(&CallStatus::Muted, true);
+        assert_eq!(control, jgt_voice::VoiceControl::Unmute);
+        assert_eq!(status, CallStatus::Listening);
+        assert!(!muted);
+
+        // Toggling while Speaking preserves Speaking status
+        let (control, status, muted) = toggle_mute(&CallStatus::Speaking, false);
+        assert_eq!(control, jgt_voice::VoiceControl::Mute);
+        assert_eq!(status, CallStatus::Speaking);
+        assert!(muted);
+
+        let (control, status, muted) = toggle_mute(&CallStatus::Speaking, true);
+        assert_eq!(control, jgt_voice::VoiceControl::Unmute);
+        assert_eq!(status, CallStatus::Speaking);
+        assert!(!muted);
+
+        // Toggling while Hearing / Transcribing becomes Muted
+        let (control, status, muted) = toggle_mute(&CallStatus::Hearing, false);
+        assert_eq!(control, jgt_voice::VoiceControl::Mute);
+        assert_eq!(status, CallStatus::Muted);
+        assert!(muted);
+
+        let (control, status, muted) = toggle_mute(&CallStatus::Transcribing, false);
+        assert_eq!(control, jgt_voice::VoiceControl::Mute);
+        assert_eq!(status, CallStatus::Muted);
+        assert!(muted);
+
+        // Toggling while Sent preserves Sent status
+        let (control, status, muted) = toggle_mute(&CallStatus::Sent("hello".into()), false);
+        assert_eq!(control, jgt_voice::VoiceControl::Mute);
+        assert_eq!(status, CallStatus::Sent("hello".into()));
+        assert!(muted);
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_should_speak_message_filtering() {
+        let coord_id = "session_coord";
+        let call_start = 1_000_000;
+
+        let base_msg = Message {
+            id: 1,
+            session_id: coord_id.into(),
+            direction: Direction::FromAgent,
+            kind: MessageKind::Text,
+            body: "Hello coordinator".into(),
+            meta: serde_json::Value::Null,
+            delivery: jgt_core::Delivery::Delivered,
+            created_at: 1_000_100,
+            delivered_at: None,
+            read_at: None,
+            question: None,
+        };
+
+        // 1. Normal match -> speaks
+        assert!(should_speak_message(&base_msg, coord_id, call_start, true));
+
+        // 2. speak_updates false -> does not speak
+        assert!(!should_speak_message(&base_msg, coord_id, call_start, false));
+
+        // 3. Different session -> does not speak
+        assert!(!should_speak_message(&base_msg, "other_session", call_start, true));
+
+        // 4. Direction checks:
+        let mut msg_to_agent = base_msg.clone();
+        msg_to_agent.direction = Direction::ToAgent;
+        assert!(!should_speak_message(&msg_to_agent, coord_id, call_start, true));
+
+        let mut msg_system = base_msg.clone();
+        msg_system.direction = Direction::System;
+        assert!(!should_speak_message(&msg_system, coord_id, call_start, true));
+
+        // 5. MessageKind checks:
+        for kind in [MessageKind::Text, MessageKind::Reply, MessageKind::Notify, MessageKind::Question] {
+            let mut m = base_msg.clone();
+            m.kind = kind;
+            assert!(should_speak_message(&m, coord_id, call_start, true), "expected kind {kind:?} to speak");
+        }
+        for kind in [MessageKind::Permission, MessageKind::Event] {
+            let mut m = base_msg.clone();
+            m.kind = kind;
+            assert!(!should_speak_message(&m, coord_id, call_start, true), "expected kind {kind:?} not to speak");
+        }
+
+        // 6. Timing checks (history not replayed):
+        let mut old_msg = base_msg.clone();
+        old_msg.created_at = call_start - 100;
+        assert!(!should_speak_message(&old_msg, coord_id, call_start, true));
+
+        let mut equal_msg = base_msg.clone();
+        equal_msg.created_at = call_start;
+        assert!(should_speak_message(&equal_msg, coord_id, call_start, true));
+
+        // 7. Muted still speaks: should_speak_message is independent of mute state
+        assert!(should_speak_message(&base_msg, coord_id, call_start, true));
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_readiness_disabled() {
+        let mut config = Config::default();
+        config.voice.enabled = false;
+        let res = voice_readiness(&config);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("disabled"));
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_readiness_missing_piper_executable() {
+        let mut config = Config::default();
+        config.voice.enabled = true;
+        config.voice.tts_command = "nonexistent_piper_command_xyz123".into();
+        let res = voice_readiness(&config);
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        // Since models might also be missing, verify missing model or missing piper hint
+        assert!(err.contains("whisper") || err.contains("missing model") || err.contains("pip install piper-tts"));
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_settings_toggles_and_persistence() {
+        let _guard = CONFIG_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let base_dir = std::env::temp_dir().join(format!("jgt-voice-settings-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base_dir);
+        std::fs::create_dir_all(&base_dir).unwrap();
+        let prev = std::env::var_os("JGT_CONFIG_DIR");
+        unsafe {
+            std::env::set_var("JGT_CONFIG_DIR", &base_dir);
+        }
+
+        let (mut app, _) = App::new(None);
+        assert!(!app.voice_enabled);
+        assert!(app.voice_speak_updates);
+        assert_eq!(app.voice_echo, "half_duplex");
+
+        // Toggle enabled
+        let _ = app.update(Msg::VoiceToggleEnabled);
+        assert!(app.voice_enabled);
+        let cfg = Config::load();
+        assert!(cfg.voice.enabled);
+
+        // Toggle speak updates
+        let _ = app.update(Msg::VoiceToggleSpeakUpdates);
+        assert!(!app.voice_speak_updates);
+        let cfg = Config::load();
+        assert!(!cfg.voice.speak_updates);
+
+        // Set echo mode
+        let _ = app.update(Msg::VoiceSetEcho("headset".into()));
+        assert_eq!(app.voice_echo, "headset");
+        let cfg = Config::load();
+        assert_eq!(cfg.voice.echo, "headset");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("JGT_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_download_state_transitions() {
+        let (mut app, _) = App::new(None);
+        assert_eq!(app.voice_download_state, VoiceDownloadState::Idle);
+
+        // Prompt confirm
+        let _ = app.update(Msg::VoiceDownloadPromptConfirm);
+        assert_eq!(app.voice_download_state, VoiceDownloadState::Confirming);
+
+        // Cancel
+        let _ = app.update(Msg::VoiceDownloadCancel);
+        assert_eq!(app.voice_download_state, VoiceDownloadState::Idle);
+
+        // Progress update
+        let prog = jgt_voice::Progress {
+            file_name: "test.bin".into(),
+            bytes_done: 100,
+            total_bytes: 200,
+            overall_bytes_done: 100,
+            overall_total_bytes: 400,
+        };
+        let _ = app.update(Msg::VoiceDownloadProgress(prog.clone()));
+        assert_eq!(
+            app.voice_download_state,
+            VoiceDownloadState::Downloading { progress: Some(prog) }
+        );
+
+        // Done failure
+        let _ = app.update(Msg::VoiceDownloadDone(Err("network unreachable".into())));
+        assert_eq!(
+            app.voice_download_state,
+            VoiceDownloadState::Failed("network unreachable".into())
+        );
+
+        // Done success
+        let _ = app.update(Msg::VoiceDownloadDone(Ok(())));
+        assert_eq!(app.voice_download_state, VoiceDownloadState::Completed);
     }
 }

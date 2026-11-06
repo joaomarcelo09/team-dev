@@ -17,6 +17,7 @@ pub struct Config {
     pub commands: Commands,
     pub desktop: Desktop,
     pub team: Team,
+    pub voice: Voice,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -473,6 +474,48 @@ impl Default for Desktop {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Voice {
+    /// Whether voice call mode is enabled.
+    pub enabled: bool,
+    /// STT model name (e.g. `medium.en-q5_0`).
+    pub stt_model: String,
+    /// TTS command line (e.g. `piper`).
+    pub tts_command: String,
+    /// Piper TTS voice (e.g. `en_US-lessac-medium`).
+    pub tts_voice: String,
+    /// Whether to speak Coordinator updates during a call.
+    pub speak_updates: bool,
+    /// Echo cancellation mode: `half_duplex`, `headset`, or `pipewire_aec`.
+    pub echo: String,
+    /// Optional audio capture input device name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_device: Option<String>,
+    /// Optional audio playback output device name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_device: Option<String>,
+    /// Optional thread count override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub threads: Option<u16>,
+}
+
+impl Default for Voice {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            stt_model: "medium.en-q5_0".into(),
+            tts_command: "piper".into(),
+            tts_voice: "en_US-lessac-medium".into(),
+            speak_updates: true,
+            echo: "half_duplex".into(),
+            input_device: None,
+            output_device: None,
+            threads: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Permissions {
@@ -742,6 +785,68 @@ mod tests {
         assert_eq!(old_cfg.desktop.style, "default");
 
         assert_eq!(Config::default().desktop.style, "jg-violet");
+    }
+
+    #[test]
+    fn voice_missing_section_uses_defaults() {
+        let toml_str = "[desktop]\ntheme = \"dark\"\n";
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.voice.enabled);
+        assert_eq!(cfg.voice.stt_model, "medium.en-q5_0");
+        assert_eq!(cfg.voice.tts_command, "piper");
+        assert_eq!(cfg.voice.tts_voice, "en_US-lessac-medium");
+        assert!(cfg.voice.speak_updates);
+        assert_eq!(cfg.voice.echo, "half_duplex");
+        assert_eq!(cfg.voice.input_device, None);
+        assert_eq!(cfg.voice.output_device, None);
+        assert_eq!(cfg.voice.threads, None);
+    }
+
+    #[test]
+    fn voice_supports_custom_and_legacy_models() {
+        let toml_str = r#"
+[voice]
+enabled = true
+stt_model = "small.en-q5_1"
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.voice.stt_model, "small.en-q5_1");
+    }
+
+    #[test]
+    fn voice_round_trips_and_missing_section_uses_defaults() {
+        let toml_str = r#"
+[voice]
+enabled = true
+stt_model = "small.en"
+tts_command = "piper"
+tts_voice = "en_US-lessac-medium"
+speak_updates = false
+echo = "headset"
+input_device = "default"
+output_device = "pipewire"
+threads = 4
+"#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert!(cfg.voice.enabled);
+        assert_eq!(cfg.voice.stt_model, "small.en");
+        assert_eq!(cfg.voice.tts_command, "piper");
+        assert_eq!(cfg.voice.tts_voice, "en_US-lessac-medium");
+        assert!(!cfg.voice.speak_updates);
+        assert_eq!(cfg.voice.echo, "headset");
+        assert_eq!(cfg.voice.input_device.as_deref(), Some("default"));
+        assert_eq!(cfg.voice.output_device.as_deref(), Some("pipewire"));
+        assert_eq!(cfg.voice.threads, Some(4));
+
+        let serialized = toml::to_string(&cfg).unwrap();
+        let round_tripped: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.voice, cfg.voice);
+
+        // Round trip with default values
+        let default_cfg = Config::default();
+        let serialized_default = toml::to_string(&default_cfg).unwrap();
+        let round_tripped_default: Config = toml::from_str(&serialized_default).unwrap();
+        assert_eq!(round_tripped_default.voice, default_cfg.voice);
     }
 
     #[test]
