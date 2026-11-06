@@ -470,9 +470,7 @@ pub const AGENT_ROLES: &[&str] = &[
     jgt_core::COORDINATOR,
     "planner",
     "coder",
-    "verifier",
     "reviewer",
-    "tester",
     "git-coder",
 ];
 

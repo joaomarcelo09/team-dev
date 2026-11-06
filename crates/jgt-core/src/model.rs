@@ -478,7 +478,7 @@ string_enum! {
     Decision {
         /// Accept the task: it goes to Done.
         Done => "done",
-        /// One more fix: one more coder and verifier, then back to Orchestrator review.
+        /// One more fix: one more coder and reviewer, then back to Orchestrator review.
         MoreRounds => "more_rounds",
         /// The user takes the task over: it goes to Backlog and the team leaves it alone.
         TakeOver => "take_over",
@@ -630,7 +630,7 @@ pub struct Waiting {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TestResult {
     pub status: TestStatus,
-    /// Hub id of the tester session.
+    /// Hub id of the coder session.
     pub worker: String,
     #[serde(default)]
     pub summary: String,

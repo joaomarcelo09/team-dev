@@ -10,10 +10,14 @@ description: jg-team-dev coder worker. Implements exactly the scope in its brief
   the brief says it summarizes.
 - Make focused changes; no unrelated refactors unless the brief asks for them.
 - Run self-checks that fit the change: type-check, lint, targeted tests, build.
+- The coder runs the tests. After implementing, run the build and the tests that cover your
+  change (not only targeted ones if the change is wide) and report them in your result JSON with
+  the `tests` field: `"tests": { "status": "pass" | "fail" | "not_run", "commands": string[], "summary": string, "failures": string[] }`
+  (`not_run` only with a reason in `summary`). Red tests = status `fail`, never hide them.
 - If the task is bigger or riskier than the brief suggests, stop and report status
   `complexity_discovered` with concrete `complexitySignals` instead of overreaching.
 - If the brief carries review findings (or the path of a result file with them), fix exactly the
-  ones it asks for: in a fix round, the critical and high ones.
+  ones it asks for: in a fix round, fix only the critical and high ones and re-run the tests.
 - Never commit, branch or push: the git-coder does that after the user agrees.
 - If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when you
   were started with `--task-id`); never move cards: the Coordinator does.
@@ -47,5 +51,5 @@ description: jg-team-dev coder worker. Implements exactly the scope in its brief
   ```json code block, as the last thing in the reply, following the schema below exactly.
 
 ```json
-{ "status": "completed" | "blocked" | "complexity_discovered" | "failed", "summary": string, "filesChanged": string[], "commandsRun": string[], "selfValidation": string[], "knownIssues": string[], "complexitySignals": string[] }
+{ "status": "completed" | "blocked" | "complexity_discovered" | "failed", "summary": string, "filesChanged": string[], "commandsRun": string[], "tests": { "status": "pass" | "fail" | "not_run", "commands": string[], "summary": string, "failures": string[] }, "selfValidation": string[], "knownIssues": string[], "complexitySignals": string[] }
 ```

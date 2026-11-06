@@ -1,7 +1,7 @@
 # jg-team-dev
 
 A desktop chat with a **Coordinator**: a Claude Code session that listens to you and runs a team
-of worker sessions (planner, coder, reviewer, tester, git-coder). Each worker starts with a
+of worker sessions (planner, coder, reviewer, git-coder). Each worker starts with a
 clean context and one skill, reports progress in its own chat box, and exits when its task is done.
 
 ```
@@ -25,15 +25,15 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   next message wakes it with its context intact.
 
 - **Phase 2** (workers): the Coordinator runs `jg-team-dev worker <skill> --task … --brief-file …`
-  (planner, coder, reviewer, tester, git-coder). It returns at once; a detached process runs
+  (planner, coder, reviewer, git-coder). It returns at once; a detached process runs
   `claude -p "/jg-team-dev:<skill> <brief>"` and relays the result JSON to the Coordinator
   through the hub, waking it if needed. Workers get their own chats under their Coordinator;
   messaging a finished worker resumes it for one reply, and the Coordinator gets a summary.
   `jg-team-dev workers` lists them (the Coordinator keeps at most 3 running).
 
 - **Phase 3** (git and memory): coders work in `.team/worktrees/<name>` on branch `jgt/<name>`
-  (`jg-team-dev worker coder --worktree <name>`; reviewers and testers can point at the same
-  worktree). In a git repository a coder without a worktree is refused unless the Coordinator
+  (`jg-team-dev worker coder --worktree <name>`; the reviewer points at the same worktree). In a
+  git repository a coder without a worktree is refused unless the Coordinator
   passes `--main-worktree` after warning you. `.team/` is kept out of `git status` through the
   repository's local exclude file. The git-coder merges into the main worktree only after a
   review, a test and your OK, then removes the worktree. On a topic change the Coordinator asks,
@@ -53,12 +53,14 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   and comment goes to the task's activity log with who made it. The hub enforces the gates:
   workers only read the Board; agents never edit the title, description or priority; the
   Coordinator creates tasks in Backlog and queues only subtasks of a task you queued; at most
-  `wip_limit` tasks are in progress. The flow is coder → verifier → one fix round → verifier →
-  Orchestrator review. A task whose first verification is clean (green test, approved review)
-  goes Review → Done. Otherwise it gets one automatic fix round (back to Working) and a second
-  verification, then waits in **Orchestrator review**, where only you decide: done, one more fix
-  (one more coder and verifier, then back to Orchestrator review), take over, or stop. Findings
-  that are not critical or high go to a follow-up task in Backlog and never start a fix round. You
+  `wip_limit` tasks are in progress. The flow is coder (stays in Working until tests are green;
+  no rounds used) → reviewer (full diff) → one fix round if critical/high findings (fresh coder
+  fixes them and re-runs tests) → reviewer (fix diff only) → Orchestrator review. A task whose first
+  review is clean goes Review → Done. Otherwise it gets one automatic fix round (back to Working;
+  rounds are consumed only by review findings) and a second review, then waits in **Orchestrator
+  review**, where only you decide: done, one more fix (one more coder and reviewer, then back to
+  Orchestrator review), take over, or stop. Findings that are not critical or high go to a
+  follow-up task in Backlog and never start a fix round. You
   may move any task anywhere; a move that skips a gate is logged as "moved by you". Reopening a
   Done task resets its rounds. `jg-team-dev task` (`list`, `show`, `create`, `edit`, `details`, `move`,
   `result`, `decide`, `comment`, `delete`, `log`) drives it from a terminal or a session.
@@ -67,7 +69,7 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   and **Board**. The Board shows the workspace's seven columns with their counts, scrolling
   sideways in a narrow window; Done shows the 20 newest tasks, with "Show all". "+" in Backlog
   and On Queue adds a task (a title is enough). A card shows its key, title, priority, the worker
-  on it (`↳ verifier`), the verification (`round 1/2`) and *Waiting for you* or *Waiting: usage
+  on it (`↳ reviewer`), the review (`round 1/2`) and *Waiting for you* or *Waiting: usage
   limit*; move it with ← → or
   "Move to…". Click a card for its panel: edit the title, description and priority; read the
   Coordinator's Details, the test and review results (critical findings first) and the activity
@@ -84,7 +86,7 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   one-fix-round rule. Workers only read (`task_get`). `jg-team-dev run start --task-id JGT-n` names the
   run after the key and links it to the task; `jg-team-dev worker … --task-id JGT-n` works in
   `.team/worktrees/jgt-n` (branch `jgt/jgt-n`) in the task's run, and the card shows the worker
-  on it. The verifier and the reviewer tag each finding by severity, with a category (security,
+  on it. The reviewer tags each finding by severity, with a category (security,
   secret, performance, patterns, docs, behavior); only critical and high findings start a fix round.
 
 - **Kanban (K-4, polish)**: drag a card to another column or position (Esc cancels; ← →
@@ -95,13 +97,18 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   they got there; moving one brings it back. Export the Board as Markdown with the Board's
   Export button or `jg-team-dev task export [--out FILE] [--all]` (default `docs/board.md`).
 
-- **Team efficiency**: after a coder the Coordinator starts one **verifier**, the default gate:
-  build, tests, the acceptance checks and a short review for critical and high problems, in one
-  pass. A tester and a reviewer run only when you ask for them (or the task needs it). Fix rounds
-  check only the new diff: `jg-team-dev snapshot --task JGT-n` saves what a verification checked
-  as a git tree under `refs/jgt/<key>/checked-<round>` (no commit, the branch and index stay
-  untouched), and `jg-team-dev snapshot --task JGT-n --diff` prints the worktree's diff since
-  then. A finished worker's result reaches the Coordinator as a short digest (at most 10 lines:
+- **Team efficiency**: the coder runs the build and tests itself and reports them (`tests` field);
+  while tests fail (or work is incomplete), the task stays in Working and the Coordinator starts a
+  fresh coder to make them green, recording no test result and using no fix round. Once tests are
+  green, the Coordinator records it as the task's test result (`pass`) and moves the card to Review.
+  The **reviewer** is the only gate: it does not re-run tests, it reviews architecture, code, test
+  results and how the change affects the app and the integration between services. One reviewer per
+  task: a big task (frontend + backend) may have several coders sharing one worktree, but a single
+  reviewer reviews the whole task at the end. The FIRST review always covers the full worktree diff
+  (`git diff`, all coders); fix rounds (consumed only by review findings) check only the new diff:
+  `jg-team-dev snapshot --task JGT-n` saves what a review checked as a git tree under
+  `refs/jgt/<key>/checked-<round>` (no commit, the branch and index stay untouched), and the second
+  review uses `jg-team-dev snapshot --task JGT-n --diff` to review the diff since then. A finished worker's result reaches the Coordinator as a short digest (at most 10 lines:
   status, finding counts, notes) with the path of the full result in the run, which also shows
   in the worker's chat. A worker stopped by the usage limit sets *Waiting: usage limit* on its
   task with the reset time; the Coordinator starts no worker meanwhile, and shortly after the
@@ -142,12 +149,12 @@ harness = "claude-code"
 model = "sonnet"
 effort = "medium"
 
-[team.skills.verifier]     # the default gate; also [team.skills.reviewer]
+[team.skills.reviewer]
 harness = "claude-code"
 model = "opus"             # Claude Code's alias for its newest Opus (Opus 5.5)
 effort = "medium"
 
-[team.skills.tester]       # also [team.skills.git-coder]
+[team.skills.git-coder]
 model = "sonnet"
 effort = "low"
 

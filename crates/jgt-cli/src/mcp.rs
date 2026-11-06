@@ -144,12 +144,12 @@ pub struct TaskUpdateArgs {
     /// Clear *Waiting for you* (the user answered).
     #[serde(default)]
     pub clear_waiting: bool,
-    /// The test result of a tester or verifier: {"status": "pass"|"fail", "worker": "<tester or
-    /// verifier hub id>", "summary": "…", "failures": ["…"]}. Recorded in Testing.
+    /// The test result of the coder: {"status": "pass"|"fail", "worker": "<coder hub id>",
+    /// "summary": "…", "failures": ["…"]}. Recorded in Testing.
     #[serde(default)]
     pub test_result: Option<serde_json::Value>,
-    /// The review result of a reviewer or verifier: {"decision": "approved"|"changes", "worker":
-    /// "<reviewer or verifier hub id>", "findings": [{"severity": "critical"|"high"|"other", "critical": bool,
+    /// The review result of the reviewer: {"decision": "approved"|"changes", "worker":
+    /// "<reviewer hub id>", "findings": [{"severity": "critical"|"high"|"other", "critical": bool,
     /// "category": "security"|"secret"|"performance"|"patterns"|"docs"|"behavior"|null, "location": "…",
     /// "problem": "…", "required_action": "…"}]}. Recorded in Review. "changes" needs a critical or high
     /// finding; an approved review carries only "other" ones.
@@ -551,7 +551,7 @@ impl JgtMcp {
     }
 
     #[tool(description = "Coordinator only. Write a task's Details (never the user's description), set or \
-        clear Waiting for you, record the tester's or the reviewer's result, or link its run and worktree.")]
+        clear Waiting for you, record the coder's or the reviewer's result, or link its run and worktree.")]
     async fn task_update(&self, Parameters(args): Parameters<TaskUpdateArgs>) -> Result<CallToolResult, McpError> {
         let (actor, workspace) = match self.coordinator_board(args.jgt_session.as_deref()).await {
             Ok(b) => b,

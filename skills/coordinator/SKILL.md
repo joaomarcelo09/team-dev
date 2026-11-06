@@ -91,16 +91,25 @@ needs; a review-only request gets one reviewer and nothing else.
 | Skill | Use it for |
 |---|---|
 | `planner` | turning a non-trivial goal into steps and acceptance criteria |
-| `coder` | implementing a defined scope |
-| `verifier` | **the default gate for every change**: build, tests, acceptance checks and a short review for critical and high problems, in one pass |
-| `tester` | independent validation, **only when the user asks** ("with tester", "full review") |
-| `reviewer` | a full review, **only when the user asks** ("full review", "with reviewer") |
+| `coder` | implementing a defined scope, building and running the tests that cover its change |
+| `reviewer` | **the only gate for every task**: reviews architecture, code, tests and their results, correctness, regressions, security, patterns, docs |
 | `git-coder` | commits, branches, merges, pull requests, only after the user agreed |
 
-**Gates.** After a coder, start one `verifier`. Run a tester and a reviewer only when the user
-asks for them, in the request or on the task; then run them **one after the other, never in
-parallel**: the tester first, then the reviewer, whose brief gives the path of the tester's
-result so it does not rebuild or re-run the tests.
+**Gates.** The reviewer is the only gate. It does not build or re-run tests: it reads the coder's
+result file(s) (paths in its brief) and reviews architecture, code, the tests and their results,
+correctness, regressions, security, patterns, docs, and whole-task integration between
+layers/services (callers of removed or changed code, API contracts, shared types). Run **one reviewer
+per task**, started ONCE after the last coder finished and the tests are green. While a coder's
+`tests` is `fail` (or the work is incomplete), the card stays in Working and the Coordinator starts
+a fresh coder (same `--task-id`/`--worktree`) to make the tests green; no `test_result` is recorded
+for that, and no round is used. Only when the coder's tests are green: `task_move testing`, record
+`test_result` pass, `task_move review`, start the reviewer. Rounds are consumed only by review
+findings. The FIRST review always covers the full worktree diff (`git diff`, all coders); the
+second review (after a fix round) is the only one that uses `snapshot --diff`. A big task (frontend +
+backend, several services) may use several coders, one piece each, all started with the same
+`--task-id` and the same `--worktree` (one after another; in parallel only when they touch disjoint
+files), never one card per coder piece (cards for subtasks only for follow-ups). The reviewer's
+brief lists every coder result file and, for multi-repo work, every worktree to review.
 
 Start one with Bash (if `jg-team-dev` is not on PATH, use the full path from your session's
 start note); the command returns at once:
@@ -111,18 +120,17 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
 
 - **Coders work in a git worktree.** In a git repository, give each coding task its own
   worktree: `--worktree <name>` (lowercase, e.g. `fix-navbar`) creates `.team/worktrees/<name>`
-  on branch `jgt/<name>`. Point the verifier (and a tester or reviewer) at the same worktree
-  with the same `--worktree <name>`, so they check the coder's changes. Only for a trivial change, and only
-  after telling the user it will touch their main worktree, pass `--main-worktree` instead.
+  on branch `jgt/<name>`. Point the reviewer at the same worktree with the same `--worktree <name>`,
+  so it checks the coders' changes. Only for a trivial change, and only after telling the user it
+  will touch their main worktree, pass `--main-worktree` instead.
 - **The brief is everything the worker knows, and it is short.** Write it to a file under
   `.team/briefs/` with the goal, the scope, what must not change, the acceptance criteria and,
-  for a verifier, reviewer or tester, the exact checks. Every worker pays to read it:
+  for a reviewer, the exact checks. Every worker pays to read it:
   - Copy **only the plan section for this task**, with its acceptance criteria. Never list whole
     documents to read (a PRD, the full plan, a decisions file).
   - Name the **files to open**, not documents to study.
   - Add the line "Do not re-read: <the PRD, the full plan>; they are summarized above."
-  - Aim for under 60 lines. A brief for a fix round, or for a verifier/reviewer/tester after
-    one, aims for under 20.
+  - Aim for under 60 lines. A brief for a fix round, or for a reviewer after one, aims for under 20.
 - **Results arrive as short digests**, marked `[jg-team-dev] Worker … finished`: the status or
   decision, a one-line summary, counts (files, findings, checks), time and cost, and the path of
   the full result (`Full result: …`). Open that file only when you need the details. To hand
@@ -133,7 +141,7 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
   the config. For one hard task you may raise one worker with `--model <name>` and/or
   `--effort <low|medium|high|xhigh|max>`; `jg-team-dev worker` prints what it runs on.
 - **At most 3 workers at a time**, any roles. Check with `jg-team-dev workers` before starting
-  more, and order the work yourself: for example coder, then reviewer, then tester.
+  more, and order the work yourself: for example coder, then reviewer.
 - **Findings go to a fresh coder**: only the critical and high ones, by the **path** of the
   result file that holds them. Never resume the old coder.
 - A coder that returns `complexity_discovered` means the plan was wrong: re-plan (maybe with a
@@ -162,38 +170,42 @@ move tasks through the rest with the `task_*` MCP tools. The hub checks every ga
      the question; when answered, `task_log` the answer and `task_update clear_waiting=true`.
      Big tasks wait for the user's OK as usual.
   4. Coder: `jg-team-dev worker coder --task-id JGT-n --task "…" --brief-file …` (its worktree is
-     `.team/worktrees/jgt-n` on `jgt/jgt-n`; pass `--task-id JGT-n` to the verifier too).
-  5. **First verification.** `task_move testing`, start the verifier. Its one result is recorded
-     twice: the test in Testing, the review in Review.
-     - `task_update test_result={"status": "pass"|"fail", "worker": "<verifier hub id>", "summary", "failures"}`
-       (its `passed` is `pass`). Green: `task_move review`.
-     - `task_update review_result={"decision": "approved"|"changes", "worker": "<verifier hub id>",
-       "findings": [{"severity": "critical"|"high"|"other", "critical", "category", "location",
-       "problem", "required_action"}]}` (its `changes_requested` is `changes`, `requiredAction` is
-       `required_action`).
-     - **Clean** (green, no critical or high finding): `task_move done`. Findings marked `other`
+     `.team/worktrees/jgt-n` on `jgt/jgt-n`; pass `--task-id JGT-n` to the reviewer too).
+  5. **Testing and review.** Working: coders run. While a coder's `tests` is `fail` (or the work is
+     incomplete), the card stays in Working and the Coordinator starts a fresh coder (same
+     `--task-id`/`--worktree`) to make the tests green; no `test_result` is recorded for that, no
+     round is used. Only when the coder's tests are green: `task_move testing`, record `test_result`
+     pass:
+     `task_update test_result={"status": "pass", "worker": "<coder hub id>", "summary", "failures": []}`
+     (`worker` = hub id of the last coder; summary from `tests`).
+     Then `task_move review`, start the reviewer. The FIRST review always covers the full worktree
+     diff (`git diff`, all coders). Record `review_result` (`worker` = reviewer's hub id):
+     `task_update review_result={"decision": "approved"|"changes", "worker": "<reviewer hub id>", "findings": [{"severity": "blocking"|"high"|"medium"|"low", "critical", "category", "location", "problem", "impact", "required_action"}]}`
+     (`changes_requested` is `changes`, `requiredAction` is `required_action`).
+     - **Clean** (no critical/high finding): `task_move done`. Findings marked `other`
        go to the follow-up task the hub files; they never start a fix round.
-  6. **The fix round** (red test, or a critical or high finding): `task_move working` and a
-     **fresh coder** that fixes only the critical and high findings (give it the result file's
-     path). Starting it with `--task-id` saves what was checked as
-     `refs/jgt/jgt-n/checked-<round>` (by hand: `jg-team-dev snapshot --task JGT-n`).
-  7. **Second verification.** `task_move testing` and a verifier whose brief says: "Second
-     verification: review only `jg-team-dev snapshot --task JGT-n --diff`, and check that each
-     finding in <path of the first result> is fixed." Record its results as in step 5.
-  8. **Orchestrator review.** Whatever the second verification says, `task_move
-     orchestrator_review` (from Review; from Testing when its test is red). The hub notifies the
-     user. Post the result in one or two lines, then ask with `chat_ask`, options "Done",
-     "One more fix", "Take over", "Stop": "JGT-n is in Orchestrator review: <result>. Accept it
-     (Done), run one more fix, take over, or stop?" Pass the answer on with
+     - **Changes requested** (critical or high finding): fix round (step 6). Rounds are consumed
+       only by review findings.
+  6. **The fix round** (critical or high finding): `task_move working` and a **fresh coder** that
+     fixes only the critical and high findings (give it the result file's path) and re-runs the tests.
+     Starting it with `--task-id` saves what was checked as `refs/jgt/jgt-n/checked-<round>`
+     (by hand: `jg-team-dev snapshot --task JGT-n`).
+  7. **Second review.** Fix coder's tests green: `task_move testing`, record `test_result` pass.
+     `task_move review`, start the reviewer (same reviewer role, brief says: "Second review:
+     review only `jg-team-dev snapshot --task JGT-n --diff`, and check that each finding in <path
+     of the first result> is fixed"). The second review (after a fix round) is the only one that uses
+     `snapshot --diff`. Record `review_result` as in step 5.
+  8. **Orchestrator review.** Whatever the second review says (or from Testing when tests are red),
+     `task_move orchestrator_review`. The hub notifies the user. Post the result in one or two lines,
+     then ask with `chat_ask`, options "Done", "One more fix", "Take over", "Stop":
+     "JGT-n is in Orchestrator review: <result>. Accept it (Done), run one more fix, take over,
+     or stop?" Pass the answer on with
      `task_decide JGT-n <done|more_rounds|take_over|stop> question_id=<that question's id>`.
      The user may also decide on the card. "One more fix" puts the task back in Working: one more
-     coder and verifier (steps 6–7), then Orchestrator review again. After "Take over" the task
+     coder and reviewer (steps 6–7), then Orchestrator review again. After "Take over" the task
      is the user's: do not touch it. You never move a card out of Orchestrator review.
   9. On Done: `jg-team-dev run finish`, then tell the user the task is ready to merge. Done never
      merges: the git-coder runs only after the user's OK, as below.
-- **Tester and reviewer on request.** When the user asked for them, they replace the verifier in
-  steps 5 and 7: the tester in Testing (`worker` = the tester's id), then the reviewer in Review
-  (`worker` = the reviewer's id), one after the other.
 - **Small pieces.** Size each coder's piece to about 5–10 minutes: one concern, a handful of
   files. Split anything bigger into subtasks (`task_create parent=JGT-n`, in Backlog) and run
   them one after another. **Never give one coder two milestones.** Queue a subtask
@@ -218,10 +230,10 @@ Never commit, branch, push or open pull requests without the user's explicit OK 
 
 Changes reach the user's main worktree only through the `git-coder`, and only when:
 
-1. a verifier passed them (or, when the user asked for them, a tester and a reviewer), and the
-   task reached Done; say so if a gate was skipped, and why,
+1. the coder's tests passed, the reviewer approved the change, and the task reached Done; say
+   so if a gate was skipped, and why,
 2. you warned the user, for example: "⚠ This merges `jgt/fix-navbar` into your main worktree
-   (branch `main`). Verified: yes. Go ahead?", and
+   (branch `main`). Tests green, reviewed: yes. Go ahead?", and
 3. the user agreed with `chat_ask`.
 
 Then start a `git-coder` whose brief names the worktree, the target branch, the agreed action

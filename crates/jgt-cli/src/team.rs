@@ -73,8 +73,6 @@ const SKILLS: &[(&str, &str)] = &[
     ("planner", include_str!("../../../skills/planner/SKILL.md")),
     ("coder", include_str!("../../../skills/coder/SKILL.md")),
     ("reviewer", include_str!("../../../skills/reviewer/SKILL.md")),
-    ("tester", include_str!("../../../skills/tester/SKILL.md")),
-    ("verifier", include_str!("../../../skills/verifier/SKILL.md")),
     ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),
 ];
 

@@ -167,24 +167,24 @@ mod tests {
 
     #[test]
     fn workers_start_as_before_the_adapter() {
-        let settings = Config::default().team.for_skill("tester", Path::new("/nonexistent"));
+        let settings = Config::default().team.for_skill("git-coder", Path::new("/nonexistent"));
         let w = WorkerLaunch {
             program: "/bin/claude".into(),
             exe: "/bin/jg-team-dev".into(),
             files: Path::new("/f"),
-            skill: "tester",
-            title: "tester · x",
+            skill: "git-coder",
+            title: "git-coder · x",
             brief: "check it",
             brief_file: Path::new("/b.md"),
             settings: &settings,
             cwd: Path::new("/w"),
             session_id: "uuid",
-            env: vec![(ROLE_ENV.into(), "tester".into())],
+            env: vec![(ROLE_ENV.into(), "git-coder".into())],
         };
         let plan = ClaudeCode.worker(&w).unwrap();
         let args = plan.args.join(" ");
-        assert!(args.starts_with("-p /jg-team-dev:tester check it --session-id uuid --output-format json --model sonnet --effort low"), "{args}");
-        assert!(args.ends_with("--plugin-dir /f/plugin -n tester · x"), "{args}");
+        assert!(args.starts_with("-p /jg-team-dev:git-coder check it --session-id uuid --output-format json --model sonnet --effort low"), "{args}");
+        assert!(args.ends_with("--plugin-dir /f/plugin -n git-coder · x"), "{args}");
         assert_eq!((plan.cwd.as_deref(), plan.path_prepend, plan.env.len()), (Some(Path::new("/w")), None, 1));
     }
 
