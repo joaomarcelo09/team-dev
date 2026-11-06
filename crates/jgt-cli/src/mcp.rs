@@ -37,6 +37,9 @@ and (for the Coordinator only) change the folder's Board; a worker reads its tas
 pub struct SendArgs {
     /// The message, in Markdown.
     pub text: String,
+    /// Short spoken version for voice call mode (one or two plain sentences, no markdown or code).
+    #[serde(default)]
+    pub speech: Option<String>,
     #[schemars(description = "Internal: filled in automatically by the client. Leave empty.")]
     #[serde(default)]
     pub jgt_session: Option<String>,
@@ -52,6 +55,9 @@ pub struct NotifyArgs {
     /// One of: info, success, warning, error. Defaults to info.
     #[serde(default)]
     pub level: Option<String>,
+    /// Short spoken version for voice call mode (one or two plain sentences, no markdown or code).
+    #[serde(default)]
+    pub speech: Option<String>,
     #[schemars(description = "Internal: filled in automatically by the client. Leave empty.")]
     #[serde(default)]
     pub jgt_session: Option<String>,
@@ -355,7 +361,11 @@ impl JgtMcp {
             Ok(s) => s,
             Err(e) => return tool_error(e),
         };
-        match self.post(&session, MessageKind::Text, args.text, serde_json::Value::Null).await {
+        let meta = match args.speech.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(s) => serde_json::json!({ "speech": s }),
+            None => serde_json::Value::Null,
+        };
+        match self.post(&session, MessageKind::Text, args.text, meta).await {
             Ok(()) => ok("Sent."),
             Err(e) => tool_error(e),
         }
@@ -373,7 +383,10 @@ impl JgtMcp {
             Some(b) => format!("**{}**\n\n{b}", args.title.trim()),
             None => format!("**{}**", args.title.trim()),
         };
-        let meta = serde_json::json!({ "title": args.title.trim(), "level": level.as_str() });
+        let mut meta = serde_json::json!({ "title": args.title.trim(), "level": level.as_str() });
+        if let Some(speech) = args.speech.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            meta["speech"] = serde_json::json!(speech);
+        }
         match self.post(&session, MessageKind::Notify, body, meta).await {
             Ok(()) => ok("Notification sent."),
             Err(e) => tool_error(e),
@@ -738,5 +751,37 @@ mod tests {
         assert_eq!(render_tasks(&[a.clone(), b]), "- JGT-1 [Review] fix navbar (high) · round 2/2\n- JGT-2 [Backlog] later");
         assert_eq!(render_change(&a), "JGT-1 is in Review, round 2/2.");
         assert_eq!(task_path("/w", " JGT-1 ", "/move"), "/v1/tasks/JGT-1/move?workspace=%2Fw");
+    }
+
+    #[test]
+    fn send_args_and_notify_args_support_optional_speech() {
+        let json_without = serde_json::json!({
+            "text": "Hello world"
+        });
+        let send_args: SendArgs = serde_json::from_value(json_without).unwrap();
+        assert_eq!(send_args.text, "Hello world");
+        assert_eq!(send_args.speech, None);
+
+        let json_with = serde_json::json!({
+            "text": "Hello world",
+            "speech": "Hi there"
+        });
+        let send_args: SendArgs = serde_json::from_value(json_with).unwrap();
+        assert_eq!(send_args.speech.as_deref(), Some("Hi there"));
+
+        let notify_without = serde_json::json!({
+            "title": "Build finished",
+            "body": "All tests passed"
+        });
+        let notify_args: NotifyArgs = serde_json::from_value(notify_without).unwrap();
+        assert_eq!(notify_args.speech, None);
+
+        let notify_with = serde_json::json!({
+            "title": "Build finished",
+            "body": "All tests passed",
+            "speech": "The build finished successfully."
+        });
+        let notify_args: NotifyArgs = serde_json::from_value(notify_with).unwrap();
+        assert_eq!(notify_args.speech.as_deref(), Some("The build finished successfully."));
     }
 }

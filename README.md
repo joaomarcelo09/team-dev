@@ -217,6 +217,61 @@ cd packaging && makepkg -si
 
 For packaging and publishing instructions, see the [AUR Maintainer Guide](docs/AUR.md).
 
+## Voice call mode (optional)
+
+`jg-team-dev-desktop` can be built with voice call mode enabled to converse directly with the Coordinator using your microphone and speakers.
+
+### Requirements
+
+- **CPU**: x86-64 processor with AVX2 support (Intel Haswell 2013+ / AMD Excavator 2015+) for real-time STT
+- **Build dependencies**: `cmake`, `clang`, `alsa-lib`
+- **Runtime speech synthesis**: Piper (`pip install piper-tts` or distro package `piper-tts`)
+
+### Building with Voice Support
+
+```sh
+cargo build --release --locked --workspace --features jgt-desktop/voice
+```
+
+### Setup and Usage
+
+1. Open **Settings** in the desktop application.
+2. In the **Voice call** section, switch **Voice mode** to **On**.
+3. Click **Download models** to fetch the STT and TTS models (~602 MB from Hugging Face: Whisper `medium.en-q5_0` and Piper `en_US-lessac-medium`).
+4. Select a Coordinator session in the sidebar and click the **Call** button in the header.
+5. Use **Mute** to toggle your microphone or **End** to hang up.
+
+### Echo Modes
+
+- **Speakers (`half_duplex`)**: Microphone is paused while the Coordinator speaks to eliminate acoustic feedback.
+- **Headset (`headset`, recommended)**: Full duplex mode. Continuous user speech (~250 ms) interrupts the Coordinator (barge-in).
+- **PipeWire echo-cancel (`pipewire_aec`)**: Full duplex mode utilizing PipeWire acoustic echo cancellation.
+
+### Configuration
+
+Voice settings persist in `~/.config/jg-team-dev/config.toml`:
+
+```toml
+[voice]
+enabled = true
+stt_model = "medium.en-q5_0"
+tts_command = "piper"
+tts_voice = "en_US-lessac-medium"
+speak_updates = true
+echo = "headset"           # half_duplex | headset | pipewire_aec
+# input_device = "..."     # optional audio capture device
+# output_device = "..."    # optional playback device
+# threads = 4              # optional thread count
+```
+
+> [!NOTE]
+> Other STT models such as `small.en-q5_1` (faster transcription, smaller download) or `small.en` can be configured via `voice.stt_model`.
+
+### Privacy & Language
+
+- **English only**: Whisper `medium.en-q5_0` and Piper `en_US-lessac-medium` are configured for English speech.
+- **100% local**: All audio transcription and voice synthesis occur locally on your device. Only the initial model download reaches out to huggingface.co.
+
 ## Development
 
 ```sh

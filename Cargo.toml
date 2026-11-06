@@ -10,6 +10,7 @@ authors = ["joaogomes"]
 
 [workspace.dependencies]
 jgt-core = { path = "crates/jgt-core" }
+jgt-voice = { path = "crates/jgt-voice" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

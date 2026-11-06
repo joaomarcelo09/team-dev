@@ -75,7 +75,7 @@ pub(crate) fn dot<'a>(color: Color, size: f32) -> Element<'a, Msg> {
     container(Space::new().width(size).height(size)).style(style::dot(color)).into()
 }
 
-pub(crate) fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: &'a str) -> Element<'a, Msg> {
+pub(crate) fn tip<'a>(content: impl Into<Element<'a, Msg>>, label: impl text::IntoFragment<'a>) -> Element<'a, Msg> {
     tooltip(
         content,
         container(text(label).size(style::fs(12))).padding([6, 10]).style(container::rounded_box),
@@ -351,6 +351,77 @@ fn settings(app: &App) -> Element<'_, Msg> {
     let line = |label: &'static str, control: Element<'static, Msg>| {
         row![text(label).size(style::fs(14)).width(style::fs(14) * 7.0), control].spacing(12).align_y(Alignment::Center)
     };
+    let mut settings_col = column![
+        line(
+            "Theme",
+            row![
+                theme_button("Auto", ThemePref::System),
+                theme_button("Dark", ThemePref::Dark),
+                theme_button("Light", ThemePref::Light)
+            ]
+            .spacing(6)
+            .into()
+        ),
+        line(
+            "Pop-ups",
+            button(text(if app.popups { "On" } else { "Off" }).size(style::fs(13)))
+                .on_press(Msg::TogglePopups)
+                .style(if app.popups { style::primary_button } else { style::pill_button })
+                .padding([4, 12])
+                .into(),
+        ),
+        muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
+            .size(style::fs(12)),
+        line(
+            "Style",
+            row![
+                style_button("JG Violet", ThemeStyle::Violet),
+                style_button("Default", ThemeStyle::Default),
+                style_button("Tokyo Night", ThemeStyle::TokyoNight),
+                style_button("Dracula", ThemeStyle::Dracula),
+            ]
+            .spacing(6)
+            .into()
+        ),
+        muted("JG Violet, Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
+            .size(style::fs(12)),
+        line(
+            "Zoom",
+            stepper(
+                format!("{:.0}%", app.zoom * 100.0),
+                Msg::Zoom(crate::app::Step::Down),
+                Msg::Zoom(crate::app::Step::Up),
+                Msg::Zoom(crate::app::Step::Reset)
+            )
+            .into()
+        ),
+        line(
+            "Text size",
+            stepper(
+                app.text_size.to_string(),
+                Msg::TextSize(crate::app::Step::Down),
+                Msg::TextSize(crate::app::Step::Up),
+                Msg::TextSize(crate::app::Step::Reset)
+            )
+            .into()
+        ),
+        muted("Zoom scales the whole window (Ctrl + / Ctrl − / Ctrl 0). Text size changes only the letters.")
+            .size(style::fs(12)),
+    ];
+
+    #[cfg(feature = "voice")]
+    {
+        settings_col = settings_col
+            .push(rule::horizontal(1).style(rule::weak))
+            .push(voice_section(app));
+    }
+
+    settings_col = settings_col
+        .push(rule::horizontal(1).style(rule::weak))
+        .push(agents_section(app))
+        .push(config_banner(app))
+        .spacing(16);
+
     let card = container(
         column![
             row![
@@ -360,70 +431,8 @@ fn settings(app: &App) -> Element<'_, Msg> {
             ]
             .align_y(Alignment::Center),
             scrollable(
-                container(
-                    column![
-                        line(
-                            "Theme",
-                            row![
-                                theme_button("Auto", ThemePref::System),
-                                theme_button("Dark", ThemePref::Dark),
-                                theme_button("Light", ThemePref::Light)
-                            ]
-                            .spacing(6)
-                            .into()
-                        ),
-                        line(
-                            "Pop-ups",
-                            button(text(if app.popups { "On" } else { "Off" }).size(style::fs(13)))
-                                .on_press(Msg::TogglePopups)
-                                .style(if app.popups { style::primary_button } else { style::pill_button })
-                                .padding([4, 12])
-                                .into(),
-                        ),
-                        muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
-                            .size(style::fs(12)),
-                        line(
-                            "Style",
-                            row![
-                                style_button("JG Violet", ThemeStyle::Violet),
-                                style_button("Default", ThemeStyle::Default),
-                                style_button("Tokyo Night", ThemeStyle::TokyoNight),
-                                style_button("Dracula", ThemeStyle::Dracula),
-                            ]
-                            .spacing(6)
-                            .into()
-                        ),
-                        muted("JG Violet, Tokyo Night and Dracula are dark palettes only; Auto/Dark/Light applies to Default.")
-                            .size(style::fs(12)),
-                        line(
-                            "Zoom",
-                            stepper(
-                                format!("{:.0}%", app.zoom * 100.0),
-                                Msg::Zoom(crate::app::Step::Down),
-                                Msg::Zoom(crate::app::Step::Up),
-                                Msg::Zoom(crate::app::Step::Reset)
-                            )
-                            .into()
-                        ),
-                        line(
-                            "Text size",
-                            stepper(
-                                app.text_size.to_string(),
-                                Msg::TextSize(crate::app::Step::Down),
-                                Msg::TextSize(crate::app::Step::Up),
-                                Msg::TextSize(crate::app::Step::Reset)
-                            )
-                            .into()
-                        ),
-                        muted("Zoom scales the whole window (Ctrl + / Ctrl − / Ctrl 0). Text size changes only the letters.")
-                            .size(style::fs(12)),
-                        rule::horizontal(1).style(rule::weak),
-                        agents_section(app),
-                        config_banner(app),
-                    ]
-                    .spacing(16),
-                )
-                .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 0.0 }),
+                container(settings_col)
+                    .padding(Padding { top: 0.0, right: 8.0, bottom: 0.0, left: 0.0 }),
             )
             .direction(scrollable::Direction::Vertical(scrollable::Scrollbar::default()))
             .width(Fill),
@@ -455,6 +464,206 @@ fn config_banner(app: &App) -> Element<'_, Msg> {
         col = col.push(text(format!("⚠ {w}")).size(style::fs(12)));
     }
     container(col).padding([8, 12]).width(Fill).style(style::banner(Color::from_rgb(0.85, 0.55, 0.1))).into()
+}
+
+#[cfg(feature = "voice")]
+fn voice_section(app: &App) -> Element<'_, Msg> {
+    use crate::app::VoiceDownloadState;
+
+    let config = jgt_core::config::Config::load();
+    let whisper_status = match jgt_voice::check_whisper(&config.voice.stt_model) {
+        Ok(_) => "Ready",
+        Err(_) => "Not downloaded",
+    };
+    let piper_status = match jgt_voice::check_piper(&config.voice.tts_voice) {
+        Ok(_) => "Ready",
+        Err(_) => "Not downloaded",
+    };
+    let piper_cmd = config
+        .voice
+        .tts_command
+        .split_whitespace()
+        .next()
+        .unwrap_or(&config.voice.tts_command);
+    let piper_installed = jgt_core::launch::which(piper_cmd).is_some();
+
+    let echo_button = |label: &'static str, mode_val: &'static str| {
+        let active = app.voice_echo == mode_val;
+        button(text(label).size(style::fs(13)))
+            .on_press(Msg::VoiceSetEcho(mode_val.to_string()))
+            .style(if active {
+                style::primary_button
+            } else {
+                style::pill_button
+            })
+            .padding([4, 12])
+    };
+
+    let download_controls: Element<'_, Msg> = match &app.voice_download_state {
+        VoiceDownloadState::Idle => button(text("Download models").size(style::fs(13)))
+            .on_press(Msg::VoiceDownloadPromptConfirm)
+            .style(style::pill_button)
+            .padding([4, 12])
+            .into(),
+        VoiceDownloadState::Confirming => {
+            let specs = jgt_voice::model_specs(&config.voice);
+            let total_mb = specs.iter().map(|s| s.expected_size).sum::<u64>() / 1_000_000;
+            let prompt = if total_mb > 0 {
+                format!("Download models? (about {total_mb} MB from huggingface.co)")
+            } else {
+                "Download models? (from huggingface.co)".to_string()
+            };
+            row![
+                text(prompt).size(style::fs(12)),
+                button(text("Confirm").size(style::fs(12)))
+                    .on_press(Msg::VoiceDownloadStart)
+                    .style(style::primary_button)
+                    .padding([2, 8]),
+                button(text("Cancel").size(style::fs(12)))
+                    .on_press(Msg::VoiceDownloadCancel)
+                    .style(style::ghost)
+                    .padding([2, 8]),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into()
+        }
+        VoiceDownloadState::Downloading { progress } => {
+            let (fraction, desc) = match progress {
+                Some(p) => {
+                    let mb_done = p.overall_bytes_done as f64 / 1_000_000.0;
+                    let mb_total = p.overall_total_bytes as f64 / 1_000_000.0;
+                    (
+                        p.fraction(),
+                        format!(
+                            "Downloading {} ({:.1} / {:.1} MB)...",
+                            p.file_name, mb_done, mb_total
+                        ),
+                    )
+                }
+                None => (0.0, "Starting download...".to_string()),
+            };
+            column![
+                iced::widget::progress_bar(0.0..=1.0, fraction).girth(style::fs(8)),
+                text(desc).size(style::fs(12)),
+            ]
+            .spacing(4)
+            .into()
+        }
+        VoiceDownloadState::Failed(err) => row![
+            text(format!("Download failed: {err}"))
+                .size(style::fs(12))
+                .style(|_: &Theme| text::Style {
+                    color: Some(Color::from_rgb(0.9, 0.2, 0.2)),
+                }),
+            button(text("Retry").size(style::fs(12)))
+                .on_press(Msg::VoiceDownloadPromptConfirm)
+                .style(style::pill_button)
+                .padding([2, 8]),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into(),
+        VoiceDownloadState::Completed => row![
+            text("Models downloaded successfully.").size(style::fs(12)),
+            button(text("Re-download").size(style::fs(12)))
+                .on_press(Msg::VoiceDownloadPromptConfirm)
+                .style(style::ghost)
+                .padding([2, 8]),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .into(),
+    };
+
+    let mut col = column![
+        text("Voice call").size(style::fs(15)).font(bold()),
+        row![
+            text("Voice mode")
+                .size(style::fs(14))
+                .width(style::fs(14) * 8.0),
+            button(text(if app.voice_enabled { "On" } else { "Off" }).size(style::fs(13)))
+                .on_press(Msg::VoiceToggleEnabled)
+                .style(if app.voice_enabled {
+                    style::primary_button
+                } else {
+                    style::pill_button
+                })
+                .padding([4, 12]),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+        row![
+            text("Speak Coordinator updates")
+                .size(style::fs(14))
+                .width(style::fs(14) * 14.0),
+            button(text(if app.voice_speak_updates { "On" } else { "Off" }).size(style::fs(13)))
+                .on_press(Msg::VoiceToggleSpeakUpdates)
+                .style(if app.voice_speak_updates {
+                    style::primary_button
+                } else {
+                    style::pill_button
+                })
+                .padding([4, 12]),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+        row![
+            text("Echo mode")
+                .size(style::fs(14))
+                .width(style::fs(14) * 8.0),
+            row![
+                echo_button("Speakers", "half_duplex"),
+                echo_button("Headset", "headset"),
+                echo_button("PipeWire echo-cancel", "pipewire_aec"),
+            ]
+            .spacing(6),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+        muted("Headset recommended for barge-in interruptions. Speakers mode pauses mic during speech.")
+            .size(style::fs(12)),
+        row![
+            text("Whisper STT")
+                .size(style::fs(14))
+                .width(style::fs(14) * 8.0),
+            text(format!("{}: {whisper_status}", config.voice.stt_model)).size(style::fs(13)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+        row![
+            text("Piper voice")
+                .size(style::fs(14))
+                .width(style::fs(14) * 8.0),
+            text(format!("en_US-lessac-medium: {piper_status}")).size(style::fs(13)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    ]
+    .spacing(12);
+
+    if !piper_installed {
+        col = col.push(
+            text("Piper TTS executable not found: install via `pip install piper-tts` or distro package")
+                .size(style::fs(12))
+                .style(|_: &Theme| text::Style {
+                    color: Some(Color::from_rgb(0.85, 0.55, 0.1)),
+                }),
+        );
+    }
+
+    col = col.push(
+        row![
+            text("Models")
+                .size(style::fs(14))
+                .width(style::fs(14) * 8.0),
+            download_controls,
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    );
+
+    col.into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1246,17 +1455,118 @@ fn chat_header<'a>(app: &'a App, s: &'a Session, theme: &Theme) -> Element<'a, M
         button(text("Delete").size(style::fs(13))).on_press(Msg::DeleteAsk).style(style::ghost).padding([6, 10]).into()
     };
 
+    #[cfg(feature = "voice")]
+    let active_call = app.call.as_ref().filter(|c| {
+        app.workspace.as_deref() == Some(&c.workspace)
+    });
+
+    #[cfg(feature = "voice")]
+    let call_btn = {
+        let config = jgt_core::config::Config::load();
+        let readiness = crate::app::voice_readiness(&config);
+        let is_ready = readiness.is_ok();
+        let tooltip_text = match &readiness {
+            Ok(_) => "Start voice call with Coordinator".to_string(),
+            Err(err) => err.clone(),
+        };
+        tip(
+            button(
+                row![
+                    icons::icon(icons::Icon::Listen, style::fs(14)),
+                    text("Call").size(style::fs(12)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .on_press_maybe(is_ready.then_some(Msg::VoiceCallStart))
+            .style(style::segment_button(false))
+            .padding([4, 10]),
+            tooltip_text,
+        )
+    };
+
+    #[cfg(feature = "voice")]
+    let controls = if s.is_coordinator() && active_call.is_none() {
+        row![call_btn, segment_control, archive, delete].spacing(12).align_y(Alignment::Center)
+    } else {
+        row![segment_control, archive, delete].spacing(12).align_y(Alignment::Center)
+    };
+    #[cfg(not(feature = "voice"))]
     let controls = row![segment_control, archive, delete].spacing(12).align_y(Alignment::Center);
+
     // The title side takes what the controls leave and clips (long paths, large text).
     let top = row![column![title, subtitle].spacing(4).width(Fill).clip(true), controls]
         .spacing(16)
         .align_y(Alignment::Center);
 
     let mut col = column![top].spacing(10);
+    #[cfg(feature = "voice")]
+    if let Some(call) = active_call {
+        col = col.push(call_bar(app, call, theme));
+    }
     if let Some(banner) = status_banner(app, s, theme) {
         col = col.push(banner);
     }
     container(col).padding([12, 18]).width(Fill).style(style::header).into()
+}
+
+#[cfg(feature = "voice")]
+fn call_bar<'a>(_app: &'a App, call: &'a crate::app::CallState, theme: &Theme) -> Element<'a, Msg> {
+    use crate::app::CallStatus;
+    let status_color = match &call.status {
+        CallStatus::Listening => style::status_color(theme, SessionStatus::Listening),
+        CallStatus::Hearing | CallStatus::Transcribing | CallStatus::Sent(_) => {
+            theme.extended_palette().primary.base.color
+        }
+        CallStatus::Speaking => style::status_color(theme, SessionStatus::Active),
+        CallStatus::Muted => style::status_color(theme, SessionStatus::Idle),
+        CallStatus::NoAudio | CallStatus::Error(_) => theme.extended_palette().danger.base.color,
+    };
+
+    let mut status_indicator = row![
+        dot(status_color, 8.0),
+        text(crate::app::call_status_label(&call.status)).size(style::fs(12)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    if !call.echo_mode.is_empty() {
+        status_indicator =
+            status_indicator.push(muted(format!("· {}", call.echo_mode)).size(style::fs(11)));
+    }
+
+    let mute_btn = if call.handle.is_some() {
+        Some(
+            button(text(if call.muted { "Unmute mic" } else { "Mute mic" }).size(style::fs(12)))
+                .on_press(Msg::VoiceCallToggleMute)
+                .style(style::pill_button)
+                .padding([4, 10]),
+        )
+    } else {
+        None
+    };
+
+    let end_btn = button(text("End call").size(style::fs(12)))
+        .on_press(Msg::VoiceCallEnd)
+        .style(style::danger_button)
+        .padding([4, 10]);
+
+    let mut bar_controls = row![].spacing(8).align_y(Alignment::Center);
+    if let Some(btn) = mute_btn {
+        bar_controls = bar_controls.push(btn);
+    }
+    bar_controls = bar_controls.push(end_btn);
+
+    container(
+        row![status_indicator, Space::new().width(Fill), bar_controls]
+            .spacing(12)
+            .align_y(Alignment::Center)
+            .width(Fill),
+    )
+    .padding([6, 12])
+    .width(Fill)
+    .style(style::pill)
+    .into()
 }
 
 /// Pure helper: returns true if the Listen toggle is enabled for the session.

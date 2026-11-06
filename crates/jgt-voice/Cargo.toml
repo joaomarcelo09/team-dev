@@ -1,0 +1,25 @@
+[package]
+name = "jgt-voice"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Voice call mode for jg-team-dev"
+
+[dependencies]
+jgt-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+cpal = "0.18"
+rubato = "5"
+earshot = "1.2"
+pulldown-cmark = "0.12"
+whisper-rs = { version = "0.16", default-features = false }
+sha2 = "0.10"
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
