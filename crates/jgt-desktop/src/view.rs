@@ -479,8 +479,9 @@ pub const AGENT_ROLES: &[&str] = &[
 pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
     let role_width = style::fs(14) * 7.0;
     let harness_width = style::fs(14) * 9.5;
-    let model_width = style::fs(14) * 11.0;
-    let suggestions_width = style::fs(14) * 12.0;
+    let model_width = style::fs(14) * 8.0;
+    let effort_width = style::fs(14) * 5.5;
+    let suggestions_width = style::fs(14) * 8.5;
 
     let mut section = column![
         text("Agents").size(style::fs(16)).font(bold()),
@@ -542,6 +543,7 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
         muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
         muted("HARNESS").size(style::fs(11)).font(bold()).width(harness_width),
         muted("MODEL").size(style::fs(11)).font(bold()).width(model_width),
+        muted("EFFORT").size(style::fs(11)).font(bold()).width(effort_width),
         muted("SUGGESTIONS").size(style::fs(11)).font(bold()).width(suggestions_width),
     ]
     .spacing(8)
@@ -595,6 +597,25 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
             .style(style::input)
             .width(model_width);
 
+        // Effort control
+        let levels = jgt_core::harness::effort_levels(agent.harness);
+        let r_name = role.to_string();
+        let effort_control: Element<'_, Msg> = if levels.is_empty() {
+            container(muted("n/a").size(style::fs(12)))
+                .width(effort_width)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            let selected = levels.iter().copied().find(|&l| l == agent.effort.as_str());
+            pick_list(levels, selected, move |e| {
+                Msg::SetAgentEffort(r_name.clone(), e.to_string())
+            })
+            .text_size(style::fs(13))
+            .padding([4, 8])
+            .width(effort_width)
+            .into()
+        };
+
         // Model suggestions control
         let r_name = role.to_string();
         let suggestions_control: Element<'_, Msg> = match app.harness_models.get(&agent.harness) {
@@ -633,6 +654,7 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
             text(role).size(style::fs(13)).font(bold()).width(role_width),
             harness_control,
             model_input,
+            effort_control,
             suggestions_control,
         ]
         .spacing(8)
@@ -2278,13 +2300,15 @@ mod tests {
     fn test_settings_agents_unlocked_renders() {
         let (mut app, _) = App::new(None);
         app.show_settings = true;
-        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Antigravity];
+        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Antigravity, Harness::Opencode];
         app.agents = AGENT_ROLES
             .iter()
             .map(|&role| AgentRow {
                 role: role.to_string(),
                 harness: if role == jgt_core::COORDINATOR {
                     Harness::ClaudeCode
+                } else if role == "reviewer" {
+                    Harness::Opencode
                 } else {
                     Harness::Antigravity
                 },
@@ -2391,5 +2415,29 @@ mod tests {
         let _ = agents_section(&app);
         let _ = settings(&app);
         let _ = view(&app);
+    }
+
+    #[test]
+    fn test_settings_agents_row_width_fits_card() {
+        for fs14 in [14.0, style::fs(14)] {
+            let role_width = fs14 * 7.0;
+            let harness_width = fs14 * 9.5;
+            let model_width = fs14 * 8.0;
+            let effort_width = fs14 * 5.5;
+            let suggestions_width = fs14 * 8.5;
+            let spacing = 8.0 * 4.0;
+
+            let total_row_width = role_width + harness_width + model_width + effort_width + suggestions_width + spacing;
+            let card_max_width = fs14 * 46.0;
+            let card_padding = 22.0 * 2.0;
+            let scrollable_padding_right = 8.0;
+            let scrollbar_width = 12.0;
+            let usable_width = card_max_width - card_padding - scrollable_padding_right - scrollbar_width;
+
+            assert!(
+                total_row_width <= usable_width,
+                "Row width ({total_row_width}px) exceeds usable width ({usable_width}px) at fs(14)={fs14}"
+            );
+        }
     }
 }
