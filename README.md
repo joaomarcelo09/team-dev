@@ -272,7 +272,7 @@ echo = "headset"           # half_duplex | headset | pipewire_aec
 ```
 
 > [!NOTE]
-> Other STT models such as `small.en-q5_1` (faster transcription, smaller download) or `small.en` can be configured via `voice.stt_model`.
+> Other STT models such as `small.en-q5_1` (faster transcription, smaller download), `small.en`, or `large-v3-turbo-q5_0` (~547 MiB download, more accurate, larger/slower on CPU, language forced to English) can be configured via `voice.stt_model`.
 
 ### Privacy & Language
 

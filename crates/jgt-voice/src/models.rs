@@ -1,6 +1,11 @@
 use std::path::PathBuf;
 use crate::error::VoiceError;
 
+/// Supported Whisper STT models.
+pub const WHISPER_DEFAULT_MODEL: &str = "medium.en-q5_0";
+pub const WHISPER_SMALL_EN_Q5_1: &str = "small.en-q5_1";
+pub const WHISPER_LARGE_V3_TURBO_Q5_0: &str = "large-v3-turbo-q5_0";
+
 /// Directory where voice models and piper voices are stored (`~/.local/share/jg-team-dev/models`).
 pub fn models_dir() -> PathBuf {
     jgt_core::paths::data_dir().join("models")
@@ -145,6 +150,14 @@ mod tests {
             whisper_model_path("ggml-medium.en-q5_0.bin"),
             expected_models.join("whisper/ggml-medium.en-q5_0.bin")
         );
+        assert_eq!(
+            whisper_model_path("large-v3-turbo-q5_0"),
+            expected_models.join("whisper/ggml-large-v3-turbo-q5_0.bin")
+        );
+        assert_eq!(
+            whisper_model_path("ggml-large-v3-turbo-q5_0.bin"),
+            expected_models.join("whisper/ggml-large-v3-turbo-q5_0.bin")
+        );
 
         assert_eq!(
             piper_voice_path("en_US-lessac-medium"),
@@ -189,6 +202,12 @@ mod tests {
         let small_path = whisper_model_path("small.en-q5_1");
         std::fs::write(&small_path, b"dummy small weights").unwrap();
         assert_eq!(check_whisper("small.en-q5_1").unwrap(), small_path);
+
+        // Also check large-v3-turbo-q5_0
+        let turbo_path = whisper_model_path("large-v3-turbo-q5_0");
+        std::fs::write(&turbo_path, b"dummy turbo weights").unwrap();
+        assert_eq!(check_whisper("large-v3-turbo-q5_0").unwrap(), turbo_path);
+        assert_eq!(check_whisper("ggml-large-v3-turbo-q5_0.bin").unwrap(), turbo_path);
     }
 
     #[test]
@@ -227,5 +246,21 @@ mod tests {
         std::fs::write(&json_path, b"{}").unwrap();
 
         assert_eq!(check_piper("en_US-lessac-medium").unwrap(), onnx_path);
+    }
+
+    #[test]
+    fn test_large_v3_turbo_path_and_missing_hint() {
+        let _lock = TEST_MUTEX.lock().unwrap();
+        let _guard = EnvGuard::new("jgt-voice-turbo");
+
+        let err = check_whisper("large-v3-turbo-q5_0").unwrap_err();
+        match err {
+            VoiceError::MissingModel { what, path, hint } => {
+                assert!(what.contains("large-v3-turbo-q5_0"));
+                assert!(path.ends_with("whisper/ggml-large-v3-turbo-q5_0.bin"));
+                assert!(hint.contains("Download ggml-large-v3-turbo-q5_0.bin from https://huggingface.co/ggerganov/whisper.cpp"));
+            }
+            other => panic!("expected MissingModel, got {other:?}"),
+        }
     }
 }
