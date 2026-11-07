@@ -14,7 +14,7 @@ use iced::{
     Alignment, Color, Element, Fill, Font, Padding, Shrink, Theme,
     font::Weight,
     widget::{
-        Space, button, column, container, markdown, pick_list, row, rule, scrollable, space, stack, text, text_editor,
+        Space, button, column, container, markdown, mouse_area, pick_list, row, rule, scrollable, space, stack, text, text_editor,
         text_input, tooltip,
     },
 };
@@ -1579,8 +1579,14 @@ fn select_button_user<'a>(id: i64, selecting: bool) -> Element<'a, Msg> {
     }
 }
 
-fn message_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, Msg> {
+fn message_editor<'a>(editor: &'a text_editor::Content, id: i64, theme: &Theme) -> Element<'a, Msg> {
+    let hl_theme = if theme.extended_palette().is_dark {
+        iced::highlighter::Theme::Base16Mocha
+    } else {
+        iced::highlighter::Theme::InspiredGitHub
+    };
     text_editor(editor)
+        .highlight("md", hl_theme)
         .on_action(move |action| Msg::MessageEditor(id, action))
         .padding([8, 10])
         .size(style::fs(14))
@@ -1590,14 +1596,27 @@ fn message_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, 
         .into()
 }
 
-fn message_user_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, Msg> {
+fn message_user_editor<'a>(editor: &'a text_editor::Content, id: i64, theme: &Theme) -> Element<'a, Msg> {
+    let hl_theme = if theme.extended_palette().is_dark {
+        iced::highlighter::Theme::Base16Mocha
+    } else {
+        iced::highlighter::Theme::InspiredGitHub
+    };
     text_editor(editor)
+        .highlight("md", hl_theme)
         .on_action(move |action| Msg::MessageEditor(id, action))
         .padding([8, 10])
         .size(style::fs(14))
         .font(style::ui_font())
         .wrapping(iced::widget::text::Wrapping::Word)
         .style(style::read_only_user_editor)
+        .into()
+}
+
+fn selectable_body<'a>(body: Element<'a, Msg>, id: i64) -> Element<'a, Msg> {
+    mouse_area(body)
+        .on_press(Msg::SelectMessage(id))
+        .interaction(iced::mouse::Interaction::Text)
         .into()
 }
 
@@ -1641,9 +1660,9 @@ fn message_view<'a>(
             .spacing(6)
             .align_y(Alignment::Center);
             let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-                message_user_editor(ed, m.id)
+                message_user_editor(ed, m.id, theme)
             } else {
-                text(m.body.as_str()).size(style::fs(14)).into()
+                selectable_body(text(m.body.as_str()).size(style::fs(14)).into(), m.id)
             };
             let bubble = container(column![content, footer].spacing(4))
                 .padding([8, 12])
@@ -1668,9 +1687,9 @@ fn message_view<'a>(
             .spacing(6)
             .align_y(Alignment::Center);
             let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-                message_editor(ed, m.id)
+                message_editor(ed, m.id, theme)
             } else {
-                md(items, &m.body, settings)
+                selectable_body(md(items, &m.body, settings), m.id)
             };
             let card = container(
                 row![dot(accent, 10.0), column![content, footer].spacing(6).width(Fill)]
@@ -1698,9 +1717,9 @@ fn message_view<'a>(
                 Space::new().width(6).into()
             };
             let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-                message_editor(ed, m.id)
+                message_editor(ed, m.id, theme)
             } else {
-                md(items, &m.body, settings)
+                selectable_body(md(items, &m.body, settings), m.id)
             };
             let bubble = container(column![content, footer].spacing(6))
                 .padding([10, 14])
@@ -1727,9 +1746,9 @@ fn question_view<'a>(
     let is_selecting = app.selecting_message == Some(m.id);
     let editor = thread.editors.get(&m.id);
     let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-        message_editor(ed, m.id)
+        message_editor(ed, m.id, theme)
     } else {
-        md(items, &m.body, settings)
+        selectable_body(md(items, &m.body, settings), m.id)
     };
 
     let mut col = column![
@@ -2521,5 +2540,76 @@ mod tests {
         let short_q = make_q("q3", MessageKind::Question, vec!["Yes", "No"]);
         let short_q_msg = make_msg(3, MessageKind::Question, Some(short_q));
         let _ = question_view(&app, &s, &thread, &short_q_msg, None, settings, &theme);
+    }
+
+    #[test]
+    fn test_message_view_renders_unselected_and_selected() {
+        let (mut app, _) = App::new(None);
+        let s = test_session("s1", Some("coordinator"), None, SessionStatus::Active, false);
+        let mut thread = Thread::default();
+
+        let agent_msg = Message {
+            id: 10,
+            session_id: "s1".to_string(),
+            direction: Direction::FromAgent,
+            kind: MessageKind::Text,
+            body: "```rust\nfn foo() {}\n```".to_string(),
+            created_at: 1000,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: None,
+        };
+        let user_msg = Message {
+            id: 11,
+            session_id: "s1".to_string(),
+            direction: Direction::ToAgent,
+            kind: MessageKind::Text,
+            body: "User message body".to_string(),
+            created_at: 1001,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: None,
+        };
+        let notify_msg = Message {
+            id: 12,
+            session_id: "s1".to_string(),
+            direction: Direction::FromAgent,
+            kind: MessageKind::Notify,
+            body: "Notification body".to_string(),
+            created_at: 1002,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: None,
+        };
+
+        thread.upsert(agent_msg.clone());
+        thread.upsert(user_msg.clone());
+        thread.upsert(notify_msg.clone());
+
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut md_style = markdown::Style::from_palette(theme.palette());
+            md_style.font = style::ui_font();
+            let settings = markdown::Settings::with_text_size(style::fs(14), md_style);
+
+            // Unselected rendering
+            app.selecting_message = None;
+            let _ = message_view(&app, &s, &thread, &agent_msg, thread.markdown.get(&10), settings, &theme);
+            let _ = message_view(&app, &s, &thread, &user_msg, thread.markdown.get(&11), settings, &theme);
+            let _ = message_view(&app, &s, &thread, &notify_msg, thread.markdown.get(&12), settings, &theme);
+
+            // Selected rendering (enters text_editor view with code highlighting)
+            app.selecting_message = Some(10);
+            let _ = message_view(&app, &s, &thread, &agent_msg, thread.markdown.get(&10), settings, &theme);
+            app.selecting_message = Some(11);
+            let _ = message_view(&app, &s, &thread, &user_msg, thread.markdown.get(&11), settings, &theme);
+            app.selecting_message = Some(12);
+            let _ = message_view(&app, &s, &thread, &notify_msg, thread.markdown.get(&12), settings, &theme);
+        }
     }
 }
