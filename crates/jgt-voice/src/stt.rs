@@ -4,7 +4,8 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextPar
 use crate::error::VoiceError;
 
 /// Domain vocabulary initial prompt to bias Whisper towards project terminology.
-pub const INITIAL_PROMPT: &str = "Coordinator, task, branch, merge.";
+pub const INITIAL_PROMPT: &str =
+    "Coordinator, task, branch, merge, worktree, reviewer, verifier, planner, backlog, pkgrel, Rust, iced, JGT, large-v3-turbo.";
 
 /// Whisper limits the initial prompt context to ~224 tokens.
 pub const MAX_INITIAL_PROMPT_TOKENS: usize = 224;
@@ -181,7 +182,7 @@ impl Stt {
 
     /// Transcribes a 16 kHz mono `f32` PCM audio buffer to English text.
     ///
-    /// Greedy decoding is used without timestamps. Blank-audio markers and surrounding whitespace
+    /// Beam search decoding is used without timestamps. Blank-audio markers and surrounding whitespace
     /// are stripped. Transcripts echoing the initial prompt are dropped.
     pub fn transcribe(&self, audio: &[f32]) -> Result<String, VoiceError> {
         let (raw, _) = self.transcribe_raw_with_prompt(audio, Some(capped_initial_prompt()))?;
@@ -203,7 +204,10 @@ impl Stt {
             .create_state()
             .map_err(|e| VoiceError::Other(format!("failed to create whisper state: {e:?}")))?;
 
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+        let mut params = FullParams::new(SamplingStrategy::BeamSearch {
+            beam_size: 5,
+            patience: -1.0,
+        });
         params.set_language(Some("en"));
         params.set_no_timestamps(true);
         params.set_print_special(false);
@@ -287,6 +291,12 @@ mod tests {
         assert_eq!(clean_transcript("task, branch, merge"), "");
         assert!(is_prompt_echo("task, branch, merge"));
 
+        assert_eq!(clean_transcript("reviewer, verifier, planner"), "");
+        assert!(is_prompt_echo("reviewer, verifier, planner"));
+
+        assert_eq!(clean_transcript("Rust, iced, JGT"), "");
+        assert!(is_prompt_echo("Rust, iced, JGT"));
+
         // Prefix/sub-run with bracket markers stripped before checking echo
         assert_eq!(
             clean_transcript("[BLANK_AUDIO] Coordinator, task, branch [NOISE]"),
@@ -303,6 +313,14 @@ mod tests {
         );
         assert!(is_prompt_echo(
             "Coordinator, task, branch, merge, how is the task going?"
+        ));
+
+        assert_eq!(
+            clean_transcript("reviewer, verifier, planner, backlog, check the issues"),
+            ""
+        );
+        assert!(is_prompt_echo(
+            "reviewer, verifier, planner, backlog, check the issues"
         ));
     }
 
@@ -321,9 +339,39 @@ mod tests {
         assert!(!is_prompt_echo("coordinator"));
         assert_eq!(clean_transcript("coordinator"), "coordinator");
 
+        assert!(!is_prompt_echo("worktree"));
+        assert_eq!(clean_transcript("worktree"), "worktree");
+
+        assert!(!is_prompt_echo("reviewer"));
+        assert_eq!(clean_transcript("reviewer"), "reviewer");
+
+        assert!(!is_prompt_echo("verifier"));
+        assert_eq!(clean_transcript("verifier"), "verifier");
+
+        assert!(!is_prompt_echo("planner"));
+        assert_eq!(clean_transcript("planner"), "planner");
+
+        assert!(!is_prompt_echo("backlog"));
+        assert_eq!(clean_transcript("backlog"), "backlog");
+
+        assert!(!is_prompt_echo("pkgrel"));
+        assert_eq!(clean_transcript("pkgrel"), "pkgrel");
+
+        assert!(!is_prompt_echo("Rust"));
+        assert_eq!(clean_transcript("Rust"), "Rust");
+
+        assert!(!is_prompt_echo("iced"));
+        assert_eq!(clean_transcript("iced"), "iced");
+
+        assert!(!is_prompt_echo("JGT"));
+        assert_eq!(clean_transcript("JGT"), "JGT");
+
         // Two words
         assert!(!is_prompt_echo("merge branch"));
         assert_eq!(clean_transcript("merge branch"), "merge branch");
+
+        assert!(!is_prompt_echo("Rust iced"));
+        assert_eq!(clean_transcript("Rust iced"), "Rust iced");
     }
 
     #[test]
@@ -352,6 +400,44 @@ mod tests {
             "I will create a new branch and test it"
         );
         assert!(!is_prompt_echo("I will create a new branch and test it"));
+
+        assert_eq!(
+            clean_transcript("switch to the worktree and run cargo test"),
+            "switch to the worktree and run cargo test"
+        );
+        assert!(!is_prompt_echo("switch to the worktree and run cargo test"));
+
+        assert_eq!(
+            clean_transcript("the reviewer and verifier passed"),
+            "the reviewer and verifier passed"
+        );
+        assert!(!is_prompt_echo("the reviewer and verifier passed"));
+
+        assert_eq!(
+            clean_transcript("check the backlog in JGT"),
+            "check the backlog in JGT"
+        );
+        assert!(!is_prompt_echo("check the backlog in JGT"));
+
+        assert_eq!(
+            clean_transcript("bump pkgrel for the new release"),
+            "bump pkgrel for the new release"
+        );
+        assert!(!is_prompt_echo("bump pkgrel for the new release"));
+
+        assert_eq!(
+            clean_transcript("the app is written in Rust using iced"),
+            "the app is written in Rust using iced"
+        );
+        assert!(!is_prompt_echo("the app is written in Rust using iced"));
+
+        assert_eq!(
+            clean_transcript("transcription with large-v3-turbo is faster"),
+            "transcription with large-v3-turbo is faster"
+        );
+        assert!(!is_prompt_echo(
+            "transcription with large-v3-turbo is faster"
+        ));
     }
 
     #[test]
@@ -377,11 +463,21 @@ mod tests {
     #[test]
     fn test_initial_prompt_constant() {
         assert!(!INITIAL_PROMPT.is_empty(), "initial prompt must not be empty");
-        // Verify key domain terms from the shortened prompt are present
+        // Verify key domain terms from the prompt are present
         assert!(INITIAL_PROMPT.contains("Coordinator"));
         assert!(INITIAL_PROMPT.contains("task"));
         assert!(INITIAL_PROMPT.contains("branch"));
         assert!(INITIAL_PROMPT.contains("merge"));
+        assert!(INITIAL_PROMPT.contains("worktree"));
+        assert!(INITIAL_PROMPT.contains("reviewer"));
+        assert!(INITIAL_PROMPT.contains("verifier"));
+        assert!(INITIAL_PROMPT.contains("planner"));
+        assert!(INITIAL_PROMPT.contains("backlog"));
+        assert!(INITIAL_PROMPT.contains("pkgrel"));
+        assert!(INITIAL_PROMPT.contains("Rust"));
+        assert!(INITIAL_PROMPT.contains("iced"));
+        assert!(INITIAL_PROMPT.contains("JGT"));
+        assert!(INITIAL_PROMPT.contains("large-v3-turbo"));
 
         // Whisper initial prompt limit is ~224 tokens.
         let word_count = INITIAL_PROMPT.split_whitespace().count();
@@ -469,20 +565,106 @@ mod tests {
         }
 
         // Benchmark small.en-q5_1 for comparison if present
-        if let Ok(small_path) = crate::models::check_whisper("small.en-q5_1") {
-            if let Ok(small_stt) = Stt::load(&small_path, 4) {
-                println!("\n=== Comparing with legacy small.en-q5_1 ===");
-                for (phrase, _) in test_cases {
-                    let pcm = piper.synthesize(phrase).await.expect("synthesis failed");
-                    let audio_16k = crate::resample::resample(pcm.sample_rate, 16_000, &pcm.to_f32())
-                        .expect("resample failed");
+        if let Ok(small_path) = crate::models::check_whisper("small.en-q5_1")
+            && let Ok(small_stt) = Stt::load(&small_path, 4)
+        {
+            println!("\n=== Comparing with legacy small.en-q5_1 ===");
+            for (phrase, _) in test_cases {
+                let pcm = piper.synthesize(phrase).await.expect("synthesis failed");
+                let audio_16k = crate::resample::resample(pcm.sample_rate, 16_000, &pcm.to_f32())
+                    .expect("resample failed");
 
-                    let t0 = Instant::now();
-                    let transcript = small_stt.transcribe(&audio_16k).expect("transcription failed");
-                    let duration = t0.elapsed();
-                    println!("[small.en-q5_1] '{phrase}' -> '{transcript}' in {duration:?}");
-                }
+                let t0 = Instant::now();
+                let transcript = small_stt.transcribe(&audio_16k).expect("transcription failed");
+                let duration = t0.elapsed();
+                println!("[small.en-q5_1] '{phrase}' -> '{transcript}' in {duration:?}");
             }
         }
+
+        // Benchmark large-v3-turbo-q5_0 for comparison if present
+        if let Ok(turbo_path) = crate::models::check_whisper("large-v3-turbo-q5_0")
+            && let Ok(turbo_stt) = Stt::load(&turbo_path, 4)
+        {
+            println!("\n=== Comparing with large-v3-turbo-q5_0 ===");
+            for (phrase, _) in test_cases {
+                let pcm = piper.synthesize(phrase).await.expect("synthesis failed");
+                let audio_16k = crate::resample::resample(pcm.sample_rate, 16_000, &pcm.to_f32())
+                    .expect("resample failed");
+
+                let t0 = Instant::now();
+                let transcript = turbo_stt.transcribe(&audio_16k).expect("transcription failed");
+                let duration = t0.elapsed();
+                println!("[large-v3-turbo-q5_0] '{phrase}' -> '{transcript}' in {duration:?}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "benchmark medium vs large-v3-turbo on same utterance"]
+    async fn test_benchmark_medium_vs_large_v3_turbo_same_utterance() {
+        use crate::audio::clean::clean_audio;
+        use crate::tts::TtsEngine;
+        use std::time::Instant;
+
+        let medium_path = crate::models::check_whisper("medium.en-q5_0").expect("medium model missing");
+        let turbo_path = crate::models::check_whisper("large-v3-turbo-q5_0").expect("turbo model missing");
+        let piper = crate::tts::PiperCommand::new("piper", "en_US-lessac-medium").expect("piper missing");
+
+        let phrase = "restart the coordinator session and check the backlog";
+        let pcm = piper.synthesize(phrase).await.expect("synthesis failed");
+        let audio_16k = crate::resample::resample(pcm.sample_rate, 16_000, &pcm.to_f32())
+            .expect("resample failed");
+        // Clean-up applied once (as done in listener.rs pipeline)
+        let cleaned_audio = clean_audio(&audio_16k);
+
+        let medium_stt = Stt::load(&medium_path, 4).expect("failed to load medium");
+        let turbo_stt = Stt::load(&turbo_path, 4).expect("failed to load turbo");
+
+        println!("\n========================================================");
+        println!("Benchmark: SAME Utterance (beam 5, clean-up applied once, CPU only)");
+        println!("Phrase: \"{}\"", phrase);
+        println!("Audio duration: {:.2}s ({} samples)", cleaned_audio.len() as f32 / 16000.0, cleaned_audio.len());
+        println!("========================================================");
+
+        // Run medium at least 3 times
+        let mut medium_times = Vec::new();
+        let mut medium_transcript = String::new();
+        for run in 1..=3 {
+            let t0 = Instant::now();
+            let transcript = medium_stt.transcribe(&cleaned_audio).expect("medium transcribe failed");
+            let elapsed_ms = t0.elapsed().as_millis();
+            println!("[medium.en-q5_0] Run {run}: {elapsed_ms} ms -> \"{transcript}\"");
+            medium_times.push(elapsed_ms);
+            medium_transcript = transcript;
+        }
+
+        // Run turbo at least 3 times
+        let mut turbo_times = Vec::new();
+        let mut turbo_transcript = String::new();
+        for run in 1..=3 {
+            let t0 = Instant::now();
+            let transcript = turbo_stt.transcribe(&cleaned_audio).expect("turbo transcribe failed");
+            let elapsed_ms = t0.elapsed().as_millis();
+            println!("[large-v3-turbo-q5_0] Run {run}: {elapsed_ms} ms -> \"{transcript}\"");
+            turbo_times.push(elapsed_ms);
+            turbo_transcript = transcript;
+        }
+
+        let mut sorted_med = medium_times.clone();
+        sorted_med.sort_unstable();
+        let min_med = sorted_med[0];
+        let median_med = sorted_med[sorted_med.len() / 2];
+
+        let mut sorted_turbo = turbo_times.clone();
+        sorted_turbo.sort_unstable();
+        let min_turbo = sorted_turbo[0];
+        let median_turbo = sorted_turbo[sorted_turbo.len() / 2];
+
+        println!("\n------------------ Timing Summary ------------------");
+        println!("Model                 | Min (ms) | Median (ms) | Transcript");
+        println!("----------------------+----------+-------------+-------------------");
+        println!("medium.en-q5_0        | {:8} | {:11} | {}", min_med, median_med, medium_transcript);
+        println!("large-v3-turbo-q5_0   | {:8} | {:11} | {}", min_turbo, median_turbo, turbo_transcript);
+        println!("----------------------------------------------------");
     }
 }

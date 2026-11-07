@@ -826,6 +826,14 @@ stt_model = "small.en-q5_1"
 "#;
         let cfg: Config = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.voice.stt_model, "small.en-q5_1");
+
+        let toml_turbo = r#"
+[voice]
+enabled = true
+stt_model = "large-v3-turbo-q5_0"
+"#;
+        let cfg_turbo: Config = toml::from_str(toml_turbo).unwrap();
+        assert_eq!(cfg_turbo.voice.stt_model, "large-v3-turbo-q5_0");
     }
 
     #[test]

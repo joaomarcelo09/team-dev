@@ -420,6 +420,57 @@ pub fn voice_readiness(config: &jgt_core::config::Config) -> Result<(), String> 
     Ok(())
 }
 
+/// What to do with transcribed voice speech.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub enum VoiceSpeechDecision<'a> {
+    Send(&'a Session),
+    NoCoordinator,
+    CoordinatorEnded,
+}
+
+#[allow(dead_code)]
+impl<'a> VoiceSpeechDecision<'a> {
+    pub fn is_drop(&self) -> bool {
+        matches!(self, Self::NoCoordinator | Self::CoordinatorEnded)
+    }
+
+    pub fn is_send(&self) -> bool {
+        matches!(self, Self::Send(_))
+    }
+}
+
+/// Decides whether a coordinator can accept a voice message.
+#[allow(dead_code)]
+pub fn decide_voice_speech_target<'a>(coord: Option<&'a Session>) -> VoiceSpeechDecision<'a> {
+    let Some(coord) = coord else {
+        return VoiceSpeechDecision::NoCoordinator;
+    };
+    if coord.status == SessionStatus::Ended {
+        return VoiceSpeechDecision::CoordinatorEnded;
+    }
+    VoiceSpeechDecision::Send(coord)
+}
+
+/// Decides whether a transcribed voice message can be sent to an active Coordinator
+/// for the given workspace, or should be dropped.
+#[allow(dead_code)]
+pub fn decide_voice_speech<'a>(
+    sessions: &'a [Session],
+    workspace: &str,
+) -> VoiceSpeechDecision<'a> {
+    decide_voice_speech_target(coordinator_for(sessions, workspace))
+}
+
+/// Alias for [`decide_voice_speech`].
+#[allow(dead_code)]
+pub fn decide_user_speech<'a>(
+    sessions: &'a [Session],
+    workspace: &str,
+) -> VoiceSpeechDecision<'a> {
+    decide_voice_speech(sessions, workspace)
+}
+
 /// A step for the zoom and text-size controls.
 #[derive(Debug, Clone, Copy)]
 pub enum Step {
@@ -1899,13 +1950,25 @@ impl App {
                 call.muted = new_muted;
                 match ev {
                     jgt_voice::VoiceEvent::UserSpeech(text) => {
-                        let Some(coord) = coordinator_for(&self.sessions, &call.workspace).cloned() else {
-                            return Task::none();
-                        };
-                        if coord.status == SessionStatus::Ended {
-                            return Task::none();
+                        match decide_voice_speech(&self.sessions, &call.workspace) {
+                            VoiceSpeechDecision::Send(coord) => {
+                                let coord = coord.clone();
+                                Task::perform(hub::send_and_wake(coord, text), Msg::Sent)
+                            }
+                            VoiceSpeechDecision::NoCoordinator
+                            | VoiceSpeechDecision::CoordinatorEnded => {
+                                tracing::warn!("Voice message not sent: no active Coordinator");
+                                self.toast("Voice message not sent: no active Coordinator", true);
+                                let existing = self.composer.text();
+                                let combined = if existing.trim().is_empty() {
+                                    text
+                                } else {
+                                    format!("{}\n{}", existing.trim_end(), text)
+                                };
+                                self.composer = text_editor::Content::with_text(&combined);
+                                Task::none()
+                            }
                         }
-                        Task::perform(hub::send_and_wake(coord, text), Msg::Sent)
                     }
                     jgt_voice::VoiceEvent::Error => {
                         if let Some(handle) = &call.handle {
@@ -3498,5 +3561,161 @@ effort = "low"
         // Done success
         let _ = app.update(Msg::VoiceDownloadDone(Ok(())));
         assert_eq!(app.voice_download_state, VoiceDownloadState::Completed);
+    }
+
+    #[test]
+    fn test_decide_voice_speech_drop_paths() {
+        let ws = "/projects/my-app";
+
+        // Drop path 1: no coordinators in session list
+        let sessions = vec![];
+        let decision = decide_voice_speech(&sessions, ws);
+        assert_eq!(decision, VoiceSpeechDecision::NoCoordinator);
+        assert!(decision.is_drop());
+        assert!(!decision.is_send());
+
+        // Drop path 1: coordinators exist, but for different workspaces
+        let other_session = make_session(
+            "c_other",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some("/other"),
+            SessionStatus::Active,
+            false,
+        );
+        let sessions = vec![other_session];
+        let decision = decide_voice_speech(&sessions, ws);
+        assert_eq!(decision, VoiceSpeechDecision::NoCoordinator);
+        assert!(decision.is_drop());
+
+        // Drop path 2: coordinator exists for workspace, but status is Ended
+        let ended_session = make_session(
+            "c_ended",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(ws),
+            SessionStatus::Ended,
+            false,
+        );
+        let sessions = vec![ended_session.clone()];
+        let decision = decide_voice_speech(&sessions, ws);
+        assert_eq!(decision, VoiceSpeechDecision::CoordinatorEnded);
+        assert!(decision.is_drop());
+        assert!(!decision.is_send());
+
+        // Drop path 2: multiple coordinators exist for workspace, but all are Ended
+        let ended_session2 = make_session(
+            "c_ended2",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(ws),
+            SessionStatus::Ended,
+            false,
+        );
+        let sessions = vec![ended_session, ended_session2];
+        let decision = decide_voice_speech(&sessions, ws);
+        assert_eq!(decision, VoiceSpeechDecision::CoordinatorEnded);
+        assert!(decision.is_drop());
+
+        // Success / Send path: coordinator exists with Active status
+        let active_session = make_session(
+            "c_active",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(ws),
+            SessionStatus::Active,
+            false,
+        );
+        let sessions = vec![active_session.clone()];
+        let decision = decide_voice_speech(&sessions, ws);
+        assert_eq!(decision, VoiceSpeechDecision::Send(&sessions[0]));
+        assert!(decision.is_send());
+        assert!(!decision.is_drop());
+
+        // Success / Send path: coordinator exists with Idle or Listening or Disconnected status
+        for status in [SessionStatus::Idle, SessionStatus::Listening, SessionStatus::Disconnected] {
+            let s = make_session("c_live", Some(jgt_core::COORDINATOR), None, Some(ws), status, false);
+            let sessions = vec![s];
+            assert_eq!(decide_voice_speech(&sessions, ws), VoiceSpeechDecision::Send(&sessions[0]));
+        }
+
+        // Test decide_voice_speech_target directly
+        assert_eq!(decide_voice_speech_target(None), VoiceSpeechDecision::NoCoordinator);
+        let ended = make_session("c_ended_direct", Some(jgt_core::COORDINATOR), None, Some(ws), SessionStatus::Ended, false);
+        assert_eq!(decide_voice_speech_target(Some(&ended)), VoiceSpeechDecision::CoordinatorEnded);
+        let active = make_session("c_act_direct", Some(jgt_core::COORDINATOR), None, Some(ws), SessionStatus::Active, false);
+        assert_eq!(decide_voice_speech_target(Some(&active)), VoiceSpeechDecision::Send(&active));
+
+        // Test decide_user_speech alias
+        assert_eq!(decide_user_speech(&sessions, ws), decide_voice_speech(&sessions, ws));
+    }
+
+    #[cfg(feature = "voice")]
+    #[test]
+    fn test_voice_user_speech_dropped_updates_toast_and_composer() {
+        let (mut app, _) = App::new(None);
+        let ws = "/projects/my-app";
+        app.call = Some(CallState {
+            workspace: ws.into(),
+            session_id: "call-1".into(),
+            muted: false,
+            status: CallStatus::Listening,
+            started_at: 1000,
+            handle: None,
+            id: 1,
+            echo_mode: "half_duplex".into(),
+        });
+
+        // Drop path 1: No coordinator -> toast shown, text kept in composer
+        let _ = app.update(Msg::Voice(jgt_voice::VoiceEvent::UserSpeech(
+            "voice message when no coordinator".into(),
+        )));
+        assert_eq!(
+            app.toast.as_ref().map(|t| (t.text.as_str(), t.error)),
+            Some(("Voice message not sent: no active Coordinator", true))
+        );
+        assert_eq!(
+            app.composer.text().trim(),
+            "voice message when no coordinator"
+        );
+
+        // Drop path 2: Ended coordinator -> toast shown, text kept in composer
+        app.toast = None;
+        app.composer = text_editor::Content::new();
+        app.sessions = vec![make_session(
+            "c_ended",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(ws),
+            SessionStatus::Ended,
+            false,
+        )];
+
+        let _ = app.update(Msg::Voice(jgt_voice::VoiceEvent::UserSpeech(
+            "voice message when coordinator ended".into(),
+        )));
+        assert_eq!(
+            app.toast.as_ref().map(|t| (t.text.as_str(), t.error)),
+            Some(("Voice message not sent: no active Coordinator", true))
+        );
+        assert_eq!(
+            app.composer.text().trim(),
+            "voice message when coordinator ended"
+        );
+
+        // Drop path with pre-existing text in composer: keeps pre-existing text and appends voice speech
+        app.toast = None;
+        app.composer = text_editor::Content::with_text("drafting something");
+        let _ = app.update(Msg::Voice(jgt_voice::VoiceEvent::UserSpeech(
+            "appended speech".into(),
+        )));
+        assert_eq!(
+            app.toast.as_ref().map(|t| (t.text.as_str(), t.error)),
+            Some(("Voice message not sent: no active Coordinator", true))
+        );
+        assert_eq!(
+            app.composer.text().trim(),
+            "drafting something\nappended speech"
+        );
     }
 }

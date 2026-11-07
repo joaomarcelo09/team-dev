@@ -36,6 +36,7 @@ pub mod stt;
 pub mod tts;
 pub mod vad;
 
+pub use audio::clean::{clean_audio, high_pass_filter, normalize_gain};
 pub use audio::playback::{AudioQueue, Player};
 pub use audio::{find_device_index, get_device_name, select_device};
 pub use call::{should_barge_in, CallHandle, EchoMode, VoiceCall, BARGE_IN_THRESHOLD_MS};
@@ -44,7 +45,8 @@ pub use error::VoiceError;
 pub use listener::{Listener, ListenerHandle};
 pub use models::{
     check_piper, check_whisper, models_dir, piper_voice_config_path, piper_voice_path,
-    piper_voice_paths, whisper_model_path,
+    piper_voice_paths, whisper_model_path, WHISPER_DEFAULT_MODEL, WHISPER_LARGE_V3_TURBO_Q5_0,
+    WHISPER_SMALL_EN_Q5_1,
 };
 pub use speaker::{Speaker, SpeakerHandle};
 pub use speech_text::speech_text;

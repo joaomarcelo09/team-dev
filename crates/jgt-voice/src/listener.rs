@@ -3,11 +3,15 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 use crate::audio::capture::AudioCapture;
+use crate::audio::clean::clean_audio;
 use crate::error::VoiceError;
 use crate::resample::Resampler16k;
 use crate::stt::{Stt, Transcriber};
 use crate::vad::VadSegmenter;
 use crate::VoiceEvent;
+
+pub use crate::audio::clean::{DEFAULT_CUTOFF_HZ, DEFAULT_MAX_GAIN, DEFAULT_SILENCE_THRESHOLD, TARGET_PEAK};
+pub use crate::audio::clean::{high_pass_filter, normalize_gain};
 
 pub type SpeechCallback = Arc<dyn Fn(u32) + Send + Sync + 'static>;
 
@@ -346,9 +350,10 @@ impl Listener {
                             let _ = events_vad.try_send(VoiceEvent::Transcribing);
                             let silence_wait =
                                 std::time::Duration::from_millis(vad.last_silence_wait_ms() as u64);
+                            let cleaned_audio = clean_audio(&utterance);
                             if stt_tx_vad
                                 .send(SttCommand::Utterance {
-                                    audio: utterance,
+                                    audio: cleaned_audio,
                                     silence_wait,
                                 })
                                 .is_err()
@@ -404,9 +409,10 @@ impl Listener {
                     let _ = events_vad.try_send(VoiceEvent::Transcribing);
                     let silence_wait =
                         std::time::Duration::from_millis(vad.last_silence_wait_ms() as u64);
+                    let cleaned_audio = clean_audio(&utterance);
                     if stt_tx_vad
                         .send(SttCommand::Utterance {
-                            audio: utterance,
+                            audio: cleaned_audio,
                             silence_wait,
                         })
                         .is_err()
@@ -1413,5 +1419,121 @@ mod tests {
         stopped.store(true, Ordering::SeqCst);
         let _ = stt_tx.send(SttCommand::Cancel);
         let _ = thread_handle.join();
+    }
+
+    #[tokio::test]
+    async fn test_clean_audio_runs_once_through_listener_pipeline() {
+        let (capture_tx, capture_rx) = mpsc::channel(64);
+        let (events_tx, mut events_rx) = mpsc::channel(16);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let recorded_clone = recorded.clone();
+
+        struct RecordingMockTranscriber {
+            recorded: Arc<Mutex<Vec<Vec<f32>>>>,
+        }
+
+        impl Transcriber for RecordingMockTranscriber {
+            fn transcribe(&self, audio: &[f32]) -> Result<String, VoiceError> {
+                self.recorded.lock().unwrap().push(audio.to_vec());
+                Ok("speech".to_string())
+            }
+        }
+
+        let transcriber = Arc::new(RecordingMockTranscriber {
+            recorded: recorded_clone,
+        });
+
+        let handle = Listener::start_pipeline_with_transcriber(
+            None,
+            16_000,
+            capture_rx,
+            transcriber,
+            events_tx,
+        )
+        .unwrap();
+
+        // Consume initial Listening event
+        let init_ev = events_rx.recv().await.unwrap();
+        assert_eq!(init_ev, VoiceEvent::Listening);
+
+        // Notify when speech reaches >= 320 ms (> MIN_SPEECH_SAMPLES 304 ms)
+        let (speech_done_tx, speech_done_rx) = tokio::sync::oneshot::channel();
+        let speech_done_tx = Arc::new(Mutex::new(Some(speech_done_tx)));
+        handle.set_on_speech(move |ms| {
+            if ms >= 320 {
+                if let Ok(mut guard) = speech_done_tx.lock() {
+                    if let Some(tx) = guard.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        });
+
+        // 200 Hz tone that EarshotDetector scores > 0.7 with DC offset (+0.2)
+        let capture_tx_clone = capture_tx.clone();
+        let speech_feed_task = tokio::spawn(async move {
+            let speech_frame: Vec<f32> = (0..256)
+                .map(|i| 0.2 + (i as f32 * 200.0 * 2.0 * std::f32::consts::PI / 16000.0).sin() * 0.4)
+                .collect();
+            for _ in 0..40 {
+                if capture_tx_clone.send(speech_frame.clone()).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        });
+
+        // Wait for Hearing event
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(1000), events_rx.recv())
+            .await
+            .expect("timeout waiting for Hearing event")
+            .unwrap();
+        assert_eq!(ev, VoiceEvent::Hearing);
+
+        // Wait until VAD has processed >= 320 ms of speech
+        tokio::time::timeout(std::time::Duration::from_millis(1000), speech_done_rx)
+            .await
+            .expect("timeout waiting for speech to reach 320 ms")
+            .unwrap();
+
+        // Mute while speech is active to flush utterance
+        handle.set_muted(true);
+        let ev = events_rx.recv().await.unwrap();
+        assert_eq!(ev, VoiceEvent::Muted);
+
+        capture_tx.send(vec![0.0f32; 256]).await.unwrap();
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(1000), events_rx.recv())
+            .await
+            .expect("timeout waiting for Transcribing event")
+            .unwrap();
+        assert_eq!(ev, VoiceEvent::Transcribing);
+
+        let ev = tokio::time::timeout(std::time::Duration::from_millis(1500), events_rx.recv())
+            .await
+            .expect("timeout waiting for UserSpeech")
+            .unwrap();
+        assert_eq!(ev, VoiceEvent::UserSpeech("speech".to_string()));
+
+        let _ = speech_feed_task.await;
+        handle.stop();
+
+        // Verify that the transcriber received exactly one utterance, and that clean_audio
+        // was applied exactly once:
+        let rec = recorded.lock().unwrap();
+        assert_eq!(rec.len(), 1, "Transcriber must receive exactly 1 utterance");
+        let audio = &rec[0];
+        assert!(!audio.is_empty());
+
+        // DC offset (+0.2) must be eliminated by the single clean_audio high-pass pass:
+        let mean = audio.iter().sum::<f32>() / audio.len() as f32;
+        assert!(mean.abs() < 0.05, "DC offset must be eliminated: mean={mean}");
+
+        // Peak amplitude normalized to ~TARGET_PEAK (0.7):
+        let peak = audio.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        assert!(
+            (peak - TARGET_PEAK).abs() < 0.1,
+            "Cleaned utterance peak must reach TARGET_PEAK (~0.7), got {peak}"
+        );
     }
 }

@@ -15,6 +15,11 @@ pub const WHISPER_SMALL_EN_Q5_1_URL: &str = "https://huggingface.co/ggerganov/wh
 pub const WHISPER_SMALL_EN_Q5_1_SHA256: &str = "bfdff4894dcb76bbf647d56263ea2a96645423f1669176f4844a1bf8e478ad30";
 pub const WHISPER_SMALL_EN_Q5_1_SIZE: u64 = 190_098_681;
 
+pub const WHISPER_LARGE_V3_TURBO_Q5_0_NAME: &str = "ggml-large-v3-turbo-q5_0.bin";
+pub const WHISPER_LARGE_V3_TURBO_Q5_0_URL: &str = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin";
+pub const WHISPER_LARGE_V3_TURBO_Q5_0_SHA256: &str = "394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2";
+pub const WHISPER_LARGE_V3_TURBO_Q5_0_SIZE: u64 = 574_041_195;
+
 pub const PIPER_VOICE_ONNX_NAME: &str = "en_US-lessac-medium.onnx";
 pub const PIPER_VOICE_ONNX_URL: &str = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_US/lessac/medium/en_US-lessac-medium.onnx";
 pub const PIPER_VOICE_ONNX_SHA256: &str = "5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f";
@@ -114,6 +119,14 @@ pub fn whisper_spec(model_name: &str) -> ModelSpec {
             url: WHISPER_SMALL_EN_Q5_1_URL.to_string(),
             expected_sha256: Some(WHISPER_SMALL_EN_Q5_1_SHA256.to_string()),
             expected_size: WHISPER_SMALL_EN_Q5_1_SIZE,
+            dest_path,
+        }
+    } else if clean == "large-v3-turbo-q5_0" {
+        ModelSpec {
+            name: WHISPER_LARGE_V3_TURBO_Q5_0_NAME.to_string(),
+            url: WHISPER_LARGE_V3_TURBO_Q5_0_URL.to_string(),
+            expected_sha256: Some(WHISPER_LARGE_V3_TURBO_Q5_0_SHA256.to_string()),
+            expected_size: WHISPER_LARGE_V3_TURBO_Q5_0_SIZE,
             dest_path,
         }
     } else {
@@ -437,16 +450,20 @@ mod tests {
         assert_eq!(specs[0].expected_sha256.as_deref(), Some(WHISPER_MODEL_SHA256));
         assert_eq!(specs[0].expected_size, WHISPER_MODEL_SIZE);
 
-        let mut small_cfg = jgt_core::config::Voice::default();
-        small_cfg.stt_model = "small.en-q5_1".into();
+        let small_cfg = jgt_core::config::Voice {
+            stt_model: "small.en-q5_1".into(),
+            ..Default::default()
+        };
         let small_specs = model_specs(&small_cfg);
         assert_eq!(small_specs[0].name, WHISPER_SMALL_EN_Q5_1_NAME);
         assert_eq!(small_specs[0].url, WHISPER_SMALL_EN_Q5_1_URL);
         assert_eq!(small_specs[0].expected_sha256.as_deref(), Some(WHISPER_SMALL_EN_Q5_1_SHA256));
         assert_eq!(small_specs[0].expected_size, WHISPER_SMALL_EN_Q5_1_SIZE);
 
-        let mut custom_cfg = jgt_core::config::Voice::default();
-        custom_cfg.stt_model = "base.en".into();
+        let custom_cfg = jgt_core::config::Voice {
+            stt_model: "base.en".into(),
+            ..Default::default()
+        };
         let custom_specs = model_specs(&custom_cfg);
         assert_eq!(custom_specs[0].name, "ggml-base.en.bin");
         assert_eq!(
@@ -454,5 +471,76 @@ mod tests {
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin"
         );
         assert_eq!(custom_specs[0].expected_sha256, None);
+
+        let turbo_cfg = jgt_core::config::Voice {
+            stt_model: "large-v3-turbo-q5_0".into(),
+            ..Default::default()
+        };
+        let turbo_specs = model_specs(&turbo_cfg);
+        assert_eq!(turbo_specs[0].name, WHISPER_LARGE_V3_TURBO_Q5_0_NAME);
+        assert_eq!(turbo_specs[0].url, WHISPER_LARGE_V3_TURBO_Q5_0_URL);
+        assert_eq!(
+            turbo_specs[0].expected_sha256.as_deref(),
+            Some(WHISPER_LARGE_V3_TURBO_Q5_0_SHA256)
+        );
+        assert_eq!(turbo_specs[0].expected_size, WHISPER_LARGE_V3_TURBO_Q5_0_SIZE);
+
+        // Also verify clean handling when specified with full filename
+        let spec_from_filename = whisper_spec("ggml-large-v3-turbo-q5_0.bin");
+        assert_eq!(spec_from_filename.name, WHISPER_LARGE_V3_TURBO_Q5_0_NAME);
+        assert_eq!(spec_from_filename.url, WHISPER_LARGE_V3_TURBO_Q5_0_URL);
+        assert_eq!(
+            spec_from_filename.expected_sha256.as_deref(),
+            Some(WHISPER_LARGE_V3_TURBO_Q5_0_SHA256)
+        );
+        assert_eq!(spec_from_filename.expected_size, WHISPER_LARGE_V3_TURBO_Q5_0_SIZE);
+    }
+
+    #[test]
+    fn test_whisper_spec_large_v3_turbo_q5_0() {
+        let spec = whisper_spec("large-v3-turbo-q5_0");
+        assert_eq!(spec.name, "ggml-large-v3-turbo-q5_0.bin");
+        assert_eq!(
+            spec.url,
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin"
+        );
+        assert_eq!(
+            spec.expected_sha256.as_deref(),
+            Some("394221709cd5ad1f40c46e6031ca61bce88931e6e088c188294c6d5a55ffa7e2")
+        );
+        assert_eq!(spec.expected_size, 574_041_195);
+        assert!(spec.dest_path.ends_with("whisper/ggml-large-v3-turbo-q5_0.bin"));
+    }
+
+    #[tokio::test]
+    #[ignore = "downloads ggml-large-v3-turbo-q5_0.bin (~547 MiB)"]
+    async fn test_download_large_v3_turbo_q5_0() {
+        let cfg = jgt_core::config::Voice {
+            stt_model: "large-v3-turbo-q5_0".into(),
+            ..Default::default()
+        };
+        download_models(&cfg, |prog| {
+            if prog.bytes_done == prog.total_bytes || prog.bytes_done % (50 * 1024 * 1024) < 100_000 {
+                println!(
+                    "Progress: {} -> {:.1}% ({}/{} MB)",
+                    prog.file_name,
+                    prog.fraction() * 100.0,
+                    prog.bytes_done / (1024 * 1024),
+                    prog.total_bytes / (1024 * 1024)
+                );
+            }
+        })
+        .await
+        .expect("download_models failed");
+
+        let dest = crate::models::whisper_model_path("large-v3-turbo-q5_0");
+        assert!(dest.is_file(), "model must exist at {}", dest.display());
+        let valid = verify_file_sha256(&dest, WHISPER_LARGE_V3_TURBO_Q5_0_SHA256)
+            .expect("SHA-256 verify failed");
+        assert!(valid, "SHA-256 hash check failed");
+        println!(
+            "Successfully downloaded and verified SHA-256 for {}",
+            dest.display()
+        );
     }
 }

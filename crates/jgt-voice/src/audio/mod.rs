@@ -1,9 +1,11 @@
 pub mod capture;
+pub mod clean;
 pub mod playback;
 
 use crate::error::VoiceError;
 
 pub use capture::{downmix, start_capture, AudioCapture};
+pub use clean::{clean_audio, high_pass_filter, normalize_gain};
 pub use playback::{AudioQueue, Player};
 
 /// Finds the index of the first candidate whose name contains `target` as a case-insensitive substring.
