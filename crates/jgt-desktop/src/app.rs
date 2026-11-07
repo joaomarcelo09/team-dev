@@ -524,6 +524,9 @@ pub enum Msg {
     // used by M5
     #[allow(dead_code)]
     SetAgentModel(String, String),
+    // used by M5
+    #[allow(dead_code)]
+    SetAgentEffort(String, String),
     ModelsListed(Harness, Result<Vec<String>, String>),
     // used by M5
     #[allow(dead_code)]
@@ -532,6 +535,7 @@ pub enum Msg {
     TextSize(Step),
     Key(keyboard::Event),
     ToggleSelect(i64),
+    SelectMessage(i64),
     MessageEditor(i64, text_editor::Action),
     DismissToast,
     Tick,
@@ -1579,6 +1583,10 @@ impl App {
                 self.selecting_message = if self.selecting_message == Some(id) { None } else { Some(id) };
                 Task::none()
             }
+            Msg::SelectMessage(id) => {
+                self.selecting_message = Some(id);
+                Task::none()
+            }
             Msg::MessageEditor(id, action) => {
                 if !action.is_edit()
                     && let Some(thread) = self.selected.as_ref().and_then(|s| self.threads.get_mut(s))
@@ -1729,12 +1737,23 @@ impl App {
                         .cloned()
                         .unwrap_or_default();
                     agent.model = first_model;
+                    let levels = jgt_core::harness::effort_levels(harness);
+                    if !levels.is_empty() && !levels.contains(&agent.effort.as_str()) {
+                        let effort = jgt_core::harness::nearest_effort(harness, &agent.effort).unwrap_or(levels[0]);
+                        agent.effort = effort.to_string();
+                    }
                 }
                 Task::none()
             }
             Msg::SetAgentModel(role, model) => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
                     agent.model = model;
+                }
+                Task::none()
+            }
+            Msg::SetAgentEffort(role, effort) => {
+                if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
+                    agent.effort = effort;
                 }
                 Task::none()
             }
@@ -2284,6 +2303,44 @@ mod tests {
         // Editor was rebuilt, so old selection is gone and new text is present.
         assert_eq!(thread.editors.get(&1).unwrap().text().trim(), "goodbye world");
         assert_eq!(thread.editors.get(&1).unwrap().selection(), None);
+    }
+
+    #[test]
+    fn message_selection_state_transitions() {
+        let (mut app, _) = App::new(None);
+        assert_eq!(app.selecting_message, None);
+
+        // Clicking a message enters selection mode for that message
+        let _ = app.update(Msg::SelectMessage(1));
+        assert_eq!(app.selecting_message, Some(1));
+
+        // Re-clicking the same message keeps selection mode active
+        let _ = app.update(Msg::SelectMessage(1));
+        assert_eq!(app.selecting_message, Some(1));
+
+        // Selecting another message transitions directly to that message
+        let _ = app.update(Msg::SelectMessage(2));
+        assert_eq!(app.selecting_message, Some(2));
+
+        // Toggle button on the currently selected message exits selection mode
+        let _ = app.update(Msg::ToggleSelect(2));
+        assert_eq!(app.selecting_message, None);
+
+        // Toggle button on unselected message enters selection mode
+        let _ = app.update(Msg::ToggleSelect(3));
+        assert_eq!(app.selecting_message, Some(3));
+
+        // Escape exits selection mode
+        let _ = app.update(Msg::Key(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        }));
+        assert_eq!(app.selecting_message, None);
     }
 
     #[test]
@@ -2977,6 +3034,53 @@ allowed_tools = ["Bash"]
             app.harness_models.get(&Harness::Opencode),
             Some(&Ok(vec!["anthropic/claude-3".into()]))
         );
+
+        // SetAgentEffort on worker: updates effort
+        let _ = app.update(Msg::SetAgentEffort("coder".into(), "xhigh".into()));
+        assert_eq!(app.agents[0].effort, "xhigh");
+
+        // SetAgentEffort on coordinator: updates effort
+        let _ = app.update(Msg::SetAgentEffort("coordinator".into(), "low".into()));
+        assert_eq!(app.agents[1].effort, "low");
+
+        // Harness without levels (Opencode) keeps effort intact
+        let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::Opencode));
+        assert_eq!(app.agents[0].harness, Harness::Opencode);
+        assert_eq!(app.agents[0].effort, "xhigh");
+
+        // Harness switch clamps effort when switching to a harness with levels and effort is not one of them
+        app.agents[0].effort = "unsupported".into();
+        let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::Antigravity));
+        assert_eq!(app.agents[0].harness, Harness::Antigravity);
+        assert_eq!(app.agents[0].effort, "low");
+    }
+
+    #[test]
+    fn test_apply_agents_writes_effort() {
+        let mut config = Config::default();
+        let agents = vec![
+            AgentRow {
+                role: "coder".into(),
+                harness: Harness::Antigravity,
+                model: "gemini-3.8-flash-high".into(),
+                effort: "xhigh".into(),
+            },
+            AgentRow {
+                role: "coordinator".into(),
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "low".into(),
+            },
+        ];
+        apply_agents(&mut config, &agents);
+        assert_eq!(
+            config.team.skills.get("coder").and_then(|s| s.effort.as_deref()),
+            Some("xhigh")
+        );
+        assert_eq!(
+            config.team.skills.get("coordinator").and_then(|s| s.effort.as_deref()),
+            Some("low")
+        );
     }
 
     #[test]
@@ -2987,11 +3091,11 @@ allowed_tools = ["Bash"]
 
         let _ = app.update(Msg::ToggleSettings);
         assert!(app.show_settings);
-        assert_eq!(app.agents.len(), 7);
+        assert_eq!(app.agents.len(), 5);
         let roles: Vec<&str> = app.agents.iter().map(|a| a.role.as_str()).collect();
         assert_eq!(
             roles,
-            vec!["coordinator", "planner", "coder", "verifier", "reviewer", "tester", "git-coder"]
+            vec!["coordinator", "planner", "coder", "reviewer", "git-coder"]
         );
         // Coordinator harness is always Claude Code
         assert_eq!(app.agents[0].harness, Harness::ClaudeCode);

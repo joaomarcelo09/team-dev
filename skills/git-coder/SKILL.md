@@ -20,6 +20,26 @@ user agreed to the git action in the chat; your brief says exactly what was agre
   `git worktree remove .team/worktrees/<name>` and delete its branch with `git branch -d jgt/<name>`.
 - Never force-push, rewrite published history or delete branches you did not create.
 
+## Secrets and .env files
+
+- Never read, open, print, copy, write, edit or commit: `.env` and `.env.*` files (except
+  `.env.example`, `.env.sample` and `.env.template`, which hold no real values), private keys
+  (`*.pem`, `*.key`, `id_rsa*`), credential files (`credentials*`, `*.p12`, `.npmrc`/`.pypirc`
+  with tokens, cloud CLI config) or any other secret or sensitive value.
+- Do not dump the environment (`env`, `printenv`, `set`, `echo $TOKEN`) and do not put secret
+  values in logs, briefs, chat messages, result files or test fixtures.
+- If the task seems to need a secret, stop and report it (status `blocked`); never go looking
+  for it. Use `.env.example` and placeholders instead.
+- If you come across a secret by accident, do not repeat it: name only the file and variable.
+- Before every commit, run `git status --short` and `git diff --cached --name-only`, and check
+  untracked files. Grep the staged diff for `API_KEY|SECRET|TOKEN|PASSWORD|PRIVATE KEY`; hits are
+  only candidates to look at. Block only if a forbidden file (a `.env`/`.env.*` file other than
+  the example/sample/template, a key or a credential file) or an actual secret-looking value (a
+  literal key, token or password assigned a real value) would be committed; never block on
+  variable names, placeholders or docs. When you block, do not commit and do not unstage anything
+  yourself: stop with status `blocked` and name the file only.
+- Confirm `.env` is ignored (`git check-ignore .env`) and report it if not.
+
 ## How you work
 
 - You are a fresh Claude Code session started headless by the Coordinator. You know nothing but

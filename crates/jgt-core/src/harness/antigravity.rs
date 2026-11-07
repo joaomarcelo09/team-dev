@@ -83,7 +83,7 @@ impl HarnessAdapter for Antigravity {
             "{skill}\n\n---\n\nNote: the jg-team-dev chat and task tools (chat_status, chat_send, chat_ask, task_get) \
              are not available in this session; skip them. Your final reply goes to the Coordinator. \
              Stay strictly inside the role and scope of the brief (a coder does not go beyond its brief; \
-             a verifier/tester/reviewer does not implement features). \
+             a reviewer does not implement features). \
              Before each step write one short plain-text line saying what you are about to do \
              (these lines appear in the run output). \
              The final reply starts with a short recap of the steps (3-8 bullets: what was done, \

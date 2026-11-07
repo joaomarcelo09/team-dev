@@ -85,13 +85,13 @@ pub enum TaskCommand {
         task: String,
         #[arg(long, value_parser = parse_test, conflicts_with = "review_file", requires = "worker")]
         test: Option<TestStatus>,
-        /// Hub id of the tester or verifier.
+        /// Hub id of the coder.
         #[arg(long)]
         worker: Option<String>,
         /// The test summary, from a file.
         #[arg(long, requires = "test")]
         file: Option<PathBuf>,
-        /// The review as JSON: `{"decision": "approved"|"changes", "worker": "<reviewer or verifier id>",
+        /// The review as JSON: `{"decision": "approved"|"changes", "worker": "<reviewer id>",
         /// "findings": [{"severity": "critical"|"high"|"other", "critical": bool, "category": "security"|…,
         /// "problem": "…", …}]}`.
         #[arg(long)]
@@ -301,7 +301,7 @@ pub async fn command(args: TaskArgs) -> Result<()> {
                         Some(f) => std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?,
                         None => String::new(),
                     };
-                    let worker = worker.context("pass the tester with --worker")?;
+                    let worker = worker.context("pass the coder with --worker")?;
                     ResultRequest {
                         actor: cx.actor.clone(),
                         test: Some(TestResultInput { status, worker, summary, failures: vec![] }),

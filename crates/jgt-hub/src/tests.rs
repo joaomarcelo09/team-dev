@@ -359,13 +359,13 @@ fn coordinators_listen_from_the_start() {
             other => panic!("expected Forbidden, got {other:?}"),
         }
 
-        // A verifier worker is also refused:
-        let w2 = make_sess("w2", "/tmp/test-folder-d", Some("verifier"));
+        // A reviewer worker is also refused:
+        let w2 = make_sess("w2", "/tmp/test-folder-d", Some("reviewer"));
         assert!(w2.is_worker());
         let err2 = hub.claim_coordinator(&w2.id).unwrap_err();
         match err2 {
             HubError::Forbidden(msg) => {
-                assert!(msg.contains("verifier worker, not a Coordinator"), "unexpected message: {msg}");
+                assert!(msg.contains("reviewer worker, not a Coordinator"), "unexpected message: {msg}");
             }
             other => panic!("expected Forbidden, got {other:?}"),
         }
@@ -602,22 +602,20 @@ mod board {
         ActorRequest::Session { session: s.id.clone() }
     }
 
-    /// A hub with a Coordinator for `WS`, its tester, its reviewer and its verifier.
+    /// A hub with a Coordinator for `WS`, its coder and its reviewer.
     struct Team {
         hub: SharedHub,
         coord: Session,
-        tester: Session,
+        coder: Session,
         reviewer: Session,
-        verifier: Session,
     }
 
     fn team() -> Team {
         let hub = hub();
         let coord = session(&hub, "coord", jgt_core::COORDINATOR, WS, None);
-        let tester = session(&hub, "tester", "tester", WS, Some(&coord.id));
+        let coder = session(&hub, "coder", "coder", WS, Some(&coord.id));
         let reviewer = session(&hub, "reviewer", "reviewer", WS, Some(&coord.id));
-        let verifier = session(&hub, "verifier", "verifier", WS, Some(&coord.id));
-        Team { hub, coord, tester, reviewer, verifier }
+        Team { hub, coord, coder, reviewer }
     }
 
     fn finding(critical: Option<bool>, category: Option<FindingCategory>) -> FindingInput {
@@ -710,7 +708,7 @@ mod board {
                 actor: self.coordinator(),
                 test: Some(TestResultInput {
                     status,
-                    worker: self.tester.id.clone(),
+                    worker: self.coder.id.clone(),
                     summary: format!("tests {status}"),
                     failures: vec![],
                 }),
@@ -911,7 +909,7 @@ mod board {
     fn workers_are_read_only() {
         let t = team();
         let task = t.create(ActorRequest::User, "task", Some(OnQueue)).unwrap();
-        let w = as_session(&t.tester);
+        let w = as_session(&t.coder);
         forbidden(t.create(w.clone(), "mine", None));
         let mut req = PatchTaskRequest::new(w.clone());
         req.details = Some("x".into());
@@ -931,10 +929,10 @@ mod board {
                 actor: w,
                 kind: TaskEventKind::WorkerStarted,
                 body: String::new(),
-                meta: serde_json::json!({ "worker": "tester" }),
+                meta: serde_json::json!({ "worker": "coder" }),
             })
             .unwrap();
-        assert_eq!(t.get(&task).current_worker.as_deref(), Some("tester"));
+        assert_eq!(t.get(&task).current_worker.as_deref(), Some("coder"));
         // Only the user deletes.
         forbidden(t.hub.delete_task(&task.id, None, &t.coordinator()));
     }
@@ -1219,7 +1217,7 @@ mod board {
         let task = t.working("x");
         t.mv(&task, Testing).unwrap();
         t.test(&task, TestStatus::Pass).unwrap();
-        // The user sends it back and on to Review, skipping the tester.
+        // The user sends it back and on to Review, skipping the test.
         let back = t.user_move(&task, Working);
         assert_eq!(back.test_result, None);
         t.user_move(&task, Review);
@@ -1307,7 +1305,7 @@ mod board {
         let t = team();
         let task = t.working("x");
         t.mv(&task, Testing).unwrap();
-        // The reviewer is not a tester.
+        // The reviewer is not a coder.
         bad_request(t.hub.record_results(&task.id, None, &ResultRequest {
             actor: t.coordinator(),
             test: Some(TestResultInput {
@@ -1322,7 +1320,7 @@ mod board {
         t.mv(&task, Review).unwrap();
         let other = session(&t.hub, "coord2", jgt_core::COORDINATOR, "/tmp/jgt-board-test/other", None);
         let stranger = session(&t.hub, "r2", "reviewer", WS, Some(&other.id));
-        for worker in [&t.tester, &stranger] {
+        for worker in [&t.coder, &stranger] {
             bad_request(t.hub.record_results(&task.id, None, &ResultRequest {
                 actor: t.coordinator(),
                 test: None,
@@ -1400,43 +1398,37 @@ mod board {
     }
 
     #[test]
-    fn the_verifier_records_both_results() {
+    fn verifier_and_tester_are_refused() {
         let t = team();
         let task = t.working("feature");
+        let tester = session(&t.hub, "tester", "tester", WS, Some(&t.coord.id));
+        let verifier = session(&t.hub, "verifier", "verifier", WS, Some(&t.coord.id));
         t.mv(&task, Testing).unwrap();
-        let by_verifier = |test: Option<TestResultInput>, review: Option<ReviewResultInput>| {
-            t.hub.record_results(&task.id, None, &ResultRequest { actor: t.coordinator(), test, review })
-        };
-        by_verifier(
-            Some(TestResultInput {
-                status: TestStatus::Pass,
-                worker: t.verifier.id.clone(),
-                summary: "build and tests green".into(),
-                failures: vec![],
-            }),
-            None,
-        )
-        .unwrap();
+        for worker in [&tester, &verifier] {
+            bad_request(t.hub.record_results(&task.id, None, &ResultRequest {
+                actor: t.coordinator(),
+                test: Some(TestResultInput {
+                    status: TestStatus::Pass,
+                    worker: worker.id.clone(),
+                    summary: "build and tests green".into(),
+                    failures: vec![],
+                }),
+                review: None,
+            }));
+        }
+        t.test(&task, TestStatus::Pass).unwrap();
         t.mv(&task, Review).unwrap();
-        // The verifier's severities alone mark a finding critical (`critical` may be left out).
-        let critical_by_severity =
-            FindingInput { critical: None, severity: Some("critical".into()), ..finding(None, Some(FindingCategory::Security)) };
-        let task = by_verifier(
-            None,
-            Some(ReviewResultInput {
-                decision: ReviewDecision::Changes,
-                worker: t.verifier.id.clone(),
-                findings: vec![critical_by_severity],
-            }),
-        )
-        .unwrap();
-        assert!(task.review_result.as_ref().unwrap().has_critical());
-        let log = t.events(&task);
-        let test = log.iter().find(|e| e.kind == TaskEventKind::TestResult).unwrap();
-        assert!(test.body.starts_with("verified by verifier ") && test.body.ends_with("build and tests green"), "{}", test.body);
-        let review = log.iter().find(|e| e.kind == TaskEventKind::ReviewResult).unwrap();
-        assert!(review.body.starts_with("verified by verifier ") && review.body.ends_with("round 1: changes"), "{}", review.body);
-        assert_eq!(review.meta["role"], "verifier");
+        for worker in [&tester, &verifier] {
+            bad_request(t.hub.record_results(&task.id, None, &ResultRequest {
+                actor: t.coordinator(),
+                test: None,
+                review: Some(ReviewResultInput {
+                    decision: ReviewDecision::Approved,
+                    worker: worker.id.clone(),
+                    findings: vec![],
+                }),
+            }));
+        }
     }
 
     #[test]

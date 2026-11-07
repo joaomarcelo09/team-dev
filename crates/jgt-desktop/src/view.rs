@@ -14,7 +14,7 @@ use iced::{
     Alignment, Color, Element, Fill, Font, Padding, Shrink, Theme,
     font::Weight,
     widget::{
-        Space, button, column, container, markdown, pick_list, row, rule, scrollable, space, stack, text, text_editor,
+        Space, button, column, container, markdown, mouse_area, pick_list, row, rule, scrollable, space, stack, text, text_editor,
         text_input, tooltip,
     },
 };
@@ -679,17 +679,16 @@ pub const AGENT_ROLES: &[&str] = &[
     jgt_core::COORDINATOR,
     "planner",
     "coder",
-    "verifier",
     "reviewer",
-    "tester",
     "git-coder",
 ];
 
 pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
     let role_width = style::fs(14) * 7.0;
     let harness_width = style::fs(14) * 9.5;
-    let model_width = style::fs(14) * 11.0;
-    let suggestions_width = style::fs(14) * 12.0;
+    let model_width = style::fs(14) * 8.0;
+    let effort_width = style::fs(14) * 5.5;
+    let suggestions_width = style::fs(14) * 8.5;
 
     let mut section = column![
         text("Agents").size(style::fs(16)).font(bold()),
@@ -751,6 +750,7 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
         muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
         muted("HARNESS").size(style::fs(11)).font(bold()).width(harness_width),
         muted("MODEL").size(style::fs(11)).font(bold()).width(model_width),
+        muted("EFFORT").size(style::fs(11)).font(bold()).width(effort_width),
         muted("SUGGESTIONS").size(style::fs(11)).font(bold()).width(suggestions_width),
     ]
     .spacing(8)
@@ -804,6 +804,25 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
             .style(style::input)
             .width(model_width);
 
+        // Effort control
+        let levels = jgt_core::harness::effort_levels(agent.harness);
+        let r_name = role.to_string();
+        let effort_control: Element<'_, Msg> = if levels.is_empty() {
+            container(muted("n/a").size(style::fs(12)))
+                .width(effort_width)
+                .align_y(Alignment::Center)
+                .into()
+        } else {
+            let selected = levels.iter().copied().find(|&l| l == agent.effort.as_str());
+            pick_list(levels, selected, move |e| {
+                Msg::SetAgentEffort(r_name.clone(), e.to_string())
+            })
+            .text_size(style::fs(13))
+            .padding([4, 8])
+            .width(effort_width)
+            .into()
+        };
+
         // Model suggestions control
         let r_name = role.to_string();
         let suggestions_control: Element<'_, Msg> = match app.harness_models.get(&agent.harness) {
@@ -842,6 +861,7 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
             text(role).size(style::fs(13)).font(bold()).width(role_width),
             harness_control,
             model_input,
+            effort_control,
             suggestions_control,
         ]
         .spacing(8)
@@ -1869,8 +1889,14 @@ fn select_button_user<'a>(id: i64, selecting: bool) -> Element<'a, Msg> {
     }
 }
 
-fn message_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, Msg> {
+fn message_editor<'a>(editor: &'a text_editor::Content, id: i64, theme: &Theme) -> Element<'a, Msg> {
+    let hl_theme = if theme.extended_palette().is_dark {
+        iced::highlighter::Theme::Base16Mocha
+    } else {
+        iced::highlighter::Theme::InspiredGitHub
+    };
     text_editor(editor)
+        .highlight("md", hl_theme)
         .on_action(move |action| Msg::MessageEditor(id, action))
         .padding([8, 10])
         .size(style::fs(14))
@@ -1880,14 +1906,27 @@ fn message_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, 
         .into()
 }
 
-fn message_user_editor<'a>(editor: &'a text_editor::Content, id: i64) -> Element<'a, Msg> {
+fn message_user_editor<'a>(editor: &'a text_editor::Content, id: i64, theme: &Theme) -> Element<'a, Msg> {
+    let hl_theme = if theme.extended_palette().is_dark {
+        iced::highlighter::Theme::Base16Mocha
+    } else {
+        iced::highlighter::Theme::InspiredGitHub
+    };
     text_editor(editor)
+        .highlight("md", hl_theme)
         .on_action(move |action| Msg::MessageEditor(id, action))
         .padding([8, 10])
         .size(style::fs(14))
         .font(style::ui_font())
         .wrapping(iced::widget::text::Wrapping::Word)
         .style(style::read_only_user_editor)
+        .into()
+}
+
+fn selectable_body<'a>(body: Element<'a, Msg>, id: i64) -> Element<'a, Msg> {
+    mouse_area(body)
+        .on_press(Msg::SelectMessage(id))
+        .interaction(iced::mouse::Interaction::Text)
         .into()
 }
 
@@ -1931,9 +1970,9 @@ fn message_view<'a>(
             .spacing(6)
             .align_y(Alignment::Center);
             let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-                message_user_editor(ed, m.id)
+                message_user_editor(ed, m.id, theme)
             } else {
-                text(m.body.as_str()).size(style::fs(14)).into()
+                selectable_body(text(m.body.as_str()).size(style::fs(14)).into(), m.id)
             };
             let bubble = container(column![content, footer].spacing(4))
                 .padding([8, 12])
@@ -1958,9 +1997,9 @@ fn message_view<'a>(
             .spacing(6)
             .align_y(Alignment::Center);
             let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-                message_editor(ed, m.id)
+                message_editor(ed, m.id, theme)
             } else {
-                md(items, &m.body, settings)
+                selectable_body(md(items, &m.body, settings), m.id)
             };
             let card = container(
                 row![dot(accent, 10.0), column![content, footer].spacing(6).width(Fill)]
@@ -1988,9 +2027,9 @@ fn message_view<'a>(
                 Space::new().width(6).into()
             };
             let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-                message_editor(ed, m.id)
+                message_editor(ed, m.id, theme)
             } else {
-                md(items, &m.body, settings)
+                selectable_body(md(items, &m.body, settings), m.id)
             };
             let bubble = container(column![content, footer].spacing(6))
                 .padding([10, 14])
@@ -2017,9 +2056,9 @@ fn question_view<'a>(
     let is_selecting = app.selecting_message == Some(m.id);
     let editor = thread.editors.get(&m.id);
     let content: Element<'a, Msg> = if is_selecting && let Some(ed) = editor {
-        message_editor(ed, m.id)
+        message_editor(ed, m.id, theme)
     } else {
-        md(items, &m.body, settings)
+        selectable_body(md(items, &m.body, settings), m.id)
     };
 
     let mut col = column![
@@ -2030,22 +2069,45 @@ fn question_view<'a>(
 
     match &m.question {
         Some(q) if q.status == QuestionStatus::Pending && s.status != SessionStatus::Ended => {
-            let mut buttons = row![].spacing(8);
-            for option in &q.options {
-                let style = match option.as_str() {
-                    "Allow" | "Yes" => style::success_button,
-                    "Deny" | "No" => style::danger_button,
-                    _ => style::pill_button,
-                };
-                buttons = buttons.push(
-                    button(text(option.as_str()).size(style::fs(13)))
+            if permission {
+                let mut buttons = row![].spacing(8);
+                for option in &q.options {
+                    let style = match option.as_str() {
+                        "Allow" | "Yes" => style::success_button,
+                        "Deny" | "No" => style::danger_button,
+                        _ => style::pill_button,
+                    };
+                    buttons = buttons.push(
+                        button(text(option.as_str()).size(style::fs(13)))
+                            .on_press(Msg::Answer { question: q.id.clone(), answer: option.clone() })
+                            .style(style)
+                            .padding([6, 14]),
+                    );
+                }
+                col = col.push(buttons);
+            } else {
+                let mut buttons = column![].spacing(6).width(Fill);
+                for option in &q.options {
+                    let style = match option.as_str() {
+                        "Allow" | "Yes" => style::success_button,
+                        "Deny" | "No" => style::danger_button,
+                        _ => style::pill_button,
+                    };
+                    buttons = buttons.push(
+                        button(
+                            text(option.as_str())
+                                .size(style::fs(13))
+                                .width(Fill)
+                                .align_x(iced::alignment::Horizontal::Left)
+                                .wrapping(iced::widget::text::Wrapping::Word),
+                        )
                         .on_press(Msg::Answer { question: q.id.clone(), answer: option.clone() })
                         .style(style)
-                        .padding([6, 14]),
-                );
-            }
-            col = col.push(buttons);
-            if !permission {
+                        .padding([6, 14])
+                        .width(Fill),
+                    );
+                }
+                col = col.push(buttons);
                 let draft = app.answers.get(&q.id).map(String::as_str).unwrap_or("");
                 let qid = q.id.clone();
                 let qid2 = q.id.clone();
@@ -2588,13 +2650,15 @@ mod tests {
     fn test_settings_agents_unlocked_renders() {
         let (mut app, _) = App::new(None);
         app.show_settings = true;
-        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Antigravity];
+        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Antigravity, Harness::Opencode];
         app.agents = AGENT_ROLES
             .iter()
             .map(|&role| AgentRow {
                 role: role.to_string(),
                 harness: if role == jgt_core::COORDINATOR {
                     Harness::ClaudeCode
+                } else if role == "reviewer" {
+                    Harness::Opencode
                 } else {
                     Harness::Antigravity
                 },
@@ -2701,5 +2765,161 @@ mod tests {
         let _ = agents_section(&app);
         let _ = settings(&app);
         let _ = view(&app);
+    }
+
+    #[test]
+    fn test_settings_agents_row_width_fits_card() {
+        for fs14 in [14.0, style::fs(14)] {
+            let role_width = fs14 * 7.0;
+            let harness_width = fs14 * 9.5;
+            let model_width = fs14 * 8.0;
+            let effort_width = fs14 * 5.5;
+            let suggestions_width = fs14 * 8.5;
+            let spacing = 8.0 * 4.0;
+
+            let total_row_width = role_width + harness_width + model_width + effort_width + suggestions_width + spacing;
+            let card_max_width = fs14 * 46.0;
+            let card_padding = 22.0 * 2.0;
+            let scrollable_padding_right = 8.0;
+            let scrollbar_width = 12.0;
+            let usable_width = card_max_width - card_padding - scrollable_padding_right - scrollbar_width;
+
+            assert!(
+                total_row_width <= usable_width,
+                "Row width ({total_row_width}px) exceeds usable width ({usable_width}px) at fs(14)={fs14}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_question_view_renders_short_and_long_options_and_permissions() {
+        let (app, _) = App::new(None);
+        let s = test_session("s1", Some("coordinator"), None, SessionStatus::Active, false);
+        let thread = Thread::default();
+        let theme = app.theme();
+        let mut md_style = markdown::Style::from_palette(theme.palette());
+        md_style.font = style::ui_font();
+        let settings = markdown::Settings::with_text_size(style::fs(14), md_style);
+
+        let make_msg = |id: i64, kind: MessageKind, q: Option<jgt_core::Question>| Message {
+            id,
+            session_id: "s1".to_string(),
+            direction: Direction::FromAgent,
+            kind,
+            body: "Test message body".to_string(),
+            created_at: 1000,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: q,
+        };
+
+        let make_q = |id: &str, kind: MessageKind, options: Vec<&str>| jgt_core::Question {
+            id: id.to_string(),
+            session_id: "s1".to_string(),
+            message_id: 1,
+            options: options.into_iter().map(String::from).collect(),
+            status: QuestionStatus::Pending,
+            answer: None,
+            answered_at: None,
+            created_at: 1000,
+            expires_at: None,
+            prompt: "Prompt".to_string(),
+            kind,
+        };
+
+        // 1. Permission message (options in a row)
+        let perm_q = make_q("q1", MessageKind::Permission, vec!["Allow", "Deny"]);
+        let perm_msg = make_msg(1, MessageKind::Permission, Some(perm_q));
+        let _ = question_view(&app, &s, &thread, &perm_msg, None, settings, &theme);
+
+        // 2. Question with long pre-made options (column with wrapping text)
+        let long_q = make_q(
+            "q2",
+            MessageKind::Question,
+            vec![
+                "Strategy A: Make the options wrap/stack so long labels are fully readable inside the card with Fill width",
+                "Strategy B: Implement a custom wrapping layout widget that measures text dimensions dynamically",
+            ],
+        );
+        let long_q_msg = make_msg(2, MessageKind::Question, Some(long_q));
+        let _ = question_view(&app, &s, &thread, &long_q_msg, None, settings, &theme);
+
+        // 3. Question with short options
+        let short_q = make_q("q3", MessageKind::Question, vec!["Yes", "No"]);
+        let short_q_msg = make_msg(3, MessageKind::Question, Some(short_q));
+        let _ = question_view(&app, &s, &thread, &short_q_msg, None, settings, &theme);
+    }
+
+    #[test]
+    fn test_message_view_renders_unselected_and_selected() {
+        let (mut app, _) = App::new(None);
+        let s = test_session("s1", Some("coordinator"), None, SessionStatus::Active, false);
+        let mut thread = Thread::default();
+
+        let agent_msg = Message {
+            id: 10,
+            session_id: "s1".to_string(),
+            direction: Direction::FromAgent,
+            kind: MessageKind::Text,
+            body: "```rust\nfn foo() {}\n```".to_string(),
+            created_at: 1000,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: None,
+        };
+        let user_msg = Message {
+            id: 11,
+            session_id: "s1".to_string(),
+            direction: Direction::ToAgent,
+            kind: MessageKind::Text,
+            body: "User message body".to_string(),
+            created_at: 1001,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: None,
+        };
+        let notify_msg = Message {
+            id: 12,
+            session_id: "s1".to_string(),
+            direction: Direction::FromAgent,
+            kind: MessageKind::Notify,
+            body: "Notification body".to_string(),
+            created_at: 1002,
+            delivered_at: None,
+            delivery: Delivery::Delivered,
+            read_at: None,
+            meta: serde_json::Value::Null,
+            question: None,
+        };
+
+        thread.upsert(agent_msg.clone());
+        thread.upsert(user_msg.clone());
+        thread.upsert(notify_msg.clone());
+
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut md_style = markdown::Style::from_palette(theme.palette());
+            md_style.font = style::ui_font();
+            let settings = markdown::Settings::with_text_size(style::fs(14), md_style);
+
+            // Unselected rendering
+            app.selecting_message = None;
+            let _ = message_view(&app, &s, &thread, &agent_msg, thread.markdown.get(&10), settings, &theme);
+            let _ = message_view(&app, &s, &thread, &user_msg, thread.markdown.get(&11), settings, &theme);
+            let _ = message_view(&app, &s, &thread, &notify_msg, thread.markdown.get(&12), settings, &theme);
+
+            // Selected rendering (enters text_editor view with code highlighting)
+            app.selecting_message = Some(10);
+            let _ = message_view(&app, &s, &thread, &agent_msg, thread.markdown.get(&10), settings, &theme);
+            app.selecting_message = Some(11);
+            let _ = message_view(&app, &s, &thread, &user_msg, thread.markdown.get(&11), settings, &theme);
+            app.selecting_message = Some(12);
+            let _ = message_view(&app, &s, &thread, &notify_msg, thread.markdown.get(&12), settings, &theme);
+        }
     }
 }

@@ -26,7 +26,7 @@ use std::{
 
 #[derive(clap::Args)]
 pub struct WorkerArgs {
-    /// planner, coder, verifier, reviewer, tester or git-coder.
+    /// planner, coder, reviewer or git-coder.
     pub skill: String,
     /// Short task title, shown as the worker's chat title (`<skill> · <task>`).
     #[arg(long)]
@@ -38,8 +38,8 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub cwd: Option<PathBuf>,
     /// Work in the git worktree `.team/worktrees/<name>` (branch `jgt/<name>`), created from HEAD
-    /// if it does not exist. Coders need this in a git repository; reviewers and testers can
-    /// point at a coder's worktree with the same name.
+    /// if it does not exist. Coders need this in a git repository; reviewers can point at a
+    /// coder's worktree with the same name.
     #[arg(long, conflicts_with = "cwd")]
     pub worktree: Option<String>,
     /// Let a coder write the main worktree directly (only after warning the user).
@@ -393,6 +393,9 @@ fn digest(head: &str, result: &str, notes: &[String], file: Option<&Path>) -> St
             let mut counts = vec![];
             if let Some(n) = len("filesChanged") {
                 counts.push(format!("{n} files changed"));
+            }
+            if let Some(status) = v.get("tests").and_then(|t| t.get("status")).and_then(Value::as_str) {
+                counts.push(format!("tests: {status}"));
             }
             if let Some(findings) = v.get("findings").and_then(Value::as_array) {
                 let (critical, high, other) = finding_counts(findings);
@@ -901,13 +904,13 @@ mod tests {
         assert_eq!(lines[3], "3 files changed");
         assert_eq!(lines.last().copied(), Some("Full result: /p/.team/runs/r1/worker-results/coder-abcd1234.md"));
 
-        let verifier = r#"done
+        let reviewer = r#"done
 ```json
 {"status": "passed", "decision": "changes_requested", "commands": ["cargo test", "cargo build"], "failures": [],
  "findings": [{"severity": "critical", "critical": true}, {"severity": "high", "critical": false},
               {"severity": "other", "critical": false}, {"severity": "other", "critical": false}]}
 ```"#;
-        let text = digest("head", verifier, &[], Some(file));
+        let text = digest("head", reviewer, &[], Some(file));
         assert!(text.contains("Status: passed · changes_requested"), "{text}");
         assert!(text.contains("findings: 1 critical, 1 high, 2 other · 2 checks run, 0 failed"), "{text}");
 
@@ -915,6 +918,21 @@ mod tests {
         let text = digest("head", &"some line\n".repeat(50), &["coder: a note".into()], None);
         assert!(text.lines().count() <= DIGEST_LINES, "{text}");
         assert!(text.contains("Note: coder: a note") && text.ends_with("Full result: in the worker's chat."), "{text}");
+    }
+
+    #[test]
+    fn coder_digest_shows_tests_status() {
+        let file = Path::new("/p/.team/runs/r1/worker-results/coder-abcd1234.md");
+        let coder = r#"Narration
+```json
+{"status": "completed", "summary": "Done with changes", "filesChanged": ["a.rs", "b.rs"],
+ "tests": {"status": "pass", "commands": ["cargo test"], "summary": "all pass", "failures": []}}
+```"#;
+        let text = digest("[jg-team-dev] Worker **coder · x** finished.", coder, &[], Some(file));
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "Status: completed");
+        assert_eq!(lines[2], "Summary: Done with changes");
+        assert_eq!(lines[3], "2 files changed · tests: pass");
     }
 
     #[test]
