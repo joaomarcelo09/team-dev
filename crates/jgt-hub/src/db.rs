@@ -433,6 +433,18 @@ impl Db {
         })
     }
 
+    pub fn sessions_by_prefix(&self, prefix: &str) -> Result<Vec<Session>> {
+        if prefix.is_empty() || !prefix.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return Ok(Vec::new());
+        }
+        self.with(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.id LIKE ?1 || '%' ORDER BY s.id ASC LIMIT 5"
+            ))?;
+            stmt.query_map([prefix], session_from_row)?.collect()
+        })
+    }
+
     pub fn session_by_external(&self, harness: Harness, external_id: &str) -> Result<Option<Session>> {
         self.with(|c| {
             c.query_row(
@@ -549,6 +561,28 @@ impl Db {
         };
         let session = self.session(&id)?.ok_or_else(|| anyhow::anyhow!("session vanished"))?;
         Ok((session, previous.map(|s| s.status)))
+    }
+
+    #[cfg(test)]
+    pub fn insert_session_with_id(
+        &self,
+        id: &str,
+        harness: Harness,
+        external_id: &str,
+        role: Option<&str>,
+        cwd: Option<&str>,
+        parent_id: Option<&str>,
+    ) -> Result<Session> {
+        let now = now_ms();
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO sessions (id, harness, external_id, title, cwd, transcript_path, pid,
+                    pid_start, status, created_at, updated_at, last_seen_at, role, parent_id)
+                 VALUES (?1, ?2, ?3, NULL, ?4, NULL, NULL, NULL, 'idle', ?5, ?5, ?5, ?6, ?7)",
+                params![id, harness.as_str(), external_id, cwd, now, role, parent_id],
+            )
+        })?;
+        self.session(id)?.ok_or_else(|| anyhow::anyhow!("session vanished"))
     }
 
     pub fn set_status(&self, id: &str, status: SessionStatus, ended_reason: Option<&str>) -> Result<()> {
