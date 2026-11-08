@@ -809,6 +809,17 @@ impl Db {
         })
     }
 
+    pub fn has_queued(&self, session_id: &str) -> Result<bool> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT EXISTS (SELECT 1 FROM messages WHERE session_id = ?1 AND direction = 'to_agent'
+                 AND delivery = 'queued')",
+                [session_id],
+                |r| r.get(0),
+            )
+        })
+    }
+
     /// Marks queued messages undeliverable (the session's context is gone).
     pub fn fail_queued(&self, session_id: &str) -> Result<Vec<Message>> {
         let queued = self.queued(session_id)?;

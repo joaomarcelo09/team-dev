@@ -1941,6 +1941,107 @@ mod board {
         let _ = (a, b);
     }
 
+    // ── Queue reminder (JGT-24) ─────────────────────────────────────────────
+
+    #[test]
+    fn queued_task_and_idle_coordinator_with_zero_in_progress_triggers_reminder() {
+        let t = team();
+        let task = t.create(ActorRequest::User, "fix navbar", Some(OnQueue)).unwrap();
+
+        t.hub
+            .set_state(&t.coord.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+
+        let queued = inbox(&t.hub, &t.coord);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].body,
+            "[jg-team-dev] 1 task(s) are on the queue: JGT-1. Take the next one (task_list status=on_queue)."
+        );
+        assert_eq!(queued[0].meta["task_id"], task.id.as_str());
+        assert_eq!(queued[0].delivery, Delivery::Queued);
+    }
+
+    #[test]
+    fn same_stop_again_within_window_gives_no_second_reminder() {
+        let t = team();
+        let _task = t.create(ActorRequest::User, "fix navbar", Some(OnQueue)).unwrap();
+
+        t.hub
+            .set_state(&t.coord.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+        let msgs = inbox(&t.hub, &t.coord);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].delivery, Delivery::Queued);
+
+        // Take messages (simulating hook take)
+        let taken = t.hub.take(&t.coord.id).unwrap();
+        assert_eq!(taken.len(), 1);
+
+        // Stop again within the window
+        t.hub
+            .set_state(&t.coord.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+        // Still only the 1 previous delivered message; no second reminder was queued.
+        assert_eq!(inbox(&t.hub, &t.coord).len(), 1);
+        assert!(t.hub.take(&t.coord.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_in_working_with_wip_limit_1_gives_no_reminder() {
+        let t = team();
+        let task1 = t.create(ActorRequest::User, "in progress task", Some(OnQueue)).unwrap();
+        t.mv(&task1, Working).unwrap();
+        t.hub.take(&t.coord.id).unwrap();
+
+        let _task2 = t.create(ActorRequest::User, "queued task", Some(OnQueue)).unwrap();
+
+        t.hub
+            .set_state(&t.coord.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+        assert!(inbox(&t.hub, &t.coord).is_empty());
+    }
+
+    #[test]
+    fn empty_queue_gives_no_reminder() {
+        let t = team();
+        t.hub
+            .set_state(&t.coord.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+        assert!(inbox(&t.hub, &t.coord).is_empty());
+    }
+
+    #[test]
+    fn non_coordinator_worker_idle_gives_no_reminder() {
+        let t = team();
+        let _task = t.create(ActorRequest::User, "task", Some(OnQueue)).unwrap();
+
+        t.hub
+            .set_state(&t.coder.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+        assert!(inbox(&t.hub, &t.coder).is_empty());
+        assert!(inbox(&t.hub, &t.coord).is_empty());
+    }
+
+    #[test]
+    fn queue_reminder_caps_at_five_keys() {
+        let t = team();
+        for i in 1..=6 {
+            t.create(ActorRequest::User, &format!("task {i}"), Some(OnQueue)).unwrap();
+        }
+
+        t.hub
+            .set_state(&t.coord.id, &StateRequest { status: SessionStatus::Idle, last_reply: None })
+            .unwrap();
+
+        let queued = inbox(&t.hub, &t.coord);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(
+            queued[0].body,
+            "[jg-team-dev] 6 task(s) are on the queue: JGT-6, JGT-5, JGT-4, JGT-3, JGT-2, .... Take the next one (task_list status=on_queue)."
+        );
+    }
+
     // ── E7: the usage limit ─────────────────────────────────────────────────
 
     #[test]
