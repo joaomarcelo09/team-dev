@@ -11,7 +11,10 @@ use jgt_core::{
     now_ms, parse_task_key,
 };
 use serde_json::json;
-use std::path::Path;
+use std::{
+    path::Path,
+    time::{Duration, Instant},
+};
 
 /// The workspace key the hub stores: the folder without a trailing slash (`/` stays `/`).
 pub fn normalize_workspace(workspace: &str) -> String {
@@ -663,6 +666,70 @@ impl Hub {
         self.emit_message(&message);
         self.emit_session(&coordinator.id);
         Ok(Some(self.session(&coordinator.id)?))
+    }
+
+    /// Reminds the Coordinator when it becomes Idle with tasks on the queue and capacity to work them.
+    pub(crate) fn remind_queue_if_idle(&self, session: &Session) -> HubResult<()> {
+        if !session.is_coordinator() {
+            return Ok(());
+        }
+        let Some(workspace) = session.cwd.as_deref().map(normalize_workspace) else {
+            return Ok(());
+        };
+        if workspace.is_empty() {
+            return Ok(());
+        }
+        if self.db.has_queued(&session.id)? {
+            return Ok(());
+        }
+        let tasks = self.tasks(&workspace, false)?;
+        let on_queue: Vec<&Task> = tasks.iter().filter(|t| t.status == TaskStatus::OnQueue).collect();
+        if on_queue.is_empty() {
+            return Ok(());
+        }
+        let in_progress = tasks.iter().filter(|t| t.status.in_progress()).count();
+        let wip_limit = self.config().team.wip_limit(Path::new(&workspace));
+        if in_progress >= usize::from(wip_limit) {
+            return Ok(());
+        }
+        let key_set = on_queue.iter().map(|t| t.key.as_str()).collect::<Vec<_>>().join(",");
+        {
+            let reminders = self.queue_reminders.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((last_keys, last_time)) = reminders.get(&session.id)
+                && last_keys == &key_set
+                && last_time.elapsed() < Duration::from_secs(10 * 60)
+            {
+                return Ok(());
+            }
+        }
+        let first_task = on_queue[0];
+        let keys_str = if on_queue.len() > 5 {
+            let first5 = on_queue[..5].iter().map(|t| t.key.as_str()).collect::<Vec<_>>().join(", ");
+            format!("{first5}, ...")
+        } else {
+            on_queue.iter().map(|t| t.key.as_str()).collect::<Vec<_>>().join(", ")
+        };
+        let text = format!(
+            "[jg-team-dev] {} task(s) are on the queue: {keys_str}. Take the next one (task_list status=on_queue).",
+            on_queue.len()
+        );
+        let meta = json!({ "relay_from": null, "task_id": first_task.id });
+        let message = self.db.insert_message(
+            &session.id,
+            jgt_core::Direction::ToAgent,
+            jgt_core::MessageKind::Text,
+            &text,
+            &meta,
+            jgt_core::Delivery::Queued,
+        )?;
+        self.queue_reminders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session.id.clone(), (key_set, Instant::now()));
+        self.bump();
+        self.emit_message(&message);
+        self.emit_session(&session.id);
+        Ok(())
     }
 
     /// What entering `to` does to a task's results and flags. The task is saved by the caller.

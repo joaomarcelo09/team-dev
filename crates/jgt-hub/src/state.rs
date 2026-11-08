@@ -37,6 +37,8 @@ pub struct Hub {
     pub ui_clients: AtomicUsize,
     /// Sessions being restarted from the app, and when that started.
     reconnecting: Mutex<HashMap<String, Instant>>,
+    /// Queue reminder loop guard: last reminded queue key-set and when it was sent per session.
+    queue_reminders: Mutex<HashMap<String, (String, Instant)>>,
 }
 
 pub type SharedHub = Arc<Hub>;
@@ -78,6 +80,7 @@ impl Hub {
             presence: Mutex::new(Presence::default()),
             ui_clients: AtomicUsize::new(0),
             reconnecting: Mutex::new(HashMap::new()),
+            queue_reminders: Mutex::new(HashMap::new()),
         })
     }
 
@@ -228,6 +231,9 @@ impl Hub {
         if let Some(reply) = req.last_reply.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
             self.mirror_reply(&session, reply)?;
         }
+        if session.is_coordinator() && req.status == SessionStatus::Idle {
+            self.remind_queue_if_idle(&session)?;
+        }
         self.bump();
         self.emit_session(id);
         self.session(id)
@@ -279,6 +285,7 @@ impl Hub {
             return Ok(());
         }
         self.db.set_status(&session.id, SessionStatus::Ended, Some(reason))?;
+        self.queue_reminders.lock().unwrap_or_else(|e| e.into_inner()).remove(&session.id);
         for m in self.db.fail_queued(&session.id)? {
             self.emit_message(&m);
         }

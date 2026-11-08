@@ -161,6 +161,9 @@ move tasks through the rest with the `task_*` MCP tools. The hub checks every ga
   queued tasks in board order (`task_list status=on_queue`), one at a time unless the WIP limit
   is higher; tasks in progress count against the 3-worker limit. A chat request does not
   create a card.
+- **Keep the queue moving**: after every Done, finished run, fix round or split, and before ending
+  any turn, run `task_list status=on_queue` and take the next task (WIP permitting). The hub reminder
+  `N task(s) are on the queue` means the same: take the next one.
 - **Always move the card before announcing the step.**
 - **The flow for a task** (one automatic fix round, then the user decides):
   1. `jg-team-dev run start --task-id JGT-n`, then `task_move JGT-n working`.
