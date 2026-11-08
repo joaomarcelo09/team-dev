@@ -758,10 +758,32 @@ impl Hub {
 
     /// Checks that `worker` is a session with one of `roles`, started by the acting Coordinator.
     fn check_worker(&self, worker: &str, roles: &[&str], actor: &Actor) -> HubResult<Session> {
-        let session = self
-            .db
-            .session(worker)?
-            .ok_or_else(|| HubError::BadRequest(format!("worker {worker} is not a known session")))?;
+        let session = match self.db.session(worker)? {
+            Some(s) => s,
+            None => {
+                let matches = if worker.len() >= 8 {
+                    self.db.sessions_by_prefix(worker)?
+                } else {
+                    Vec::new()
+                };
+                match matches.len() {
+                    1 => matches.into_iter().next().unwrap(),
+                    0 => {
+                        return Err(HubError::BadRequest(format!(
+                            "worker {worker} is not a known session; use the full session id (26 chars, `jg-team-dev sessions`)"
+                        )));
+                    }
+                    n => {
+                        let list = matches
+                            .iter()
+                            .map(|s| format!("{} ({})", s.display_name(), s.id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Err(HubError::BadRequest(format!("{n} sessions match `{worker}`: {list}")));
+                    }
+                }
+            }
+        };
         let role = session.role.clone().unwrap_or_default();
         if !roles.contains(&role.as_str()) {
             return Err(HubError::BadRequest(format!(
@@ -800,14 +822,14 @@ impl Hub {
                     }
                     task.test_result = Some(TestResult {
                         status: test.status,
-                        worker: test.worker.clone(),
+                        worker: worker.id.clone(),
                         summary: test.summary.clone(),
                         failures: test.failures.clone(),
                         at: now_ms(),
                     });
                     b.save(&task)?;
                     let meta = json!({
-                        "status": test.status, "worker": test.worker, "failures": test.failures, "role": worker.role,
+                        "status": test.status, "worker": worker.id, "failures": test.failures, "role": worker.role,
                     });
                     let body = test.summary.clone();
                     changes.log(b, &task.id, TaskEventKind::TestResult, &actor, &body, meta)?;
@@ -847,12 +869,12 @@ impl Hub {
                     let result = ReviewResult {
                         decision: review.decision,
                         round,
-                        worker: review.worker.clone(),
+                        worker: worker.id.clone(),
                         findings,
                         at: now_ms(),
                     };
                     let meta = json!({
-                        "decision": review.decision, "round": round, "worker": review.worker,
+                        "decision": review.decision, "round": round, "worker": worker.id,
                         "findings": result.findings.len(), "critical": critical, "high": high, "role": worker.role,
                     });
                     task.review_result = Some(result);

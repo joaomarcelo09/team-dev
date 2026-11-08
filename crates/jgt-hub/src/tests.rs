@@ -46,6 +46,27 @@ fn register_is_idempotent_and_keeps_the_same_chat() {
 }
 
 #[test]
+fn sessions_by_prefix_matches_alphanumeric_prefix_only() {
+    let hub = hub();
+    let s = register(&hub, Harness::ClaudeCode, "s1", None);
+    // Exact match
+    let matches = hub.db.sessions_by_prefix(&s.id).unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].id, s.id);
+
+    // 10-char prefix match
+    let matches = hub.db.sessions_by_prefix(&s.id[..10]).unwrap();
+    assert_eq!(matches.len(), 1);
+    assert_eq!(matches[0].id, s.id);
+
+    // Non-alphanumeric rejected (returns empty)
+    assert!(hub.db.sessions_by_prefix("").unwrap().is_empty());
+    assert!(hub.db.sessions_by_prefix("%").unwrap().is_empty());
+    assert!(hub.db.sessions_by_prefix("_").unwrap().is_empty());
+    assert!(hub.db.sessions_by_prefix(&format!("{}%", &s.id[..5])).unwrap().is_empty());
+}
+
+#[test]
 fn messages_queue_until_taken_and_are_taken_once() {
     let hub = hub();
     let s = register(&hub, Harness::ClaudeCode, "s1", None);
@@ -596,6 +617,22 @@ mod board {
             parent: parent.map(str::to_owned),
         })
         .unwrap()
+    }
+
+    fn session_with_id(
+        hub: &Hub,
+        id: &str,
+        ext: &str,
+        role: &str,
+        cwd: &str,
+        parent: Option<&str>,
+    ) -> Session {
+        let s = hub
+            .db
+            .insert_session_with_id(id, Harness::ClaudeCode, ext, Some(role), Some(cwd), parent)
+            .unwrap();
+        hub.emit_session(id);
+        s
     }
 
     fn as_session(s: &Session) -> ActorRequest {
@@ -1332,6 +1369,179 @@ mod board {
             }));
         }
         t.review(&task, ReviewDecision::Approved, vec![]).unwrap();
+    }
+
+    #[test]
+    fn worker_id_exact_and_prefix_lookups() {
+        let hub = hub();
+        let coord = session_with_id(&hub, "01ARZ3NDEK0000000000000001", "coord", jgt_core::COORDINATOR, WS, None);
+        let coder = session_with_id(&hub, "01BRZ3NDEK0000000000000002", "coder", "coder", WS, Some(&coord.id));
+        let reviewer = session_with_id(&hub, "01CRZ3NDEK0000000000000003", "reviewer", "reviewer", WS, Some(&coord.id));
+        let t = Team { hub, coord, coder, reviewer };
+        let task = t.working("task1");
+        t.mv(&task, Testing).unwrap();
+
+        // 1. Exact id works for test result (and stores full id)
+        let res = t.hub.record_results(&task.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: Some(TestResultInput {
+                status: TestStatus::Pass,
+                worker: t.coder.id.clone(),
+                summary: "tests pass".into(),
+                failures: vec![],
+            }),
+            review: None,
+        }).unwrap();
+        assert_eq!(res.test_result.as_ref().unwrap().worker, t.coder.id);
+
+        // Move to Review
+        t.mv(&task, Review).unwrap();
+
+        // 1. Exact id works for review result (and stores full id)
+        let res = t.hub.record_results(&task.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: None,
+            review: Some(ReviewResultInput {
+                decision: ReviewDecision::Approved,
+                worker: t.reviewer.id.clone(),
+                findings: vec![],
+            }),
+        }).unwrap();
+        assert_eq!(res.review_result.as_ref().unwrap().worker, t.reviewer.id);
+        t.mv(&task, Done).unwrap();
+
+        // 2. 10-char prefix works for test result, and stores full id
+        let task2 = t.working("task2");
+        t.mv(&task2, Testing).unwrap();
+        let coder_prefix = &t.coder.id[..10];
+        let res = t.hub.record_results(&task2.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: Some(TestResultInput {
+                status: TestStatus::Pass,
+                worker: coder_prefix.to_string(),
+                summary: "tests pass prefix".into(),
+                failures: vec![],
+            }),
+            review: None,
+        }).unwrap();
+        assert_eq!(res.test_result.as_ref().unwrap().worker, t.coder.id);
+
+        // Verify task events also store the resolved full id
+        let events = t.events(&task2);
+        let test_event = events.iter().find(|e| e.kind == TaskEventKind::TestResult).unwrap();
+        assert_eq!(test_event.meta["worker"], t.coder.id);
+
+        // 2. 10-char prefix works for review result, and stores full id
+        t.mv(&task2, Review).unwrap();
+        let reviewer_prefix = &t.reviewer.id[..10];
+        let res = t.hub.record_results(&task2.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: None,
+            review: Some(ReviewResultInput {
+                decision: ReviewDecision::Approved,
+                worker: reviewer_prefix.to_string(),
+                findings: vec![],
+            }),
+        }).unwrap();
+        assert_eq!(res.review_result.as_ref().unwrap().worker, t.reviewer.id);
+
+        let events = t.events(&task2);
+        let review_event = events.iter().find(|e| e.kind == TaskEventKind::ReviewResult).unwrap();
+        assert_eq!(review_event.meta["worker"], t.reviewer.id);
+        t.mv(&task2, Done).unwrap();
+
+        // 3. Ambiguous prefix rejected (two sessions sharing a prefix)
+        let shared_prefix = &t.reviewer.id[..10];
+        let fake_reviewer_id = format!("{shared_prefix}9999999999999999");
+        session_with_id(&t.hub, &fake_reviewer_id, "rev2", "reviewer", WS, Some(&t.coord.id));
+
+        let task3 = t.working("task3");
+        t.mv(&task3, Testing).unwrap();
+        t.test(&task3, TestStatus::Pass).unwrap();
+        t.mv(&task3, Review).unwrap();
+
+        let err = t.hub.record_results(&task3.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: None,
+            review: Some(ReviewResultInput {
+                decision: ReviewDecision::Approved,
+                worker: shared_prefix.to_string(),
+                findings: vec![],
+            }),
+        }).unwrap_err();
+        match err {
+            HubError::BadRequest(msg) => {
+                assert!(msg.contains("2 sessions match"), "unexpected message: {msg}");
+                assert!(msg.contains(shared_prefix), "unexpected message: {msg}");
+                assert!(msg.contains(&fake_reviewer_id), "unexpected message: {msg}");
+                assert!(msg.contains(&t.reviewer.id), "unexpected message: {msg}");
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // 4. Unknown id gives the hint
+        let err = t.hub.record_results(&task3.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: None,
+            review: Some(ReviewResultInput {
+                decision: ReviewDecision::Approved,
+                worker: "01UNKNOWN000000000".to_string(),
+                findings: vec![],
+            }),
+        }).unwrap_err();
+        match err {
+            HubError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("use the full session id (26 chars, `jg-team-dev sessions`)"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // Short unknown id (< 8 chars) also gives the hint
+        let err_short = t.hub.record_results(&task3.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: None,
+            review: Some(ReviewResultInput {
+                decision: ReviewDecision::Approved,
+                worker: "short".to_string(),
+                findings: vec![],
+            }),
+        }).unwrap_err();
+        match err_short {
+            HubError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("use the full session id (26 chars, `jg-team-dev sessions`)"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
+
+        // 5. A prefix of a session started by ANOTHER Coordinator is still rejected
+        let other_coord = session_with_id(&t.hub, "01DRZ3NDEK0000000000000004", "coord_other", jgt_core::COORDINATOR, "/tmp/jgt-board-test/other_ws", None);
+        let stranger = session_with_id(&t.hub, "01ERZ3NDEK0000000000000005", "stranger_rev", "reviewer", WS, Some(&other_coord.id));
+        let stranger_prefix = &stranger.id[..10];
+
+        let err_stranger = t.hub.record_results(&task3.id, None, &ResultRequest {
+            actor: t.coordinator(),
+            test: None,
+            review: Some(ReviewResultInput {
+                decision: ReviewDecision::Approved,
+                worker: stranger_prefix.to_string(),
+                findings: vec![],
+            }),
+        }).unwrap_err();
+        match err_stranger {
+            HubError::BadRequest(msg) => {
+                assert!(
+                    msg.contains("was not started by this Coordinator"),
+                    "unexpected message: {msg}"
+                );
+            }
+            other => panic!("expected BadRequest, got {other:?}"),
+        }
     }
 
     #[test]
