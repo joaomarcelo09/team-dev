@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use chrono::{Local, TimeZone};
 use jgt_core::{
     Direction, Harness, HubClient, Message, MessageKind, QuestionStatus, ReconnectMode, Session, SessionStatus,
-    api::*, launch, procs,
+    api::*, config::Config, launch, procs,
 };
 use std::time::Duration;
 
@@ -290,3 +290,40 @@ pub async fn agent(cmd: AgentCommand) -> Result<()> {
     }
     Ok(())
 }
+
+pub fn git_policy() -> Result<()> {
+    let config = Config::load();
+    println!("{}", git_policy_text(&config));
+    Ok(())
+}
+
+pub fn git_policy_text(config: &Config) -> String {
+    config.git.policy_text()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jgt_core::config::Git;
+
+    #[test]
+    fn git_policy_text_with_non_default_config() {
+        let mut config = Config::default();
+        config.git = Git {
+            auto_commit: true,
+            auto_merge: false,
+            auto_push: true,
+            allow_main: true,
+        };
+        let text = git_policy_text(&config);
+        assert_eq!(
+            text,
+            "auto-commit: ON (commit without asking)\n\
+             auto-merge: OFF (ask first)\n\
+             auto-push: ON (push without asking)\n\
+             main branch: ON (the ON actions also apply to main)\n\
+             Always: reviewer approval and Done before merge; never force-push."
+        );
+    }
+}
+

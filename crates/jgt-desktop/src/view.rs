@@ -1,7 +1,7 @@
 //! Everything on screen: the session sidebar, the chat, the composer.
 
 use crate::{
-    app::{AgentRow, App, Conn, MESSAGES_ID, Msg, ThemePref, ThemeStyle, Thread},
+    app::{AgentRow, App, Conn, GitSwitch, MESSAGES_ID, Msg, ThemePref, ThemeStyle, Thread},
     icons, style,
 };
 
@@ -349,7 +349,7 @@ fn settings(app: &App) -> Element<'_, Msg> {
             .padding([4, 12])
     };
     let line = |label: &'static str, control: Element<'static, Msg>| {
-        row![text(label).size(style::fs(14)).width(style::fs(14) * 7.0), control].spacing(12).align_y(Alignment::Center)
+        row![text(label).size(style::fs(14)).width(style::fs(14) * 10.0), control].spacing(12).align_y(Alignment::Center)
     };
     let card = container(
         column![
@@ -381,6 +381,40 @@ fn settings(app: &App) -> Element<'_, Msg> {
                                 .into(),
                         ),
                         muted("Turns off only the desktop pop-up. The tray dot and unread counts stay.")
+                            .size(style::fs(12)),
+                        line(
+                            "Auto-commit",
+                            button(text(if app.auto_commit { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::ToggleGit(GitSwitch::Commit))
+                                .style(if app.auto_commit { style::primary_button } else { style::pill_button })
+                                .padding([4, 12])
+                                .into(),
+                        ),
+                        line(
+                            "Auto-merge",
+                            button(text(if app.auto_merge { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::ToggleGit(GitSwitch::Merge))
+                                .style(if app.auto_merge { style::primary_button } else { style::pill_button })
+                                .padding([4, 12])
+                                .into(),
+                        ),
+                        line(
+                            "Auto-push",
+                            button(text(if app.auto_push { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::ToggleGit(GitSwitch::Push))
+                                .style(if app.auto_push { style::primary_button } else { style::pill_button })
+                                .padding([4, 12])
+                                .into(),
+                        ),
+                        line(
+                            "Also for main",
+                            button(text(if app.allow_main { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::ToggleGit(GitSwitch::Main))
+                                .style(if app.allow_main { style::primary_button } else { style::pill_button })
+                                .padding([4, 12])
+                                .into(),
+                        ),
+                        muted("ON = the Coordinator does it without asking. Merge and push still wait for review and Done. Never force-push. Without \"Also for main\" it still asks before touching main.")
                             .size(style::fs(12)),
                         line(
                             "Style",

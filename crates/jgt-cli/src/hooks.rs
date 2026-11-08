@@ -168,7 +168,9 @@ impl Hook {
                 {
                     note.push_str(&format!(
                         " You are the Coordinator: run `jg-team-dev worker`, `jg-team-dev workers`, \
-                         `jg-team-dev run` and `jg-team-dev reset` as `{}`.",
+                         `jg-team-dev run` and `jg-team-dev reset` as `{}`. \
+                         Before any commit, merge or push run `jg-team-dev git-policy` (use the same path) \
+                         to see which git actions you may do without asking.",
                         exe.canonicalize().unwrap_or(exe).display()
                     ));
                 }

@@ -17,6 +17,7 @@ pub struct Config {
     pub commands: Commands,
     pub desktop: Desktop,
     pub team: Team,
+    pub git: Git,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -534,6 +535,41 @@ pub struct Commands {
     pub terminal: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Git {
+    pub auto_commit: bool,
+    pub auto_merge: bool,
+    pub auto_push: bool,
+    pub allow_main: bool,
+}
+
+impl Git {
+    pub fn policy_text(&self) -> String {
+        let commit = if self.auto_commit {
+            "auto-commit: ON (commit without asking)"
+        } else {
+            "auto-commit: OFF (ask first)"
+        };
+        let merge = if self.auto_merge {
+            "auto-merge: ON (merge without asking)"
+        } else {
+            "auto-merge: OFF (ask first)"
+        };
+        let push = if self.auto_push {
+            "auto-push: ON (push without asking)"
+        } else {
+            "auto-push: OFF (ask first)"
+        };
+        let main = if self.allow_main {
+            "main branch: ON (the ON actions also apply to main)"
+        } else {
+            "main branch: OFF (ask before any commit, merge or push that touches main, even if the action is ON)"
+        };
+        format!("{commit}\n{merge}\n{push}\n{main}\nAlways: reviewer approval and Done before merge; never force-push.")
+    }
+}
+
 impl Config {
     pub fn load() -> Config {
         Self::load_from(&crate::paths::config_path())
@@ -946,5 +982,98 @@ mod tests {
         assert!(warnings.iter().any(|w| w.contains("Claude Code only")), "{warnings:?}");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn git_defaults_are_all_off() {
+        let git = Git::default();
+        assert!(!git.auto_commit);
+        assert!(!git.auto_merge);
+        assert!(!git.auto_push);
+        assert!(!git.allow_main);
+
+        let cfg = Config::default();
+        assert_eq!(cfg.git, Git::default());
+    }
+
+    #[test]
+    fn git_toml_round_trip() {
+        let toml_str = r#"
+        [git]
+        auto_commit = true
+        auto_merge = false
+        auto_push = true
+        allow_main = true
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            cfg.git,
+            Git {
+                auto_commit: true,
+                auto_merge: false,
+                auto_push: true,
+                allow_main: true,
+            }
+        );
+        let serialized = toml::to_string(&cfg).unwrap();
+        let round_tripped: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(round_tripped.git, cfg.git);
+    }
+
+    #[test]
+    fn config_without_git_loads_defaults() {
+        let toml_str = r#"
+        [desktop]
+        theme = "dark"
+        "#;
+        let cfg: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.git, Git::default());
+
+        let empty_cfg: Config = toml::from_str("").unwrap();
+        assert_eq!(empty_cfg.git, Git::default());
+    }
+
+    #[test]
+    fn git_policy_text_reflects_each_flag() {
+        let off = Git::default();
+        assert_eq!(
+            off.policy_text(),
+            "auto-commit: OFF (ask first)\n\
+             auto-merge: OFF (ask first)\n\
+             auto-push: OFF (ask first)\n\
+             main branch: OFF (ask before any commit, merge or push that touches main, even if the action is ON)\n\
+             Always: reviewer approval and Done before merge; never force-push."
+        );
+
+        let on = Git {
+            auto_commit: true,
+            auto_merge: true,
+            auto_push: true,
+            allow_main: true,
+        };
+        assert_eq!(
+            on.policy_text(),
+            "auto-commit: ON (commit without asking)\n\
+             auto-merge: ON (merge without asking)\n\
+             auto-push: ON (push without asking)\n\
+             main branch: ON (the ON actions also apply to main)\n\
+             Always: reviewer approval and Done before merge; never force-push."
+        );
+
+        let commit_only = Git { auto_commit: true, ..Git::default() };
+        assert!(commit_only.policy_text().contains("auto-commit: ON (commit without asking)"));
+        assert!(commit_only.policy_text().contains("auto-merge: OFF (ask first)"));
+
+        let merge_only = Git { auto_merge: true, ..Git::default() };
+        assert!(merge_only.policy_text().contains("auto-commit: OFF (ask first)"));
+        assert!(merge_only.policy_text().contains("auto-merge: ON (merge without asking)"));
+
+        let push_only = Git { auto_push: true, ..Git::default() };
+        assert!(push_only.policy_text().contains("auto-commit: OFF (ask first)"));
+        assert!(push_only.policy_text().contains("auto-push: ON (push without asking)"));
+
+        let main_only = Git { allow_main: true, ..Git::default() };
+        assert!(main_only.policy_text().contains("main branch: ON (the ON actions also apply to main)"));
+        assert!(main_only.policy_text().contains("auto-commit: OFF (ask first)"));
     }
 }
