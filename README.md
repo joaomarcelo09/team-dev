@@ -158,10 +158,21 @@ effort = "medium"
 model = "sonnet"
 effort = "low"
 
+[git]
+auto_commit = false        # commit coder changes without asking (default: false)
+auto_merge = false         # merge worktree into target branch once Done (default: false)
+auto_push = false          # push branch without asking (default: false)
+allow_main = false         # allow auto actions touching main; if false, always ask (default: false)
+
 [commands]
 # opencode = "/path/to/opencode"   # when it is not on PATH (e.g. an nvm install)
 # antigravity = "/path/to/agy"
 ```
+
+The `[git]` section configures git autonomy. All four keys default to `false`. When `allow_main`
+is `false`, any commit, merge or push touching `main` still asks first via chat even if the action
+is enabled. Force-push is never allowed under any setting. Inspect the live policy at any time
+with `jg-team-dev git-policy`.
 
 An Antigravity worker cannot ask for permission: a headless `agy` run denies every tool call
 that needs it (shell commands included), and `--mode auto` is not available on every account.

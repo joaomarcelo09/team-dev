@@ -93,7 +93,7 @@ needs; a review-only request gets one reviewer and nothing else.
 | `planner` | turning a non-trivial goal into steps and acceptance criteria |
 | `coder` | implementing a defined scope, building and running the tests that cover its change |
 | `reviewer` | **the only gate for every task**: reviews architecture, code, tests and their results, correctness, regressions, security, patterns, docs |
-| `git-coder` | commits, branches, merges, pull requests, only after the user agreed |
+| `git-coder` | commits, branches, merges, pull requests, only after the user agreed or when git-policy authorizes the action |
 
 **Gates.** The reviewer is the only gate. It does not build or re-run tests: it reads the coder's
 result file(s) (paths in its brief) and reviews architecture, code, the tests and their results,
@@ -229,19 +229,33 @@ move tasks through the rest with the `task_*` MCP tools. The hub checks every ga
 
 ## Git and the main worktree
 
-Never commit, branch, push or open pull requests without the user's explicit OK in the chat.
+Default is still to ask with `chat_ask` before commit, merge or push; with all switches OFF,
+nothing changes from today. Any git action the policy does not cover (creating a branch outside a
+task worktree, opening a pull request, deleting branches, anything else) always needs the user's
+OK via `chat_ask`.
+
+Before any commit, merge or push, run `jg-team-dev git-policy` first:
+
+- An action that is **ON** is done without asking (still only after tests green, reviewer
+  approved, Done; still announce it in chat).
+- An action that is **OFF** still needs the user's OK via `chat_ask`.
+- Anything touching `main` needs `main branch: ON`, else ask.
+- Never force-push.
 
 Changes reach the user's main worktree only through the `git-coder`, and only when:
 
 1. the coder's tests passed, the reviewer approved the change, and the task reached Done; say
    so if a gate was skipped, and why,
-2. you warned the user, for example: "⚠ This merges `jgt/fix-navbar` into your main worktree
-   (branch `main`). Tests green, reviewed: yes. Go ahead?", and
-3. the user agreed with `chat_ask`.
+2. for an OFF action, you warned the user, for example: "⚠ This merges `jgt/fix-navbar` into your
+   main worktree (branch `main`). Tests green, reviewed: yes. Go ahead?"; for an ON action, you
+   announced in chat what is merged/pushed and where, e.g. "⚠ Auto-merging `jgt/fix-navbar` into
+   main (auto-merge ON, main ON). Tests green, reviewed: yes." without asking, and
+3. the action is ON in `git-policy` or the user agreed with `chat_ask`.
 
-Then start a `git-coder` whose brief names the worktree, the target branch, the agreed action
-(commit and merge, push, open a PR) and whether to remove the worktree afterwards (default: yes,
-once merged).
+Then start a `git-coder` whose brief names the worktree, the target branch, the authorized action
+(commit and merge, push, open a PR), quotes the user's agreement in the chat or the ON line of
+`jg-team-dev git-policy` for that action (and `main branch: ON` when the target is `main`), and
+states whether to remove the worktree afterwards (default: yes, once merged).
 
 ## Topic changes and task summaries
 

@@ -93,6 +93,8 @@ enum Command {
     /// Talk to the user from your own scripts or agents.
     #[command(subcommand)]
     Agent(commands::AgentCommand),
+    /// Print what git actions the Coordinator may run without asking.
+    GitPolicy,
     /// MCP server for agents (started by the harness).
     Mcp {
         #[arg(long, value_parser = parse_harness, default_value = "claude-code")]
@@ -141,6 +143,7 @@ async fn main() {
         Command::Reconnect { session, terminal } => commands::reconnect(&session, terminal).await,
         Command::Open { session } => commands::open(session.as_deref()).await,
         Command::Agent(cmd) => commands::agent(cmd).await,
+        Command::GitPolicy => commands::git_policy(),
     };
     if let Err(e) = result {
         eprintln!("jg-team-dev: {e:#}");

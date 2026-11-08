@@ -11,7 +11,7 @@ use jgt_core::{
     Decision, Direction, Event, Harness, Message, MessageKind, Question, ReconnectMode, Session, SessionStatus, Task as BoardTask,
     TaskEvent, TaskPriority, TaskStatus, TeamAgents,
     api::{MoveResponse, PatchSessionRequest},
-    config::{Config, Desktop as DesktopConfig},
+    config::{Config, Desktop as DesktopConfig, Git},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -182,6 +182,10 @@ pub struct App {
     /// Chat text size in pixels.
     pub text_size: u16,
     pub popups: bool,
+    pub auto_commit: bool,
+    pub auto_merge: bool,
+    pub auto_push: bool,
+    pub allow_main: bool,
     pub show_settings: bool,
     /// Problems in the `[team]` config (unknown harness or effort, …), shown as a banner in Settings.
     pub config_warnings: Vec<String>,
@@ -241,6 +245,14 @@ pub enum Step {
     Up,
     Down,
     Reset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitSwitch {
+    Commit,
+    Merge,
+    Push,
+    Main,
 }
 
 #[derive(Debug, Clone)]
@@ -333,6 +345,7 @@ pub enum Msg {
     SetStyle(ThemeStyle),
     ToggleSettings,
     TogglePopups,
+    ToggleGit(GitSwitch),
     // used by M5
     #[allow(dead_code)]
     SetAgentHarness(String, Harness),
@@ -428,6 +441,10 @@ impl App {
             zoom: clamp_zoom(desktop.zoom),
             text_size,
             popups: config.notifications.enabled,
+            auto_commit: config.git.auto_commit,
+            auto_merge: config.git.auto_merge,
+            auto_push: config.git.auto_push,
+            allow_main: config.git.allow_main,
             show_settings: false,
             config_warnings: config.team.warnings(None),
             agents: Vec::new(),
@@ -1358,6 +1375,10 @@ impl App {
                 if self.show_settings {
                     let config = Config::load();
                     self.popups = config.notifications.enabled;
+                    self.auto_commit = config.git.auto_commit;
+                    self.auto_merge = config.git.auto_merge;
+                    self.auto_push = config.git.auto_push;
+                    self.allow_main = config.git.allow_main;
                     self.config_warnings = config.team.warnings(None);
                     self.agents_locked = agents_locked_for(self);
 
@@ -1426,6 +1447,24 @@ impl App {
                 self.popups = !self.popups;
                 let mut config = Config::load();
                 apply_popups(&mut config, self.popups);
+                let _ = config.save();
+                Task::perform(hub::reload_config(), Msg::Done)
+            }
+            Msg::ToggleGit(switch) => {
+                match switch {
+                    GitSwitch::Commit => self.auto_commit = !self.auto_commit,
+                    GitSwitch::Merge => self.auto_merge = !self.auto_merge,
+                    GitSwitch::Push => self.auto_push = !self.auto_push,
+                    GitSwitch::Main => self.allow_main = !self.allow_main,
+                }
+                let flags = Git {
+                    auto_commit: self.auto_commit,
+                    auto_merge: self.auto_merge,
+                    auto_push: self.auto_push,
+                    allow_main: self.allow_main,
+                };
+                let mut config = Config::load();
+                apply_git(&mut config, &flags);
                 let _ = config.save();
                 Task::perform(hub::reload_config(), Msg::Done)
             }
@@ -1666,6 +1705,11 @@ pub(crate) fn apply_popups(config: &mut Config, enabled: bool) {
     config.notifications.enabled = enabled;
 }
 
+/// Applies git policy settings to a config.
+pub(crate) fn apply_git(config: &mut Config, flags: &Git) {
+    config.git = flags.clone();
+}
+
 /// Applies agent row settings to `config.team.skills`, keeping other skill settings intact.
 pub(crate) fn apply_agents(config: &mut Config, agents: &[AgentRow]) {
     for agent in agents {
@@ -1865,6 +1909,44 @@ mod tests {
         assert!(!config.notifications.enabled);
         apply_popups(&mut config, true);
         assert!(config.notifications.enabled);
+    }
+
+    #[test]
+    fn applying_git_toggle_updates_config() {
+        let mut config = Config::default();
+        // defaults OFF
+        assert!(!config.git.auto_commit);
+        assert!(!config.git.auto_merge);
+        assert!(!config.git.auto_push);
+        assert!(!config.git.allow_main);
+        assert_eq!(config.git, Git::default());
+
+        // apply_git sets keys and keeps other config (notifications, team)
+        let flags = Git {
+            auto_commit: true,
+            auto_merge: true,
+            auto_push: true,
+            allow_main: true,
+        };
+        apply_git(&mut config, &flags);
+        assert!(config.git.auto_commit);
+        assert!(config.git.auto_merge);
+        assert!(config.git.auto_push);
+        assert!(config.git.allow_main);
+        assert_eq!(config.git, flags);
+        assert!(config.notifications.enabled);
+        assert_eq!(config.team.wip_limit, 1);
+
+        let partial = Git {
+            auto_commit: true,
+            auto_merge: false,
+            auto_push: true,
+            allow_main: false,
+        };
+        apply_git(&mut config, &partial);
+        assert_eq!(config.git, partial);
+        assert!(config.notifications.enabled);
+        assert_eq!(config.team.wip_limit, 1);
     }
 
     #[test]
