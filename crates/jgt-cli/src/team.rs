@@ -219,14 +219,14 @@ where
 pub async fn existing_coordinators(client: &HubClient, folder: &Path) -> Result<Vec<Session>> {
     let all: SessionsResponse = client.get("/v1/sessions?archived=true").await.context("hub unreachable")?;
     let folder_str = folder.to_string_lossy();
-    let folder_norm = team::normalize_folder(&folder_str);
+    let folder_norm = team::project_folder(&folder_str);
     Ok(all
         .sessions
         .into_iter()
         .filter(|s| {
             s.is_coordinator()
                 && s.status != SessionStatus::Ended
-                && s.cwd.as_deref().is_some_and(|c| team::normalize_folder(c) == folder_norm)
+                && s.cwd.as_deref().is_some_and(|c| team::project_folder(c) == folder_norm)
         })
         .collect())
 }
@@ -467,7 +467,8 @@ pub async fn reset(summary: Option<PathBuf>) -> Result<()> {
     if !old.is_coordinator() {
         bail!("only a Coordinator can reset");
     }
-    let folder = PathBuf::from(old.cwd.clone().context("the Coordinator has no folder")?);
+    let cwd = old.cwd.clone().context("the Coordinator has no folder")?;
+    let folder = PathBuf::from(team::project_folder(&cwd));
     let summary = match summary {
         Some(p) => {
             let p = if p.is_absolute() { p } else { folder.join(p) };

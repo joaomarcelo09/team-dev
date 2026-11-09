@@ -385,12 +385,16 @@ impl Db {
     /// The Coordinator of a workspace: the newest coordinator session with that folder that has
     /// not ended (a reset retires, i.e. ends, the previous one).
     pub fn current_coordinator(&self, workspace: &str) -> Result<Option<Session>> {
-        let ws_norm = jgt_core::team::normalize_folder(workspace);
+        let ws_norm = jgt_core::team::project_folder(workspace);
         self.with(|c| {
             c.query_row(
                 &format!(
                     "SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.role = 'coordinator' AND s.status != 'ended'
-                     AND (s.cwd = ?1 OR s.cwd = ?1 || '/' OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = ?1))
+                     AND (
+                         s.cwd = ?1 OR s.cwd = ?1 || '/' OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = ?1)
+                         OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = CASE WHEN ?1 = '/' THEN '' ELSE ?1 END || '/.team/worktrees')
+                         OR substr(s.cwd, 1, length(CASE WHEN ?1 = '/' THEN '' ELSE ?1 END || '/.team/worktrees/')) = (CASE WHEN ?1 = '/' THEN '' ELSE ?1 END || '/.team/worktrees/')
+                     )
                      ORDER BY s.created_at DESC LIMIT 1"
                 ),
                 [ws_norm],
@@ -402,13 +406,17 @@ impl Db {
 
     /// A connected Coordinator session in `workspace` (active, idle, or listening).
     pub fn live_coordinator(&self, workspace: &str) -> Result<Option<Session>> {
-        let ws_norm = jgt_core::team::normalize_folder(workspace);
+        let ws_norm = jgt_core::team::project_folder(workspace);
         self.with(|c| {
             c.query_row(
                 &format!(
                     "SELECT {SESSION_COLUMNS} FROM sessions s WHERE s.role = 'coordinator'
                      AND s.status IN ('active', 'idle', 'listening')
-                     AND (s.cwd = ?1 OR s.cwd = ?1 || '/' OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = ?1))
+                     AND (
+                         s.cwd = ?1 OR s.cwd = ?1 || '/' OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = ?1)
+                         OR (s.cwd IS NOT NULL AND rtrim(s.cwd, '/') = CASE WHEN ?1 = '/' THEN '' ELSE ?1 END || '/.team/worktrees')
+                         OR substr(s.cwd, 1, length(CASE WHEN ?1 = '/' THEN '' ELSE ?1 END || '/.team/worktrees/')) = (CASE WHEN ?1 = '/' THEN '' ELSE ?1 END || '/.team/worktrees/')
+                     )
                      ORDER BY s.created_at DESC LIMIT 1"
                 ),
                 [ws_norm],
@@ -509,10 +517,30 @@ impl Db {
         let previous = self.session_by_external(r.harness, r.external_id)?;
         let id = match &previous {
             Some(s) => {
+                let is_coord = r.role == Some(jgt_core::COORDINATOR)
+                    || (r.role.is_none() && s.is_coordinator());
+                let coord_cwd = if is_coord {
+                    r.cwd
+                        .map(jgt_core::team::project_folder)
+                        .or_else(|| s.cwd.as_deref().map(jgt_core::team::project_folder))
+                } else {
+                    None
+                };
                 self.with(|c| {
                     c.execute(
                         "UPDATE sessions SET
-                            cwd = COALESCE(?2, cwd),
+                            cwd = CASE
+                                WHEN COALESCE(?9, role) = 'coordinator' THEN
+                                    CASE
+                                        WHEN cwd IS NULL
+                                             OR cwd LIKE '%/.team/worktrees/%'
+                                             OR cwd LIKE '%/.team/worktrees'
+                                             OR rtrim(cwd, '/') LIKE '%/.team/worktrees'
+                                            THEN COALESCE(?11, ?2, cwd)
+                                        ELSE cwd
+                                    END
+                                ELSE COALESCE(?2, cwd)
+                            END,
                             title = CASE WHEN title_locked = 0 AND ?3 IS NOT NULL THEN ?3 ELSE title END,
                             pid = COALESCE(?4, pid),
                             pid_start = CASE WHEN ?4 IS NOT NULL THEN ?5 ELSE pid_start END,
@@ -530,7 +558,8 @@ impl Db {
                             r.status.as_str(),
                             now,
                             r.role,
-                            r.parent_id
+                            r.parent_id,
+                            coord_cwd,
                         ],
                     )
                 })?;
@@ -538,6 +567,12 @@ impl Db {
             }
             None => {
                 let id = ulid::Ulid::generate().to_string();
+                let is_coord = r.role == Some(jgt_core::COORDINATOR);
+                let cwd = if is_coord {
+                    r.cwd.map(jgt_core::team::project_folder)
+                } else {
+                    r.cwd
+                };
                 self.with(|c| {
                     c.execute(
                         "INSERT INTO sessions (id, harness, external_id, title, cwd, transcript_path, pid,
@@ -548,7 +583,7 @@ impl Db {
                             r.harness.as_str(),
                             r.external_id,
                             r.title,
-                            r.cwd,
+                            cwd,
                             r.transcript_path,
                             r.pid,
                             r.pid_start,

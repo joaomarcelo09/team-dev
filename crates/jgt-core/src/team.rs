@@ -127,18 +127,37 @@ pub fn normalize_folder(folder: &str) -> &str {
     }
 }
 
+/// Returns the root project folder for `path`: normalizes the folder, then if the path contains
+/// `/.team/worktrees/` (or ends with `/.team/worktrees`), returns the part before `/.team/worktrees`;
+/// if that part is empty returns "/".
+///
+/// Note that a team deliberately started inside a worktree folder maps to the outer project (first match)
+/// and is refused while that outer project's Coordinator is live.
+pub fn project_folder(path: &str) -> &str {
+    let norm = normalize_folder(path);
+    const WORKTREES: &str = "/.team/worktrees";
+    for (idx, _) in norm.match_indices(WORKTREES) {
+        let rest = &norm[idx + WORKTREES.len()..];
+        if rest.is_empty() || rest.starts_with('/') {
+            let prefix = &norm[..idx];
+            return if prefix.is_empty() { "/" } else { prefix };
+        }
+    }
+    norm
+}
+
 /// The Coordinator of `folder` now: the newest coordinator session of that folder not ended.
 pub async fn current_coordinator(client: &crate::HubClient, folder: &str) -> Result<Option<crate::Session>, String> {
     let all: crate::api::SessionsResponse =
         client.get("/v1/sessions?archived=true").await.map_err(|e| e.to_string())?;
-    let folder = normalize_folder(folder);
+    let folder = project_folder(folder);
     Ok(all
         .sessions
         .into_iter()
         .filter(|s| {
             s.is_coordinator()
                 && s.status != crate::SessionStatus::Ended
-                && s.cwd.as_deref().is_some_and(|c| normalize_folder(c) == folder)
+                && s.cwd.as_deref().is_some_and(|c| project_folder(c) == folder)
         })
         .max_by_key(|s| s.created_at))
 }
@@ -158,7 +177,7 @@ pub fn session_workspace(session: &crate::Session, sessions: &[crate::Session]) 
         return session
             .cwd
             .as_deref()
-            .map(normalize_folder)
+            .map(project_folder)
             .filter(|k| !k.is_empty())
             .map(str::to_string);
     }
@@ -169,14 +188,14 @@ pub fn session_workspace(session: &crate::Session, sessions: &[crate::Session]) 
             return parent
                 .cwd
                 .as_deref()
-                .map(normalize_folder)
+                .map(project_folder)
                 .filter(|k| !k.is_empty())
                 .map(str::to_string);
         }
         if let Some(folder) = session
             .cwd
             .as_deref()
-            .map(normalize_folder)
+            .map(project_folder)
             .filter(|k| !k.is_empty())
             && coordinator_for(sessions, folder).is_some()
         {
@@ -188,7 +207,7 @@ pub fn session_workspace(session: &crate::Session, sessions: &[crate::Session]) 
 
 /// The Coordinator for `ws`: the newest live Coordinator of that folder.
 pub fn coordinator_for<'a>(sessions: &'a [crate::Session], ws: &str) -> Option<&'a crate::Session> {
-    let ws_norm = normalize_folder(ws);
+    let ws_norm = project_folder(ws);
     if ws_norm.is_empty() {
         return None;
     }
@@ -196,7 +215,7 @@ pub fn coordinator_for<'a>(sessions: &'a [crate::Session], ws: &str) -> Option<&
         .iter()
         .filter(|s| {
             s.is_coordinator()
-                && s.cwd.as_deref().map(normalize_folder) == Some(ws_norm)
+                && s.cwd.as_deref().map(project_folder) == Some(ws_norm)
         })
         .collect();
     if coords.is_empty() {
@@ -269,5 +288,94 @@ mod tests {
         assert_eq!(normalize_folder("/foo/bar"), "/foo/bar");
         assert_eq!(normalize_folder("foo/bar/"), "foo/bar");
         assert_eq!(normalize_folder("foo/bar"), "foo/bar");
+    }
+
+    #[test]
+    fn project_folder_cases() {
+        // trailing slash
+        assert_eq!(project_folder("/w/.team/worktrees/jgt-5/"), "/w");
+        assert_eq!(project_folder("/w/.team/worktrees/"), "/w");
+        assert_eq!(project_folder("/w/.team/worktrees"), "/w");
+
+        // nested subpath
+        assert_eq!(project_folder("/w/.team/worktrees/jgt-5/crates/x"), "/w");
+
+        // no worktree
+        assert_eq!(project_folder("/w/crates/x"), "/w/crates/x");
+        assert_eq!(project_folder("/w"), "/w");
+
+        // root /
+        assert_eq!(project_folder("/"), "/");
+
+        // non-matches
+        assert_eq!(project_folder("/w/.team/worktrees-x"), "/w/.team/worktrees-x");
+        assert_eq!(project_folder("/w2"), "/w2");
+        assert_eq!(project_folder("/w/.team"), "/w/.team");
+
+        // worktree at root (empty prefix before /.team/worktrees)
+        assert_eq!(project_folder("/.team/worktrees"), "/");
+        assert_eq!(project_folder("/.team/worktrees/"), "/");
+        assert_eq!(project_folder("/.team/worktrees/jgt-5"), "/");
+    }
+
+    #[test]
+    fn session_workspace_maps_coordinator_and_worker_worktree_to_project() {
+        let coord: crate::Session = serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "harness": "claude-code",
+            "external_id": "ext-c1",
+            "status": "idle",
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 10,
+            "updated_at": 10,
+            "last_seen_at": 10,
+            "role": "coordinator",
+            "cwd": "/w/.team/worktrees/jgt-5",
+        }))
+        .unwrap();
+
+        let worker_with_parent: crate::Session = serde_json::from_value(serde_json::json!({
+            "id": "w1",
+            "harness": "claude-code",
+            "external_id": "ext-w1",
+            "status": "active",
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 20,
+            "updated_at": 20,
+            "last_seen_at": 20,
+            "role": "coder",
+            "parent_id": "c1",
+            "cwd": "/w/.team/worktrees/jgt-5",
+        }))
+        .unwrap();
+
+        let worker_without_parent: crate::Session = serde_json::from_value(serde_json::json!({
+            "id": "w2",
+            "harness": "claude-code",
+            "external_id": "ext-w2",
+            "status": "active",
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 30,
+            "updated_at": 30,
+            "last_seen_at": 30,
+            "role": "coder",
+            "cwd": "/w/.team/worktrees/jgt-5",
+        }))
+        .unwrap();
+
+        let sessions = vec![coord.clone(), worker_with_parent.clone(), worker_without_parent.clone()];
+
+        assert_eq!(session_workspace(&coord, &sessions), Some("/w".to_string()));
+        assert_eq!(session_workspace(&worker_with_parent, &sessions), Some("/w".to_string()));
+        assert_eq!(session_workspace(&worker_without_parent, &sessions), Some("/w".to_string()));
     }
 }

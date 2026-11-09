@@ -107,7 +107,7 @@ impl std::fmt::Display for WorkspaceChoice {
 /// - Working sessions are connected non-coordinator workers belonging to the workspace's coordinator.
 /// - Cost is the sum of `cost_usd` across all workers of that coordinator (including archived and ended workers).
 pub fn team_summary(sessions: &[Session], workspace: &str) -> (usize, f64) {
-    let ws_norm = jgt_core::team::normalize_folder(workspace);
+    let ws_norm = jgt_core::team::project_folder(workspace);
     if ws_norm.is_empty() {
         return (0, 0.0);
     }

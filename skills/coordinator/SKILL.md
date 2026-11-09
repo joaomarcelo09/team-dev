@@ -123,6 +123,8 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
   on branch `jgt/<name>`. Point the reviewer at the same worktree with the same `--worktree <name>`,
   so it checks the coders' changes. Only for a trivial change, and only after telling the user it
   will touch their main worktree, pass `--main-worktree` instead.
+- **Never `cd` into a worktree** (the hub knows you by your folder); use `git -C <worktree> ...`,
+  absolute paths, or a subshell `(cd <worktree> && ...)` for commands that need it.
 - **The brief is everything the worker knows, and it is short.** Write it to a file under
   `.team/briefs/` with the goal, the scope, what must not change, the acceptance criteria and,
   for a reviewer, the exact checks. Every worker pays to read it:

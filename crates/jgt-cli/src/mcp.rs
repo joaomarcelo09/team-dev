@@ -481,7 +481,7 @@ impl JgtMcp {
             _ => session.cwd.clone(),
         };
         let folder = folder.ok_or("This session has no folder, so it has no Board.")?;
-        Ok((session, folder))
+        Ok((session, jgt_core::team::project_folder(&folder).to_string()))
     }
 
     /// The Coordinator's Board; non-coordinators get a clear error before the hub is asked.

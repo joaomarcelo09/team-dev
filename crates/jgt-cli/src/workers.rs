@@ -152,6 +152,7 @@ fn task_worktree(args: &WorkerArgs, task: Option<&Task>) -> Option<String> {
 /// `/v1/tasks/<task>[<tail>]?workspace=<the Coordinator's folder>`.
 fn task_path(parent: &Session, task: &str, tail: &str) -> Result<String> {
     let workspace = parent.cwd.as_deref().context("the Coordinator has no folder")?;
+    let workspace = jgt_core::team::project_folder(workspace);
     Ok(format!("/v1/tasks/{}{tail}?workspace={}", encode_query(task), encode_query(workspace)))
 }
 
@@ -877,6 +878,28 @@ pub async fn list(parent: Option<String>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_path_maps_worktree_folder_to_project() {
+        let parent: Session = serde_json::from_value(serde_json::json!({
+            "id": "c1",
+            "harness": "claude-code",
+            "external_id": "ext-c1",
+            "status": "idle",
+            "listen": false,
+            "mirror": false,
+            "archived": false,
+            "awaiting_reply": false,
+            "created_at": 0,
+            "updated_at": 0,
+            "last_seen_at": 0,
+            "role": "coordinator",
+            "cwd": "/w/.team/worktrees/jgt-5",
+        }))
+        .unwrap();
+        let path = task_path(&parent, "JGT-12", "").unwrap();
+        assert_eq!(path, "/v1/tasks/JGT-12?workspace=%2Fw");
+    }
 
     #[test]
     fn uuids_are_version_4() {

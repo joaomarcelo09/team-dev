@@ -196,13 +196,14 @@ impl Hub {
             return Err(HubError::Forbidden(session.not_coordinator_error()));
         }
         let cwd = session.cwd.as_deref().ok_or_else(|| HubError::BadRequest("session has no folder".into()))?;
+        let folder = jgt_core::team::project_folder(cwd);
 
         // Refuse if another live (connected) Coordinator already exists on the same folder.
-        if let Some(live) = self.db.live_coordinator(cwd)?
+        if let Some(live) = self.db.live_coordinator(folder)?
             && live.id != session.id
         {
             return Err(HubError::Forbidden(format!(
-                "another Coordinator is already running for {cwd} ({})",
+                "another Coordinator is already running for {folder} ({})",
                 live.display_name()
             )));
         }
@@ -328,7 +329,7 @@ impl Hub {
     }
 
     pub fn delete_workspace(&self, folder: &str) -> HubResult<()> {
-        let ws_norm = jgt_core::team::normalize_folder(folder);
+        let ws_norm = jgt_core::team::project_folder(folder);
         if ws_norm.is_empty() {
             return Ok(());
         }
