@@ -322,7 +322,7 @@ mod tests {
              auto-merge: OFF (ask first)\n\
              auto-push: ON (push without asking)\n\
              main branch: ON (the ON actions also apply to main)\n\
-             Always: reviewer approval and Done before merge; never force-push."
+             Always: reviewer approval (card past Review) before any commit, merge or push; never force-push."
         );
     }
 }

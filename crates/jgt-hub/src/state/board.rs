@@ -47,7 +47,18 @@ fn usage_limit(meta: &serde_json::Value) -> Option<(String, Option<i64>, Option<
 /// never logged as skipping a gate.
 fn users_own_move(from: TaskStatus, to: TaskStatus) -> bool {
     use TaskStatus::*;
-    matches!((from, to), (Backlog, OnQueue) | (OnQueue, Backlog) | (Done, OnQueue))
+    if matches!((from, to), (Backlog, OnQueue) | (OnQueue, Backlog) | (Done, OnQueue)) {
+        return true;
+    }
+    if from.is_git_stage() {
+        if to == OnQueue {
+            return true;
+        }
+        if to.is_past_review() && to.index() > from.index() {
+            return true;
+        }
+    }
+    false
 }
 
 /// Roles whose results the hub records: coder records tests, reviewer records reviews.
@@ -404,11 +415,41 @@ impl Hub {
         Ok(())
     }
 
+    fn review_passed(task: &Task, to: TaskStatus) -> Result<(), String> {
+        if task.test_result.as_ref().map(|t| t.status) != Some(TestStatus::Pass) {
+            return Err(format!("{} needs a green test of this pass (K6)", to.label()));
+        }
+        let Some(review) = &task.review_result else {
+            return Err(format!("{} needs a review of this pass (K6)", to.label()));
+        };
+        if review.decision == ReviewDecision::Changes && task.fix_round_left() {
+            return Err("the fix round is still left: move it to Working".into());
+        }
+        Ok(())
+    }
+
+    fn is_git_switch_on(status: TaskStatus, git: &jgt_core::config::Git) -> bool {
+        match status {
+            TaskStatus::ToCommit => git.auto_commit,
+            TaskStatus::ToMerge => git.auto_merge,
+            TaskStatus::ToPush => git.auto_push,
+            _ => true,
+        }
+    }
+
     /// The team's transition table (plan §1.4). `Err` names the gate that refuses the move.
     ///
     /// The flow: coder → first verification → Done when clean; otherwise one automatic fix round
     /// (Review or Testing → Working) → second verification → Done.
-    fn check_team_move(&self, b: &Board, task: &Task, to: TaskStatus, wip_limit: u8) -> HubResult<Result<(), String>> {
+    fn check_team_move(
+        &self,
+        b: &Board,
+        task: &Task,
+        to: TaskStatus,
+        wip_limit: u8,
+        reason: Option<&str>,
+        git: &jgt_core::config::Git,
+    ) -> HubResult<Result<(), String>> {
         use TaskStatus::*;
         let from = task.status;
         let refused = |why: String| Ok(Err(why));
@@ -473,18 +514,40 @@ impl Hub {
                     ));
                 }
             }
-            (Review, Done) => {
-                if task.test_result.as_ref().map(|t| t.status) != Some(TestStatus::Pass) {
-                    return refused("Done needs a green test of this pass (K6)".into());
+            (Review, to) if to.is_git_stage() || to == Done => {
+                if let Err(why) = Self::review_passed(task, to) {
+                    return refused(why);
                 }
-                let Some(review) = &task.review_result else {
-                    return refused("Done needs a review of this pass (K6)".into());
-                };
-                if review.decision == ReviewDecision::Changes && task.fix_round_left() {
-                    return refused("the fix round is still left: move it to Working".into());
+                for col in [ToCommit, ToMerge, ToPush] {
+                    if col.index() > from.index() && col.index() < to.index() && !Self::is_git_switch_on(col, git) {
+                        return refused(format!(
+                            "{} waits in {} for the user's OK to {}",
+                            task.key,
+                            col.label(),
+                            col.git_step().unwrap_or("")
+                        ));
+                    }
                 }
             }
             (a, b) if a == b => return refused(format!("{} is already in {}", task.key, a.label())),
+            (from, to) if from.is_git_stage() && to.is_past_review() && to.index() > from.index() => {
+                if !Self::is_git_switch_on(from, git) && (reason.is_none() || reason.unwrap().trim().is_empty()) {
+                    return refused(format!("leaving {} needs the user's OK: quote it in reason", from.label()));
+                }
+                for col in [ToCommit, ToMerge, ToPush] {
+                    if col.index() > from.index() && col.index() < to.index() && !Self::is_git_switch_on(col, git) {
+                        return refused(format!(
+                            "{} waits in {} for the user's OK to {}",
+                            task.key,
+                            col.label(),
+                            col.git_step().unwrap_or("")
+                        ));
+                    }
+                }
+            }
+            (from, to) if from.is_git_stage() => {
+                return refused(format!("{} is past review; it does not go back to {}", task.key, to.label()));
+            }
             _ => return refused(format!("the team cannot move a task from {} to {}", from.label(), to.label())),
         }
         Ok(Ok(()))
@@ -493,16 +556,22 @@ impl Hub {
     pub fn move_task(&self, id: &str, workspace: Option<&str>, req: &MoveTaskRequest) -> HubResult<MoveResponse> {
         let task = self.task(id, workspace)?;
         let actor = self.writer(&req.actor, &task.workspace)?;
+        let git = self.config().git;
         let wip_limit = self.config().team.wip_limit(Path::new(&task.workspace));
         let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
         let mut changes = Changes::default();
         let mut queued = false;
         let mut follow_up_task = None;
+        let mut git_steps = Vec::new();
+        let mut from_status = task.status;
         self.db.board(|b| {
             // Re-read inside the transaction, so the gates see what is committed now.
             let mut task = b.task(&task.id)?.ok_or(HubError::NotFound("task"))?;
             let from = task.status;
-            let to = req.to;
+            from_status = from;
+            let routed = actor != Actor::User && req.to == TaskStatus::Done && (from == TaskStatus::Review || from.is_git_stage());
+            let to = if routed { git.stop_after(from) } else { req.to };
+            git_steps = git.steps_between(from, to).into_iter().map(String::from).collect();
             queued = to == TaskStatus::OnQueue && from != to;
             if from == to {
                 if actor != Actor::User {
@@ -513,7 +582,7 @@ impl Hub {
                 changes.task(&task.id);
                 return Ok(());
             }
-            let gate = self.check_team_move(b, &task, to, wip_limit)?;
+            let gate = self.check_team_move(b, &task, to, wip_limit, reason, &git)?;
             let gate_skipped = match (gate, &actor) {
                 (Ok(()), _) => None,
                 (Err(_), Actor::User) if users_own_move(from, to) => None,
@@ -523,12 +592,23 @@ impl Hub {
             self.apply_move(b, &mut task, to, &actor, &mut changes)?;
             b.save(&task)?;
             b.place(&task.id, &task.workspace, to, req.position)?;
-            let body = match (&actor, &gate_skipped, reason) {
-                (Actor::User, Some(_), Some(r)) => format!("moved by you: {r}"),
-                (Actor::User, Some(_), None) => "moved by you".to_string(),
-                (_, _, r) => r.unwrap_or_default().to_string(),
+            let body = if routed && to != TaskStatus::Done {
+                let base = format!("routed to {}: auto-{} OFF", to.label(), to.git_step().unwrap_or(""));
+                match reason {
+                    Some(r) => format!("{base}; {r}"),
+                    None => base,
+                }
+            } else {
+                match (&actor, &gate_skipped, reason) {
+                    (Actor::User, Some(_), Some(r)) => format!("moved by you: {r}"),
+                    (Actor::User, Some(_), None) => "moved by you".to_string(),
+                    (_, _, r) => r.unwrap_or_default().to_string(),
+                }
             };
             let mut meta = json!({ "from": from, "to": to });
+            if routed && to != TaskStatus::Done {
+                meta["routed_from"] = json!("done");
+            }
             if let Some(r) = reason {
                 meta["reason"] = json!(r);
             }
@@ -536,24 +616,38 @@ impl Hub {
                 meta["gate_skipped"] = json!(why);
             }
             changes.log(b, &task.id, TaskEventKind::Moved, &actor, &body, meta)?;
-            if to == TaskStatus::Done {
+            if !from.is_past_review() && to.is_past_review() {
                 follow_up_task = self.follow_up(b, &task, &mut changes)?;
             }
             Ok(())
         })?;
         self.publish(changes);
-        let before = task.status;
+        let before = from_status;
         let task = self.task(&task.id, None)?;
         if task.status == TaskStatus::Done && before != TaskStatus::Done && actor != Actor::User {
             let extra = match &follow_up_task {
                 Some(f) => format!(" A {}-priority follow-up {} is in Backlog.", f.priority, f.key),
                 None => String::new(),
             };
+            let steps = if git_steps.is_empty() {
+                "no git steps".to_string()
+            } else {
+                git_steps.join(", ")
+            };
             let body = format!(
-                "{} \"{}\" is Done: tested and reviewed. It is ready to merge once you agree.{extra}",
+                "{} \"{}\" is Done: tested, reviewed; {steps} per git policy.{extra}",
                 task.key, task.title
             );
             self.notify_task(&task, "success", &format!("{} is Done", task.key), &body)?;
+        }
+        if task.status.is_git_stage() && before != task.status {
+            let step = task.status.git_step().unwrap_or("");
+            let title = format!("{} waits for your OK to {step}", task.key);
+            let body = format!(
+                "\"{}\" is tested and reviewed. Move the card (or answer in chat) to OK the {step}.",
+                task.title
+            );
+            self.notify_task(&task, "warning", &title, &body)?;
         }
         // Queueing a task is the request (K4): the Coordinator hears of it, and the caller wakes it.
         let coordinator = if queued {
@@ -566,10 +660,28 @@ impl Hub {
                 task.key, task.title
             );
             self.tell_coordinator(&task, &text)?
+        } else if actor == Actor::User
+            && (before.is_git_stage() || before == TaskStatus::Review)
+            && task.status.is_past_review()
+            && task.status.index() > before.index()
+        {
+            let steps = git.steps_between(before, task.status);
+            if !steps.is_empty() {
+                let text = format!(
+                    "[jg-team-dev] The user moved {} from {} to {}: their OK to {}. Run them with the git-coder now.",
+                    task.key,
+                    before.label(),
+                    task.status.label(),
+                    steps.join(", ")
+                );
+                self.tell_coordinator(&task, &text)?
+            } else {
+                None
+            }
         } else {
             None
         };
-        Ok(MoveResponse { task, coordinator, queued })
+        Ok(MoveResponse { task, coordinator, queued, git_steps })
     }
 
     /// Posts a `notify` message in the Coordinator's chat for a task reaching Done or getting
@@ -689,7 +801,7 @@ impl Hub {
             // Moving an archived task brings it back on the Board.
             task.archived = false;
         }
-        if from == Done {
+        if from == Done || (from.is_git_stage() && !to.is_past_review()) {
             // Reopened: a fresh start (decision 3).
             task.review_rounds = 0;
             task.round_limit = ROUND_LIMIT;
@@ -727,7 +839,7 @@ impl Hub {
             _ => {}
         }
         let legacy_limit = task.waiting.as_ref().is_some_and(|w| w.kind == WaitingKind::RoundLimit);
-        if task.waiting.is_some() && (matches!(to, Backlog | Done) || legacy_limit) {
+        if task.waiting.is_some() && (matches!(to, Backlog | Done) || to.is_git_stage() || legacy_limit) {
             task.waiting = None;
             changes.log(b, &task.id, TaskEventKind::Waiting, actor, "cleared", json!({ "waiting": null }))?;
         }

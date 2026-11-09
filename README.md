@@ -48,25 +48,33 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   permission mode and tools can be set per skill and per project (below).
 
 - **Kanban (K-1, board data)**: each workspace (a Coordinator's folder) has a Board of tasks in
-  the hub database, `JGT-1`, `JGT-2`, … per workspace (keys are never reused), in six columns:
-  Backlog, On Queue, Working, Testing, Review, Done. Every move, edit, result and comment goes to
-  the task's activity log with who made it. The hub enforces the gates: workers only read the
-  Board; agents never edit the title, description or priority; the Coordinator creates tasks in
-  Backlog and queues only subtasks of a task you queued; at most `wip_limit` tasks are in progress.
-  The flow is coder (stays in Working until tests are green; no rounds used) → reviewer (full
-  diff) → one fix round if critical/high findings (fresh coder fixes them and re-runs tests) →
-  reviewer (fix diff only) → Done. Review → Done is accepted for an approved review at any round,
-  and for a review with changes only when no fix round is left. The hub then files the leftover
-  findings as ONE follow-up in Backlog (parent = the task) and sets its priority itself = highest
-  severity (critical/high → high; medium or unlabelled → normal; only low → low; no findings →
-  normal). The task never waits for the user (a red test at the last round needs a user move). You
-  may move any task anywhere; a move that skips a gate is logged as "moved by you".
-  Reopening a Done task resets its rounds. `jg-team-dev task` (`list`, `show`, `create`, `edit`,
-  `details`, `move`, `result`, `comment`, `delete`, `log`) drives it from a terminal or a
-  session.
+  the hub database, `JGT-1`, `JGT-2`, … per workspace (keys are never reused), in nine columns:
+  Backlog, On Queue, Working, Testing, Review, To commit, To merge, To push, Done. Between Review
+  and Done sits the fixed git line (To commit → To merge → To push → Done), where each column
+  represents the next git step awaiting the user's OK. When the Coordinator moves a card to `done`
+  from Review or a git column, the hub routes it to the first later column whose auto-switch is OFF,
+  or to Done if all are ON. The hub returns the ON steps passed along the way (`git_steps`), which
+  the Coordinator runs with the git-coder. Dragging a card forward along the line counts as the user's
+  OK for every step it passes, and the hub notifies the Coordinator to run them. Leaving a git column
+  whose switch is OFF requires a reason quoting the user's OK. The team can never move a card
+  backward from a git column. Git columns do not count toward the WIP limit. Every move, edit, result
+  and comment goes to the task's activity log with who made it. The hub enforces the gates: workers
+  only read the Board; agents never edit the title, description or priority; the Coordinator creates
+  tasks in Backlog and queues only subtasks of a task you queued; at most `wip_limit` tasks are in
+  progress. The flow is coder (stays in Working until tests are green; no rounds used) → reviewer
+  (full diff) → one fix round if blocking/high findings (fresh coder fixes them and re-runs tests) →
+  reviewer (fix diff only) → routing along the git line to Done. Review → Done is accepted for an
+  approved review at any round, and for a review with changes only when no fix round is left. The hub
+  then files the leftover findings as ONE follow-up in Backlog (parent = the task) and sets its
+  priority itself = highest severity (blocking/high → high; medium or unlabelled → normal; only low →
+  low; no findings → normal). The task never waits for the user (a red test at the last round needs a
+  user move). You may move any task anywhere; a move that skips a gate is logged as "moved by you".
+  Reopening a task from a git column or Done (moving to On Queue) resets its rounds. `jg-team-dev task`
+  (`list`, `show`, `create`, `edit`, `details`, `move`, `result`, `comment`, `delete`, `log`) drives
+  it from a terminal or a session.
 
 - **Kanban (K-2, Board view)**: a Coordinator's chat header has two tabs, **Chat** (the default)
-  and **Board**. The Board shows the workspace's six columns with their counts, scrolling
+  and **Board**. The Board shows the workspace's nine columns with their counts, scrolling
   sideways in a narrow window; Done shows the 20 newest tasks, with "Show all". "+" in Backlog
   and On Queue adds a task (a title is enough). A card shows its key, title, priority, the worker
   on it (`↳ reviewer`), the review (`round 1/2`) and *Waiting for you* or *Waiting: usage
@@ -86,16 +94,17 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   one-fix-round rule. Workers only read (`task_get`). `jg-team-dev run start --task-id JGT-n` names the
   run after the key and links it to the task; `jg-team-dev worker … --task-id JGT-n` works in
   `.team/worktrees/jgt-n` (branch `jgt/jgt-n`) in the task's run, and the card shows the worker
-  on it. The reviewer tags each finding by severity, with a category (security,
-  secret, performance, patterns, docs, behavior); only critical and high findings start a fix round.
+  on it. The reviewer tags each finding by severity (`blocking`, `high`, `medium`, `low`), with a category
+  (security, secret, performance, patterns, docs, behavior); only blocking and high findings start a fix round.
 
 - **Kanban (K-4, polish)**: drag a card to another column or position (Esc cancels; ← →
   and "Move to…" stay). Comment on a task from its panel or `jg-team-dev task comment`: the
-  comment reaches the Coordinator like a chat message and wakes it. A task reaching Done, or
-  getting *Waiting for you*, posts a notification in the Coordinator's chat, which also shows on
-  the desktop. Done tasks are archived (kept, hidden; `task list --all` shows them) 7 days after
-  they got there; moving one brings it back. Export the Board as Markdown with the Board's
-  Export button or `jg-team-dev task export [--out FILE] [--all]` (default `docs/board.md`).
+  comment reaches the Coordinator like a chat message and wakes it. A task reaching Done,
+  entering a git column waiting for your OK, or getting *Waiting for you*, posts a notification in
+  the Coordinator's chat, which also shows on the desktop. Done tasks are archived (kept, hidden;
+  `task list --all` shows them) 7 days after they got there; moving one brings it back. Export the
+  Board as Markdown with the Board's Export button or `jg-team-dev task export [--out FILE] [--all]`
+  (default `docs/board.md`).
 
 - **Team efficiency**: the coder runs the build and tests itself and reports them (`tests` field);
   while tests fail (or work is incomplete), the task stays in Working and the Coordinator starts a
@@ -160,7 +169,7 @@ effort = "low"
 
 [git]
 auto_commit = false        # commit coder changes without asking (default: false)
-auto_merge = false         # merge worktree into target branch once Done (default: false)
+auto_merge = false         # merge worktree into target branch once reviewed (default: false)
 auto_push = false          # push branch without asking (default: false)
 allow_main = false         # allow auto actions touching main; if false, always ask (default: false)
 

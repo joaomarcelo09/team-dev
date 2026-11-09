@@ -97,6 +97,9 @@ mod tests {
             "## Working (1)",
             "## Testing (0)",
             "## Review (1)",
+            "## To commit (0)",
+            "## To merge (0)",
+            "## To push (0)",
             "## Done (2)",
         ] {
             assert!(md.contains(column), "{column} in\n{md}");
@@ -104,7 +107,10 @@ mod tests {
         assert!(md.contains("- [JGT-2] second\n- [JGT-1] first\n"), "{md}");
         assert!(md.contains("- [JGT-3] fix navbar (high, round 2/2, waiting: usage limit, resets 17:00)\n"), "{md}");
         assert!(md.contains("## Working (1)\n\n- [JGT-6] add export (round 2/2)\n"), "{md}");
-        assert!(md.find("## Review").unwrap() < md.find("## Done").unwrap());
+        assert!(md.find("## Review").unwrap() < md.find("## To commit").unwrap());
+        assert!(md.find("## To commit").unwrap() < md.find("## To merge").unwrap());
+        assert!(md.find("## To merge").unwrap() < md.find("## To push").unwrap());
+        assert!(md.find("## To push").unwrap() < md.find("## Done").unwrap());
         assert!(md.contains("- [JGT-5] new\n- [JGT-4] old\n"), "{md}");
         assert!(md.contains("## On Queue (0)\n\n_No tasks._\n"));
     }

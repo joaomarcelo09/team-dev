@@ -9,7 +9,7 @@ use jgt_core::{
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{path::Path, sync::Mutex};
 
-pub(crate) const SCHEMA_VERSION: i64 = 8;
+pub(crate) const SCHEMA_VERSION: i64 = 9;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -136,6 +136,8 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, "ALTER TABLE sessions ADD COLUMN model TEXT; ALTER TABLE sessions ADD COLUMN effort TEXT;
          ALTER TABLE sessions ADD COLUMN tokens_in INTEGER; ALTER TABLE sessions ADD COLUMN tokens_out INTEGER;"),
     (8, "UPDATE tasks SET status = 'review' WHERE status = 'orchestrator_review';"),
+    // Status values to_commit, to_merge, to_push (JGT-23): no data changes, bump keeps older hubs away.
+    (9, "SELECT 1;"),
 ];
 
 /// Columns selected for a `Session`, including the computed counters.
