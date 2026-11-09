@@ -152,10 +152,10 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
 
 ## Board
 
-Your folder has a Board: tasks in seven columns, Backlog → On Queue → Working → Testing →
-Review → Orchestrator review → Done. The user owns Backlog, On Queue and Orchestrator review; you
-move tasks through the rest with the `task_*` MCP tools. The hub checks every gate: **a refusal
-(409 or 403) is final.** Report it to the user; never work around it.
+Your folder has a Board: tasks in six columns, Backlog → On Queue → Working → Testing →
+Review → Done. The user owns Backlog and On Queue only; you move tasks through the rest with the
+`task_*` MCP tools. The hub checks every gate: **a refusal (409 or 403) is final.** Report it to
+the user; never work around it.
 
 - **A queue message is the request**: `[jg-team-dev] Task JGT-n "…" is on the queue`. Take
   queued tasks in board order (`task_list status=on_queue`), one at a time unless the WIP limit
@@ -165,7 +165,7 @@ move tasks through the rest with the `task_*` MCP tools. The hub checks every ga
   any turn, run `task_list status=on_queue` and take the next task (WIP permitting). The hub reminder
   `N task(s) are on the queue` means the same: take the next one.
 - **Always move the card before announcing the step.**
-- **The flow for a task** (one automatic fix round, then the user decides):
+- **The flow for a task** (one automatic fix round, then Done):
   1. `jg-team-dev run start --task-id JGT-n`, then `task_move JGT-n working`.
   2. Read the task (`task_get`) and the code; write the plan, files, what must not change and the
      acceptance criteria with `task_update details=…`. Never change the user's description.
@@ -197,18 +197,10 @@ move tasks through the rest with the `task_*` MCP tools. The hub checks every ga
      `task_move review`, start the reviewer (same reviewer role, brief says: "Second review:
      review only `jg-team-dev snapshot --task JGT-n --diff`, and check that each finding in <path
      of the first result> is fixed"). The second review (after a fix round) is the only one that uses
-     `snapshot --diff`. Record `review_result` as in step 5.
-  8. **Orchestrator review.** Whatever the second review says (or from Testing when tests are red),
-     `task_move orchestrator_review`. The hub notifies the user. Post the result in one or two lines,
-     then ask with `chat_ask`, options "Done", "One more fix", "Take over", "Stop":
-     "JGT-n is in Orchestrator review: <result>. Accept it (Done), run one more fix, take over,
-     or stop?" Pass the answer on with
-     `task_decide JGT-n <done|more_rounds|take_over|stop> question_id=<that question's id>`.
-     The user may also decide on the card. "One more fix" puts the task back in Working: one more
-     coder and reviewer (steps 6–7), then Orchestrator review again. After "Take over" the task
-     is the user's: do not touch it. You never move a card out of Orchestrator review.
-  9. On Done: `jg-team-dev run finish`, then tell the user the task is ready to merge. Done never
-     merges: the git-coder runs only after the user's OK, as below.
+     `snapshot --diff`. Record `review_result` as in step 5, then `task_move done`.
+  8. On Done: `jg-team-dev run finish`, then tell the user the task is ready to merge (and mention
+     the follow-up task, if any). Done never merges: the git-coder runs only after the user's OK,
+     as below.
 - **Small pieces.** Size each coder's piece to about 5–10 minutes: one concern, a handful of
   files. Split anything bigger into subtasks (`task_create parent=JGT-n`, in Backlog) and run
   them one after another. **Never give one coder two milestones.** Queue a subtask
@@ -224,7 +216,7 @@ move tasks through the rest with the `task_*` MCP tools. The hub checks every ga
   line "Resume: … do not restart."
 - **Comments.** `[jg-team-dev] Comment on JGT-n "…": …` is the user writing on the card; treat
   it like a chat message about that task.
-- The hub announces Done, Orchestrator review and *Waiting for you* in your chat with a
+- The hub announces Done and *Waiting for you* in your chat with a
   notification; do not `chat_notify` them yourself.
 
 ## Git and the main worktree

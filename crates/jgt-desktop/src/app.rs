@@ -8,7 +8,7 @@ use iced::{
     keyboard, window,
 };
 use jgt_core::{
-    Decision, Direction, Event, Harness, Message, MessageKind, Question, ReconnectMode, Session, SessionStatus, Task as BoardTask,
+    Direction, Event, Harness, Message, MessageKind, Question, ReconnectMode, Session, SessionStatus, Task as BoardTask,
     TaskEvent, TaskPriority, TaskStatus, TeamAgents,
     api::{MoveResponse, PatchSessionRequest},
     config::{Config, Desktop as DesktopConfig, Git},
@@ -300,13 +300,12 @@ pub enum Msg {
     SaveTask,
     RevertTask,
     SetPriority(TaskPriority),
-    /// A create, edit or decision came back from the hub.
+    /// A create or edit came back from the hub.
     TaskChanged(Result<BoardTask, String>),
     DeleteTaskAsk,
     DeleteTaskCancel,
     DeleteTaskConfirm,
     TaskDeleted { id: String, result: Result<(), String> },
-    Decide { id: String, choice: Decision },
     ShowAllDone(bool),
     CommentInput(String),
     CommentSend,
@@ -1193,7 +1192,6 @@ impl App {
                 }
                 Task::none()
             }
-            Msg::Decide { id, choice } => Task::perform(hub::decide(id, choice), Msg::TaskChanged),
             Msg::ShowAllDone(on) => {
                 self.show_all_done = on;
                 Task::none()

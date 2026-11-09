@@ -84,7 +84,7 @@ mod tests {
             since: 0,
             until: Some(1),
         });
-        let mut f = Task::new("/w", 6, "add export", TaskStatus::OrchestratorReview);
+        let mut f = Task::new("/w", 6, "add export", TaskStatus::Working);
         f.review_rounds = 1;
         let mut d = Task::new("/w", 4, "old", TaskStatus::Done);
         d.done_at = Some(1);
@@ -94,19 +94,17 @@ mod tests {
         for column in [
             "## Backlog (2)",
             "## On Queue (0)",
-            "## Working (0)",
+            "## Working (1)",
             "## Testing (0)",
             "## Review (1)",
-            "## Orchestrator review (1)",
             "## Done (2)",
         ] {
             assert!(md.contains(column), "{column} in\n{md}");
         }
         assert!(md.contains("- [JGT-2] second\n- [JGT-1] first\n"), "{md}");
         assert!(md.contains("- [JGT-3] fix navbar (high, round 2/2, waiting: usage limit, resets 17:00)\n"), "{md}");
-        assert!(md.contains("## Orchestrator review (1)\n\n- [JGT-6] add export (round 2/2)\n"), "{md}");
-        assert!(md.find("## Review").unwrap() < md.find("## Orchestrator review").unwrap());
-        assert!(md.find("## Orchestrator review").unwrap() < md.find("## Done").unwrap());
+        assert!(md.contains("## Working (1)\n\n- [JGT-6] add export (round 2/2)\n"), "{md}");
+        assert!(md.find("## Review").unwrap() < md.find("## Done").unwrap());
         assert!(md.contains("- [JGT-5] new\n- [JGT-4] old\n"), "{md}");
         assert!(md.contains("## On Queue (0)\n\n_No tasks._\n"));
     }

@@ -335,9 +335,6 @@ string_enum! {
         Working => "working",
         Testing => "testing",
         Review => "review",
-        /// The second verification is done: the task waits for the user's own review and decision
-        /// (PRD D4). Only the user moves it out.
-        OrchestratorReview => "orchestrator_review",
         Done => "done",
     }
 }
@@ -351,7 +348,6 @@ impl TaskStatus {
             TaskStatus::Working => "Working",
             TaskStatus::Testing => "Testing",
             TaskStatus::Review => "Review",
-            TaskStatus::OrchestratorReview => "Orchestrator review",
             TaskStatus::Done => "Done",
         }
     }
@@ -371,8 +367,7 @@ impl TaskStatus {
         self.index().checked_sub(1).map(|i| Self::ALL[i])
     }
 
-    /// The team is working on a task in this column (counts toward the WIP limit). A task in
-    /// Orchestrator review waits for the user, not the team.
+    /// The team is working on a task in this column (counts toward the WIP limit).
     pub fn in_progress(self) -> bool {
         matches!(self, TaskStatus::Working | TaskStatus::Testing | TaskStatus::Review)
     }
@@ -391,8 +386,7 @@ string_enum! {
     WaitingKind {
         /// A decision is open: a `chat_ask` question.
         Question => "question",
-        /// Legacy: the old 3-round limit. The Orchestrator review column replaced it (PRD D4);
-        /// the hub never sets it, and moves tasks that had it to that column when it opens.
+        /// Legacy: the old 3-round limit.
         RoundLimit => "round_limit",
         /// A worker on the task stopped at the harness's usage limit; `until` is the reset. Set and
         /// cleared by the hub, which then wakes the Coordinator to resume (PRD E7).
@@ -446,8 +440,8 @@ impl Severity {
 }
 
 string_enum! {
-    /// The kinds of critical finding (PRD "Critical findings"). Only these stop a task after the
-    /// last review round.
+    /// The kinds of critical finding (PRD "Critical findings"). Critical findings must carry one
+    /// of these categories (K17).
     FindingCategory {
         Security => "security",
         Secret => "secret",
@@ -473,26 +467,9 @@ string_enum! {
     }
 }
 
-string_enum! {
-    /// The user's answer to a task in Orchestrator review (PRD D3/D4).
-    Decision {
-        /// Accept the task: it goes to Done.
-        Done => "done",
-        /// One more fix: one more coder and reviewer, then back to Orchestrator review.
-        MoreRounds => "more_rounds",
-        /// The user takes the task over: it goes to Backlog and the team leaves it alone.
-        TakeOver => "take_over",
-        /// Stop: back to Backlog, the findings stay in the log.
-        Stop => "stop",
-    }
-}
-
-/// Verifications a task gets before the user decides (PRD D3): the first one, and the one after
+/// Verifications a task gets before moving to Done: the first one, and the one after
 /// the single automatic fix round.
 pub const ROUND_LIMIT: i64 = 2;
-
-/// What `more_rounds` adds: one more fix and verification.
-pub const MORE_ROUNDS: i64 = 1;
 
 /// Prefix of every task key (`JGT-12`).
 pub const TASK_KEY_PREFIX: &str = "JGT-";
@@ -534,9 +511,9 @@ pub struct Task {
     pub priority: TaskPriority,
     #[serde(default)]
     pub waiting: Option<Waiting>,
-    /// Fix rounds so far: Review → Working and Testing → Working returns, and "one more fix".
+    /// Fix rounds so far: Review → Working and Testing → Working returns.
     pub review_rounds: i64,
-    /// Verifications allowed before the user decides (2, plus 1 per `more_rounds`).
+    /// Verifications allowed before moving to Done (2).
     pub round_limit: i64,
     /// The test of the current pass (cleared when the task enters Testing).
     #[serde(default)]
@@ -574,11 +551,11 @@ impl Task {
 
     /// Whether the round is worth showing: the team has the task, or a review already sent it back.
     pub fn shows_round(&self) -> bool {
-        self.review_rounds > 0 || self.status.in_progress() || self.status == TaskStatus::OrchestratorReview
+        self.review_rounds > 0 || self.status.in_progress()
     }
 
-    /// Whether the team may still start a fix round on its own: the current verification is not
-    /// the last one before the user decides.
+    /// Whether the team may still start a fix round: the current verification is not
+    /// the last one before Done.
     pub fn fix_round_left(&self) -> bool {
         self.review_rounds + 1 < self.round_limit
     }
@@ -685,6 +662,27 @@ impl Finding {
     }
 }
 
+/// The priority of a follow-up task filed from review findings.
+///
+/// Rule: the highest severity wins (Critical/High -> High; else any "medium" or unlabelled other -> Normal;
+/// only "low" -> Low; empty -> Normal).
+pub fn follow_up_priority(findings: &[Finding]) -> TaskPriority {
+    if findings.is_empty() {
+        return TaskPriority::Normal;
+    }
+    if findings.iter().any(|f| matches!(f.level(), Severity::Critical | Severity::High)) {
+        return TaskPriority::High;
+    }
+    let all_low = findings
+        .iter()
+        .all(|f| f.severity.as_deref().map(|s| s.trim().eq_ignore_ascii_case("low")).unwrap_or(false));
+    if all_low {
+        TaskPriority::Low
+    } else {
+        TaskPriority::Normal
+    }
+}
+
 /// Who did something on the Board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -743,10 +741,60 @@ mod tests {
         assert_eq!(TaskStatus::Done.next(), None);
         assert_eq!(TaskStatus::Review.prev(), Some(TaskStatus::Testing));
         assert!(TaskStatus::Testing.in_progress() && !TaskStatus::OnQueue.in_progress());
-        assert_eq!(TaskStatus::Review.next(), Some(TaskStatus::OrchestratorReview));
-        assert_eq!(TaskStatus::OrchestratorReview.next(), Some(TaskStatus::Done));
-        assert!(!TaskStatus::OrchestratorReview.in_progress());
-        assert_eq!(TaskStatus::ALL.len(), 7);
+        assert_eq!(TaskStatus::Review.next(), Some(TaskStatus::Done));
+        assert_eq!(TaskStatus::Done.prev(), Some(TaskStatus::Review));
+        assert!(!TaskStatus::Done.in_progress());
+        assert_eq!(TaskStatus::ALL.len(), 6);
+    }
+
+    #[test]
+    fn follow_up_priority_highest_severity_wins() {
+        let f = |critical: bool, severity: Option<&str>| Finding {
+            critical,
+            category: None,
+            severity: severity.map(str::to_string),
+            location: String::new(),
+            problem: "p".into(),
+            required_action: String::new(),
+        };
+
+        // Empty -> Normal
+        assert_eq!(follow_up_priority(&[]), TaskPriority::Normal);
+
+        // Only low -> Low
+        assert_eq!(follow_up_priority(&[f(false, Some("low"))]), TaskPriority::Low);
+        assert_eq!(
+            follow_up_priority(&[f(false, Some("low")), f(false, Some("LOW")), f(false, Some(" low "))]),
+            TaskPriority::Low
+        );
+
+        // Any medium or unlabelled other -> Normal
+        assert_eq!(follow_up_priority(&[f(false, Some("medium"))]), TaskPriority::Normal);
+        assert_eq!(follow_up_priority(&[f(false, None)]), TaskPriority::Normal);
+        assert_eq!(follow_up_priority(&[f(false, Some(""))]), TaskPriority::Normal);
+        assert_eq!(follow_up_priority(&[f(false, Some("nit"))]), TaskPriority::Normal);
+        assert_eq!(
+            follow_up_priority(&[f(false, Some("medium")), f(false, Some("low")), f(false, Some("low"))]),
+            TaskPriority::Normal
+        );
+        assert_eq!(
+            follow_up_priority(&[f(false, None), f(false, Some("low"))]),
+            TaskPriority::Normal
+        );
+
+        // Critical or High -> High
+        assert_eq!(follow_up_priority(&[f(true, None)]), TaskPriority::High);
+        assert_eq!(follow_up_priority(&[f(true, Some("low"))]), TaskPriority::High);
+        assert_eq!(follow_up_priority(&[f(false, Some("high"))]), TaskPriority::High);
+        assert_eq!(follow_up_priority(&[f(false, Some("blocking"))]), TaskPriority::High);
+        assert_eq!(
+            follow_up_priority(&[f(false, Some("high")), f(false, Some("medium")), f(false, Some("low"))]),
+            TaskPriority::High
+        );
+        assert_eq!(
+            follow_up_priority(&[f(true, None), f(false, Some("low"))]),
+            TaskPriority::High
+        );
     }
 
     #[test]

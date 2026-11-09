@@ -8,7 +8,7 @@ use crate::runs::read_text;
 use anyhow::{Context, Result, bail};
 use chrono::{Local, TimeZone};
 use jgt_core::{
-    Decision, HubClient, ReviewDecision, Session, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus, TestStatus,
+    HubClient, ReviewDecision, Session, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus, TestStatus,
     api::*, client::encode_query, procs,
 };
 use std::path::PathBuf;
@@ -97,15 +97,6 @@ pub enum TaskCommand {
         #[arg(long)]
         review_file: Option<PathBuf>,
     },
-    /// Decide on a task in Orchestrator review: done, more-rounds (one more fix), take-over or stop.
-    Decide {
-        task: String,
-        #[arg(value_parser = parse_decision)]
-        choice: Decision,
-        /// For the Coordinator: the answered chat_ask question with the user's choice.
-        #[arg(long)]
-        question: Option<String>,
-    },
     /// Comment on a task.
     Comment { task: String, text: Vec<String> },
     /// Delete a task (the user only; its key is never reused).
@@ -135,7 +126,6 @@ pub(crate) fn parse_column(s: &str) -> Result<TaskStatus, String> {
     let s = s.trim().to_lowercase().replace(['-', ' '], "_");
     let s = match s.as_str() {
         "queue" | "onqueue" => "on_queue".to_string(),
-        "orchestrator" | "orchestratorreview" => "orchestrator_review".to_string(),
         _ => s,
     };
     s.parse().map_err(|_| {
@@ -148,16 +138,6 @@ fn parse_test(s: &str) -> Result<TestStatus, String> {
         "pass" | "passed" | "green" => Ok(TestStatus::Pass),
         "fail" | "failed" | "red" => Ok(TestStatus::Fail),
         other => Err(format!("unknown test status `{other}`; use pass or fail")),
-    }
-}
-
-/// Decisions as typed: `done`, `more_rounds` (or `one more fix`), `take_over`, `stop`.
-pub(crate) fn parse_decision(s: &str) -> Result<Decision, String> {
-    let s = s.trim().to_lowercase().replace(['-', ' '], "_");
-    match s.as_str() {
-        "one_more_fix" | "more_fix" | "fix" => Ok(Decision::MoreRounds),
-        "accept" => Ok(Decision::Done),
-        _ => s.parse().map_err(|_| format!("unknown decision `{s}`; use done, more_rounds, take_over or stop")),
     }
 }
 
@@ -328,13 +308,6 @@ pub async fn command(args: TaskArgs) -> Result<()> {
                 _ => println!("{} updated", t.key),
             }
         }
-        TaskCommand::Decide { task, choice, question } => {
-            let t: Task = cx
-                .client
-                .post(&cx.path(&task, "/decision"), &DecisionRequest { actor: cx.actor.clone(), choice, question_id: question })
-                .await?;
-            println!("{} {}: in {}, round {}", t.key, choice, t.status.label(), round(&t));
-        }
         TaskCommand::Comment { task, text } => {
             let body = read_text(None, &text, "comment")?;
             let _: TaskEvent = cx
@@ -476,12 +449,6 @@ mod tests {
         }
         assert_eq!(parse_column("Done"), Ok(TaskStatus::Done));
         assert!(parse_column("doing").is_err());
-        assert_eq!(parse_decision("more-rounds"), Ok(Decision::MoreRounds));
-        assert_eq!(parse_decision("One more fix"), Ok(Decision::MoreRounds));
-        assert_eq!(parse_decision("done"), Ok(Decision::Done));
-        assert!(parse_decision("later").is_err());
-        assert_eq!(parse_column("Orchestrator review"), Ok(TaskStatus::OrchestratorReview));
-        assert_eq!(parse_column("orchestrator"), Ok(TaskStatus::OrchestratorReview));
         assert_eq!(parse_test("green"), Ok(TestStatus::Pass));
     }
 
@@ -493,8 +460,6 @@ mod tests {
         assert!(show(&t).contains("round      1/2"));
         t.status = TaskStatus::Backlog;
         t.review_rounds = 1;
-        assert!(show(&t).contains("round      2/2"));
-        t.status = TaskStatus::OrchestratorReview;
         assert!(show(&t).contains("round      2/2"));
     }
 }

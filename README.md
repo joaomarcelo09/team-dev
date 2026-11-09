@@ -48,40 +48,40 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   permission mode and tools can be set per skill and per project (below).
 
 - **Kanban (K-1, board data)**: each workspace (a Coordinator's folder) has a Board of tasks in
-  the hub database, `JGT-1`, `JGT-2`, … per workspace (keys are never reused), in seven columns:
-  Backlog, On Queue, Working, Testing, Review, Orchestrator review, Done. Every move, edit, result
-  and comment goes to the task's activity log with who made it. The hub enforces the gates:
-  workers only read the Board; agents never edit the title, description or priority; the
-  Coordinator creates tasks in Backlog and queues only subtasks of a task you queued; at most
-  `wip_limit` tasks are in progress. The flow is coder (stays in Working until tests are green;
-  no rounds used) → reviewer (full diff) → one fix round if critical/high findings (fresh coder
-  fixes them and re-runs tests) → reviewer (fix diff only) → Orchestrator review. A task whose first
-  review is clean goes Review → Done. Otherwise it gets one automatic fix round (back to Working;
-  rounds are consumed only by review findings) and a second review, then waits in **Orchestrator
-  review**, where only you decide: done, one more fix (one more coder and reviewer, then back to
-  Orchestrator review), take over, or stop. Findings that are not critical or high go to a
-  follow-up task in Backlog and never start a fix round. You
-  may move any task anywhere; a move that skips a gate is logged as "moved by you". Reopening a
-  Done task resets its rounds. `jg-team-dev task` (`list`, `show`, `create`, `edit`, `details`, `move`,
-  `result`, `decide`, `comment`, `delete`, `log`) drives it from a terminal or a session.
+  the hub database, `JGT-1`, `JGT-2`, … per workspace (keys are never reused), in six columns:
+  Backlog, On Queue, Working, Testing, Review, Done. Every move, edit, result and comment goes to
+  the task's activity log with who made it. The hub enforces the gates: workers only read the
+  Board; agents never edit the title, description or priority; the Coordinator creates tasks in
+  Backlog and queues only subtasks of a task you queued; at most `wip_limit` tasks are in progress.
+  The flow is coder (stays in Working until tests are green; no rounds used) → reviewer (full
+  diff) → one fix round if critical/high findings (fresh coder fixes them and re-runs tests) →
+  reviewer (fix diff only) → Done. Review → Done is accepted for an approved review at any round,
+  and for a review with changes only when no fix round is left. The hub then files the leftover
+  findings as ONE follow-up in Backlog (parent = the task) and sets its priority itself = highest
+  severity (critical/high → high; medium or unlabelled → normal; only low → low; no findings →
+  normal). The task never waits for the user (a red test at the last round needs a user move). You
+  may move any task anywhere; a move that skips a gate is logged as "moved by you".
+  Reopening a Done task resets its rounds. `jg-team-dev task` (`list`, `show`, `create`, `edit`,
+  `details`, `move`, `result`, `comment`, `delete`, `log`) drives it from a terminal or a
+  session.
 
 - **Kanban (K-2, Board view)**: a Coordinator's chat header has two tabs, **Chat** (the default)
-  and **Board**. The Board shows the workspace's seven columns with their counts, scrolling
+  and **Board**. The Board shows the workspace's six columns with their counts, scrolling
   sideways in a narrow window; Done shows the 20 newest tasks, with "Show all". "+" in Backlog
   and On Queue adds a task (a title is enough). A card shows its key, title, priority, the worker
   on it (`↳ reviewer`), the review (`round 1/2`) and *Waiting for you* or *Waiting: usage
   limit*; move it with ← → or
   "Move to…". Click a card for its panel: edit the title, description and priority; read the
   Coordinator's Details, the test and review results (critical findings first) and the activity
-  log; open the run folder or a worker's chat; decide a task in Orchestrator review (done, one
-  more fix, take over, stop); delete it. Changes from the team or a terminal show up live.
+  log; open the run folder or a worker's chat; delete it. Changes from the team or a terminal show
+  up live.
 
 - **Kanban (K-3, team on the board)**: moving a task to On Queue is the request. The hub queues
   `[jg-team-dev] Task JGT-n "…" is on the queue` for the folder's current Coordinator, and the
   app or the CLI that moved it wakes a sleeping Coordinator (`team::wake`, shared with worker
   results; the hub never starts agents). With no Coordinator running, the task's log says so and
   the app offers "Start team". The Coordinator works the task with the MCP tools `task_list`,
-  `task_get`, `task_update`, `task_move`, `task_create`, `task_decide` and `task_log`, following
+  `task_get`, `task_update`, `task_move`, `task_create` and `task_log`, following
   the "Board" section of its skill: it moves the card before announcing each step and keeps the
   one-fix-round rule. Workers only read (`task_get`). `jg-team-dev run start --task-id JGT-n` names the
   run after the key and links it to the task; `jg-team-dev worker … --task-id JGT-n` works in

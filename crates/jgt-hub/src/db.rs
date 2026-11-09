@@ -9,7 +9,7 @@ use jgt_core::{
 use rusqlite::{Connection, OptionalExtension, Row, params};
 use std::{path::Path, sync::Mutex};
 
-pub(crate) const SCHEMA_VERSION: i64 = 7;
+pub(crate) const SCHEMA_VERSION: i64 = 8;
 
 pub(crate) const SCHEMA: &str = r#"
 CREATE TABLE sessions (
@@ -135,6 +135,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     // What a worker runs on, and the tokens it used (PRD H7, H8).
     (7, "ALTER TABLE sessions ADD COLUMN model TEXT; ALTER TABLE sessions ADD COLUMN effort TEXT;
          ALTER TABLE sessions ADD COLUMN tokens_in INTEGER; ALTER TABLE sessions ADD COLUMN tokens_out INTEGER;"),
+    (8, "UPDATE tasks SET status = 'review' WHERE status = 'orchestrator_review';"),
 ];
 
 /// Columns selected for a `Session`, including the computed counters.
@@ -1181,16 +1182,6 @@ impl Board<'_> {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         ids.iter().filter_map(|id| self.task(id).transpose()).collect()
-    }
-
-    /// When the task last moved into `status`, from its activity log.
-    pub fn entered(&self, task_id: &str, status: TaskStatus) -> rusqlite::Result<Option<i64>> {
-        self.c.query_row(
-            "SELECT MAX(created_at) FROM task_events WHERE task_id = ?1 AND kind = 'moved'
-                AND json_extract(meta, '$.to') = ?2",
-            params![task_id, status.as_str()],
-            |r| r.get(0),
-        )
     }
 
     /// Whether a K8 decision taking the task away from the team (take over, stop) was made.
