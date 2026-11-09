@@ -177,11 +177,15 @@ impl Board {
         let caller = calling_session(&client).await;
         let workspace = match (workspace, &caller) {
             (Some(dir), _) => dir.canonicalize().unwrap_or(dir),
-            (None, Some(s)) if s.is_coordinator() => s.cwd.clone().map(PathBuf::from).context("the Coordinator has no folder")?,
+            (None, Some(s)) if s.is_coordinator() => {
+                let cwd = s.cwd.as_deref().context("the Coordinator has no folder")?;
+                PathBuf::from(jgt_core::team::project_folder(cwd))
+            }
             (None, Some(s)) => match &s.parent_id {
                 Some(parent) => {
                     let coordinator: Session = client.get(&format!("/v1/sessions/{parent}")).await?;
-                    coordinator.cwd.map(PathBuf::from).context("the Coordinator has no folder")?
+                    let cwd = coordinator.cwd.as_deref().context("the Coordinator has no folder")?;
+                    PathBuf::from(jgt_core::team::project_folder(cwd))
                 }
                 None => std::env::current_dir()?.canonicalize()?,
             },

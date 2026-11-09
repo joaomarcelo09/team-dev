@@ -16,13 +16,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The workspace key the hub stores: the folder without a trailing slash (`/` stays `/`).
+/// The workspace key the hub stores: the folder without a trailing slash (`/` stays `/`),
+/// with worktree paths mapped back to their root project folder.
 pub fn normalize_workspace(workspace: &str) -> String {
-    let trimmed = workspace.trim();
-    match trimmed.trim_end_matches('/') {
-        "" if trimmed.starts_with('/') => "/".into(),
-        rest => rest.into(),
-    }
+    jgt_core::team::project_folder(workspace).to_string()
 }
 
 /// Logged on a task when a queue message or a comment has no Coordinator to go to.
@@ -734,7 +731,7 @@ impl Hub {
         if !session.is_coordinator() {
             return Ok(());
         }
-        let Some(workspace) = session.cwd.as_deref().map(normalize_workspace) else {
+        let Some(workspace) = session.cwd.as_deref().map(jgt_core::team::project_folder) else {
             return Ok(());
         };
         if workspace.is_empty() {
@@ -743,13 +740,13 @@ impl Hub {
         if self.db.has_queued(&session.id)? {
             return Ok(());
         }
-        let tasks = self.tasks(&workspace, false)?;
+        let tasks = self.tasks(workspace, false)?;
         let on_queue: Vec<&Task> = tasks.iter().filter(|t| t.status == TaskStatus::OnQueue).collect();
         if on_queue.is_empty() {
             return Ok(());
         }
         let in_progress = tasks.iter().filter(|t| t.status.in_progress()).count();
-        let wip_limit = self.config().team.wip_limit(Path::new(&workspace));
+        let wip_limit = self.config().team.wip_limit(Path::new(workspace));
         if in_progress >= usize::from(wip_limit) {
             return Ok(());
         }
@@ -1143,6 +1140,7 @@ mod tests {
     fn workspaces_lose_the_trailing_slash() {
         assert_eq!(normalize_workspace("/work/app/"), "/work/app");
         assert_eq!(normalize_workspace("/work/app"), "/work/app");
+        assert_eq!(normalize_workspace("/work/app/.team/worktrees/jgt-5"), "/work/app");
         assert_eq!(normalize_workspace("/"), "/");
         assert_eq!(normalize_workspace("  "), "");
     }

@@ -2736,4 +2736,145 @@ mod board {
         assert_eq!(done_notice.meta_str("level"), Some("success"));
         assert!(done_notice.body.contains("Done: tested, reviewed; commit, merge, push per git policy."));
     }
+
+    #[test]
+    fn coordinator_re_register_in_worktree_keeps_original_cwd() {
+        let hub = hub();
+        let coord = session(&hub, "coord-ext-1", jgt_core::COORDINATOR, "/w", None);
+        assert_eq!(coord.cwd.as_deref(), Some("/w"));
+
+        // Re-register the same external_id with a worktree cwd:
+        let re_coord = session(&hub, "coord-ext-1", jgt_core::COORDINATOR, "/w/.team/worktrees/jgt-5", None);
+        assert_eq!(re_coord.id, coord.id);
+        assert_eq!(re_coord.cwd.as_deref(), Some("/w"), "coordinator cwd must not change when cd'd into worktree");
+
+        let curr = hub.db.current_coordinator("/w").unwrap();
+        assert_eq!(curr.as_ref().map(|s| s.id.as_str()), Some(coord.id.as_str()));
+
+        let actor = hub.actor(&as_session(&re_coord), "/w").unwrap();
+        assert_eq!(actor, Actor::Coordinator { session: coord.id.clone() });
+
+        // A worker's cwd still updates on re-register:
+        let worker = session(&hub, "worker-ext-1", "coder", "/w", Some(&coord.id));
+        assert_eq!(worker.cwd.as_deref(), Some("/w"));
+        let re_worker = session(&hub, "worker-ext-1", "coder", "/w/.team/worktrees/jgt-5", Some(&coord.id));
+        assert_eq!(re_worker.id, worker.id);
+        assert_eq!(re_worker.cwd.as_deref(), Some("/w/.team/worktrees/jgt-5"), "worker cwd updates on re-register");
+    }
+
+    #[test]
+    fn coordinator_with_null_cwd_gets_one_set() {
+        let hub = hub();
+        let coord = hub
+            .register(&RegisterRequest {
+                harness: Harness::ClaudeCode,
+                external_id: "coord-null-ext".into(),
+                cwd: None,
+                title: None,
+                pid: None,
+                transcript_path: None,
+                source: Some("startup".into()),
+                role: Some(jgt_core::COORDINATOR.into()),
+                parent: None,
+            })
+            .unwrap();
+        assert_eq!(coord.cwd, None);
+
+        // Re-register with a worktree cwd sets the healed project folder:
+        let re_coord = hub
+            .register(&RegisterRequest {
+                harness: Harness::ClaudeCode,
+                external_id: "coord-null-ext".into(),
+                cwd: Some("/w/.team/worktrees/jgt-5".into()),
+                title: None,
+                pid: None,
+                transcript_path: None,
+                source: Some("startup".into()),
+                role: Some(jgt_core::COORDINATOR.into()),
+                parent: None,
+            })
+            .unwrap();
+        assert_eq!(re_coord.id, coord.id);
+        assert_eq!(re_coord.cwd.as_deref(), Some("/w"), "NULL-cwd coordinator gets project folder set");
+
+        let curr = hub.db.current_coordinator("/w").unwrap();
+        assert_eq!(curr.as_ref().map(|s| s.id.as_str()), Some(coord.id.as_str()));
+    }
+
+    #[test]
+    fn stuck_worktree_cwd_is_healed_to_project_folder() {
+        let hub = hub();
+        let coord = session_with_id(
+            &hub,
+            "coord-stuck-id",
+            "coord-stuck-ext",
+            jgt_core::COORDINATOR,
+            "/w/.team/worktrees/jgt-5",
+            None,
+        );
+        assert_eq!(coord.cwd.as_deref(), Some("/w/.team/worktrees/jgt-5"));
+
+        // Re-register heals the stuck cwd to the project folder:
+        let re_coord = session(&hub, "coord-stuck-ext", jgt_core::COORDINATOR, "/w/.team/worktrees/jgt-5", None);
+        assert_eq!(re_coord.id, coord.id);
+        assert_eq!(re_coord.cwd.as_deref(), Some("/w"), "stuck worktree cwd must heal to project folder");
+
+        let curr = hub.db.current_coordinator("/w").unwrap();
+        assert_eq!(curr.as_ref().map(|s| s.id.as_str()), Some(coord.id.as_str()));
+    }
+
+    #[test]
+    fn task_lookup_by_key_with_worktree_workspace_returns_project_task() {
+        let hub = hub();
+        let folder = "/w";
+        let task = hub
+            .create_task(&CreateTaskRequest {
+                actor: ActorRequest::User,
+                workspace: folder.into(),
+                title: "project task".into(),
+                description: String::new(),
+                priority: None,
+                status: None,
+                parent_id: None,
+            })
+            .unwrap();
+
+        // Looking up the task by key with a worktree subfolder resolves to the project task:
+        let found = hub.task(&task.key, Some("/w/.team/worktrees/jgt-5")).unwrap();
+        assert_eq!(found.id, task.id);
+        assert_eq!(found.key, task.key);
+
+        // tasks() list also resolves worktree to the project:
+        let tasks = hub.tasks("/w/.team/worktrees/jgt-5", false).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].id, task.id);
+    }
+
+    #[test]
+    fn coordinator_with_worktree_cwd_in_db_matches_workspace() {
+        let hub = hub();
+        // Insert directly via db/session helper a coordinator row whose cwd is already /w/.team/worktrees/jgt-5
+        let coord = session_with_id(
+            &hub,
+            "coord-wt-id",
+            "coord-wt-ext",
+            jgt_core::COORDINATOR,
+            "/w/.team/worktrees/jgt-5",
+            None,
+        );
+
+        let curr = hub.db.current_coordinator("/w").unwrap();
+        assert_eq!(curr.as_ref().map(|s| s.id.as_str()), Some(coord.id.as_str()));
+
+        let live = hub.db.live_coordinator("/w").unwrap();
+        assert_eq!(live.as_ref().map(|s| s.id.as_str()), Some(coord.id.as_str()));
+
+        let actor = hub.actor(&as_session(&coord), "/w").unwrap();
+        assert_eq!(actor, Actor::Coordinator { session: coord.id.clone() });
+
+        // A different project /w2 does not match it:
+        assert!(hub.db.current_coordinator("/w2").unwrap().is_none());
+        assert!(hub.db.live_coordinator("/w2").unwrap().is_none());
+        assert!(hub.actor(&as_session(&coord), "/w2").is_err());
+    }
 }

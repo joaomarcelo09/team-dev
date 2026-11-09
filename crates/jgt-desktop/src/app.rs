@@ -762,7 +762,7 @@ impl App {
             }
             Msg::Select(id) => self.select(id),
             Msg::SelectWorkspace(ws) => {
-                let ws_norm = jgt_core::team::normalize_folder(&ws).to_string();
+                let ws_norm = jgt_core::team::project_folder(&ws).to_string();
                 self.confirm_delete_team = false;
                 self.workspace = Some(ws_norm.clone());
                 self.module = Module::Coordinator;
@@ -1744,7 +1744,7 @@ pub fn workspaces(sessions: &[Session]) -> Vec<Workspace> {
         .filter_map(|s| {
             s.cwd
                 .as_deref()
-                .map(jgt_core::team::normalize_folder)
+                .map(jgt_core::team::project_folder)
                 .filter(|k| !k.is_empty())
                 .map(str::to_string)
         })

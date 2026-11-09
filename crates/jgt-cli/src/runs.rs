@@ -99,7 +99,7 @@ pub fn runs_root(project: &Path) -> PathBuf {
 /// The project folder of a Coordinator: its working folder.
 pub fn project_dir(coordinator: &Session) -> Result<PathBuf> {
     match coordinator.cwd.as_deref() {
-        Some(cwd) => Ok(PathBuf::from(cwd)),
+        Some(cwd) => Ok(PathBuf::from(jgt_core::team::project_folder(cwd))),
         None => Ok(std::env::current_dir()?),
     }
 }
