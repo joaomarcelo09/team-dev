@@ -1,7 +1,7 @@
 //! `~/.config/jg-team-dev/config.toml`, shared by the hub, the CLI and the app.
 
 pub use crate::agents::{agents_path, AgentSetting, AgentSettings, TeamAgents};
-use crate::model::Harness;
+use crate::model::{Harness, TaskStatus};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -545,6 +545,37 @@ pub struct Git {
 }
 
 impl Git {
+    /// The first git column after `from` whose switch is OFF, else Done. `from` is Review or a git column.
+    pub fn stop_after(&self, from: TaskStatus) -> TaskStatus {
+        let candidates = [
+            (TaskStatus::ToCommit, self.auto_commit),
+            (TaskStatus::ToMerge, self.auto_merge),
+            (TaskStatus::ToPush, self.auto_push),
+        ];
+        for (status, switch_on) in candidates {
+            if status.index() > from.index() && !switch_on {
+                return status;
+            }
+        }
+        TaskStatus::Done
+    }
+
+    /// The steps the card passed, meaning the git columns from `from` (inclusive, when it is a git column)
+    /// up to `to` (exclusive).
+    pub fn steps_between(&self, from: TaskStatus, to: TaskStatus) -> Vec<&'static str> {
+        let start = if from.is_git_stage() { from.index() } else { from.index() + 1 };
+        let candidates = [
+            TaskStatus::ToCommit,
+            TaskStatus::ToMerge,
+            TaskStatus::ToPush,
+        ];
+        candidates
+            .into_iter()
+            .filter(|col| col.index() >= start && col.index() < to.index())
+            .filter_map(|col| col.git_step())
+            .collect()
+    }
+
     pub fn policy_text(&self) -> String {
         let commit = if self.auto_commit {
             "auto-commit: ON (commit without asking)"
@@ -566,7 +597,7 @@ impl Git {
         } else {
             "main branch: OFF (ask before any commit, merge or push that touches main, even if the action is ON)"
         };
-        format!("{commit}\n{merge}\n{push}\n{main}\nAlways: reviewer approval and Done before merge; never force-push.")
+        format!("{commit}\n{merge}\n{push}\n{main}\nAlways: reviewer approval (card past Review) before any commit, merge or push; never force-push.")
     }
 }
 
@@ -1042,7 +1073,7 @@ mod tests {
              auto-merge: OFF (ask first)\n\
              auto-push: OFF (ask first)\n\
              main branch: OFF (ask before any commit, merge or push that touches main, even if the action is ON)\n\
-             Always: reviewer approval and Done before merge; never force-push."
+             Always: reviewer approval (card past Review) before any commit, merge or push; never force-push."
         );
 
         let on = Git {
@@ -1057,7 +1088,7 @@ mod tests {
              auto-merge: ON (merge without asking)\n\
              auto-push: ON (push without asking)\n\
              main branch: ON (the ON actions also apply to main)\n\
-             Always: reviewer approval and Done before merge; never force-push."
+             Always: reviewer approval (card past Review) before any commit, merge or push; never force-push."
         );
 
         let commit_only = Git { auto_commit: true, ..Git::default() };
@@ -1075,5 +1106,61 @@ mod tests {
         let main_only = Git { allow_main: true, ..Git::default() };
         assert!(main_only.policy_text().contains("main branch: ON (the ON actions also apply to main)"));
         assert!(main_only.policy_text().contains("auto-commit: OFF (ask first)"));
+    }
+
+    #[test]
+    fn git_stop_after_and_steps_between_all_eight_combinations() {
+        use TaskStatus::*;
+        // (auto_commit, auto_merge, auto_push) -> (target_from_review, steps_from_review)
+        let cases = [
+            // 0: all OFF
+            ((false, false, false), ToCommit, vec![]),
+            // 1: push ON only
+            ((false, false, true), ToCommit, vec![]),
+            // 2: merge ON only
+            ((false, true, false), ToCommit, vec![]),
+            // 3: merge+push ON
+            ((false, true, true), ToCommit, vec![]),
+            // 4: commit ON only
+            ((true, false, false), ToMerge, vec!["commit"]),
+            // 5: commit+push ON
+            ((true, false, true), ToMerge, vec!["commit"]),
+            // 6: commit+merge ON
+            ((true, true, false), ToPush, vec!["commit", "merge"]),
+            // 7: all ON
+            ((true, true, true), Done, vec!["commit", "merge", "push"]),
+        ];
+
+        for ((c, m, p), expected_target, expected_steps) in cases {
+            let git = Git {
+                auto_commit: c,
+                auto_merge: m,
+                auto_push: p,
+                allow_main: false,
+            };
+            let target = git.stop_after(Review);
+            assert_eq!(target, expected_target, "stop_after failed for ({c}, {m}, {p})");
+            let steps = git.steps_between(Review, target);
+            assert_eq!(steps, expected_steps, "steps_between failed for ({c}, {m}, {p})");
+        }
+
+        // Additional transitions starting from git columns
+        let all_off = Git::default();
+        assert_eq!(all_off.stop_after(ToCommit), ToMerge);
+        assert_eq!(all_off.steps_between(ToCommit, ToMerge), vec!["commit"]);
+        assert_eq!(all_off.stop_after(ToMerge), ToPush);
+        assert_eq!(all_off.steps_between(ToMerge, ToPush), vec!["merge"]);
+        assert_eq!(all_off.stop_after(ToPush), Done);
+        assert_eq!(all_off.steps_between(ToPush, Done), vec!["push"]);
+
+        // Moving from ToCommit with merge ON and push OFF -> ToPush
+        let merge_on = Git { auto_merge: true, ..Git::default() };
+        assert_eq!(merge_on.stop_after(ToCommit), ToPush);
+        assert_eq!(merge_on.steps_between(ToCommit, ToPush), vec!["commit", "merge"]);
+
+        // Moving from ToCommit with all ON -> Done
+        let all_on = Git { auto_commit: true, auto_merge: true, auto_push: true, allow_main: true };
+        assert_eq!(all_on.stop_after(ToCommit), Done);
+        assert_eq!(all_on.steps_between(ToCommit, Done), vec!["commit", "merge", "push"]);
     }
 }

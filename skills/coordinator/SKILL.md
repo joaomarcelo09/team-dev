@@ -142,7 +142,7 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
   `--effort <low|medium|high|xhigh|max>`; `jg-team-dev worker` prints what it runs on.
 - **At most 3 workers at a time**, any roles. Check with `jg-team-dev workers` before starting
   more, and order the work yourself: for example coder, then reviewer.
-- **Findings go to a fresh coder**: only the critical and high ones, by the **path** of the
+- **Findings go to a fresh coder**: only the blocking and high ones, by the **path** of the
   result file that holds them. Never resume the old coder.
 - A coder that returns `complexity_discovered` means the plan was wrong: re-plan (maybe with a
   planner) and tell the user.
@@ -152,18 +152,20 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
 
 ## Board
 
-Your folder has a Board: tasks in six columns, Backlog → On Queue → Working → Testing →
-Review → Done. The user owns Backlog and On Queue only; you move tasks through the rest with the
-`task_*` MCP tools. The hub checks every gate: **a refusal (409 or 403) is final.** Report it to
-the user; never work around it.
+Your folder has a Board: tasks in nine columns, Backlog → On Queue → Working → Testing →
+Review → To commit → To merge → To push → Done. The user owns Backlog and On Queue only; you move
+tasks through the rest with the `task_*` MCP tools. The fixed line between Review and Done (To commit →
+To merge → To push → Done) represents the git steps waiting for the user's OK. The hub checks every
+gate: **a refusal (409 or 403) is final.** Report it to the user; never work around it.
 
 - **A queue message is the request**: `[jg-team-dev] Task JGT-n "…" is on the queue`. Take
   queued tasks in board order (`task_list status=on_queue`), one at a time unless the WIP limit
   is higher; tasks in progress count against the 3-worker limit. A chat request does not
   create a card.
-- **Keep the queue moving**: after every Done, finished run, fix round or split, and before ending
-  any turn, run `task_list status=on_queue` and take the next task (WIP permitting). The hub reminder
-  `N task(s) are on the queue` means the same: take the next one.
+- **Keep the queue moving**: after every move past Review (into a git column or Done), finished run,
+  fix round or split, and before ending any turn, run `task_list status=on_queue` and take the next task
+  (WIP permitting; git columns do not count toward WIP). The hub reminder `N task(s) are on the queue`
+  means the same: take the next one.
 - **Always move the card before announcing the step.**
 - **The flow for a task** (one automatic fix round, then Done):
   1. `jg-team-dev run start --task-id JGT-n`, then `task_move JGT-n working`.
@@ -185,12 +187,13 @@ the user; never work around it.
      diff (`git diff`, all coders). Record `review_result` (`worker` = reviewer's hub id):
      `task_update review_result={"decision": "approved"|"changes", "worker": "<reviewer hub id>", "findings": [{"severity": "blocking"|"high"|"medium"|"low", "critical", "category", "location", "problem", "impact", "required_action"}]}`
      (`changes_requested` is `changes`, `requiredAction` is `required_action`).
-     - **Clean** (no critical/high finding): `task_move done`. Findings marked `other`
-       go to the follow-up task the hub files; they never start a fix round.
-     - **Changes requested** (critical or high finding): fix round (step 6). Rounds are consumed
+     - **Clean** (no blocking/high finding): `task_move done` (the hub routes it; see step 8).
+       Findings marked `medium` or `low` go to the follow-up task the hub files; they never start
+       a fix round.
+     - **Changes requested** (blocking or high finding): fix round (step 6). Rounds are consumed
        only by review findings.
-  6. **The fix round** (critical or high finding): `task_move working` and a **fresh coder** that
-     fixes only the critical and high findings (give it the result file's path) and re-runs the tests.
+  6. **The fix round** (blocking or high finding): `task_move working` and a **fresh coder** that
+     fixes only the blocking and high findings (give it the result file's path) and re-runs the tests.
      Starting it with `--task-id` saves what was checked as `refs/jgt/jgt-n/checked-<round>`
      (by hand: `jg-team-dev snapshot --task JGT-n`).
   7. **Second review.** Fix coder's tests green: `task_move testing`, record `test_result` pass.
@@ -198,9 +201,19 @@ the user; never work around it.
      review only `jg-team-dev snapshot --task JGT-n --diff`, and check that each finding in <path
      of the first result> is fixed"). The second review (after a fix round) is the only one that uses
      `snapshot --diff`. Record `review_result` as in step 5, then `task_move done`.
-  8. On Done: `jg-team-dev run finish`, then tell the user the task is ready to merge (and mention
-     the follow-up task, if any). Done never merges: the git-coder runs only after the user's OK,
-     as below.
+  8. **Git routing and completion.** On calling `task_move done`, the hub routes the card to the
+     first column whose auto-switch is OFF (To commit, To merge, To push), or to Done if all are ON.
+     Run the returned `git_steps` immediately with the `git-coder` (ON actions announced in chat,
+     as in *Git and the main worktree*).
+     - A card in a git column waits for the user's OK to proceed with that step (via `chat_ask` or
+       by the user dragging the card forward).
+     - When the user drags the card forward along the line, the hub tells you which steps were
+       approved; run them with the `git-coder`.
+     - When moving a card out of a git column whose switch is OFF yourself: with the user's OK, call `task_move done reason="<quote>"`; run the returned git_steps (they include the step just OK'd).
+     - The team can never move a card back from a git column to Working, Testing or Review.
+     - Git columns do not count toward the WIP limit (the work is finished; only git steps await OK).
+     - On reaching Done: `jg-team-dev run finish`, then tell the user the task is finished (and
+       mention the follow-up task, if any).
 - **Small pieces.** Size each coder's piece to about 5–10 minutes: one concern, a handful of
   files. Split anything bigger into subtasks (`task_create parent=JGT-n`, in Backlog) and run
   them one after another. **Never give one coder two milestones.** Queue a subtask
@@ -216,7 +229,7 @@ the user; never work around it.
   line "Resume: … do not restart."
 - **Comments.** `[jg-team-dev] Comment on JGT-n "…": …` is the user writing on the card; treat
   it like a chat message about that task.
-- The hub announces Done and *Waiting for you* in your chat with a
+- The hub announces moves into git columns, Done, and *Waiting for you* in your chat with a
   notification; do not `chat_notify` them yourself.
 
 ## Git and the main worktree
@@ -229,15 +242,15 @@ OK via `chat_ask`.
 Before any commit, merge or push, run `jg-team-dev git-policy` first:
 
 - An action that is **ON** is done without asking (still only after tests green, reviewer
-  approved, Done; still announce it in chat).
+  approved, card past Review; still announce it in chat).
 - An action that is **OFF** still needs the user's OK via `chat_ask`.
 - Anything touching `main` needs `main branch: ON`, else ask.
 - Never force-push.
 
 Changes reach the user's main worktree only through the `git-coder`, and only when:
 
-1. the coder's tests passed, the reviewer approved the change, and the task reached Done; say
-   so if a gate was skipped, and why,
+1. the coder's tests passed, the reviewer approved the change, and the card is past Review (To commit /
+   To merge / To push / Done); say so if a gate was skipped, and why,
 2. for an OFF action, you warned the user, for example: "⚠ This merges `jgt/fix-navbar` into your
    main worktree (branch `main`). Tests green, reviewed: yes. Go ahead?"; for an ON action, you
    announced in chat what is merged/pushed and where, e.g. "⚠ Auto-merging `jgt/fix-navbar` into

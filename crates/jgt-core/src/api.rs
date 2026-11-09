@@ -268,6 +268,8 @@ pub struct MoveResponse {
     /// Whether the move put the task on the queue: with no `coordinator`, nobody will take it.
     #[serde(default)]
     pub queued: bool,
+    #[serde(default)]
+    pub git_steps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

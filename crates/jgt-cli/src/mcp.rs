@@ -100,7 +100,7 @@ pub struct TextArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskListArgs {
-    /// Only this column: backlog, on_queue, working, testing, review or done.
+    /// Only this column: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.
     #[serde(default)]
     pub status: Option<String>,
     /// Include Done tasks (left out by default).
@@ -149,10 +149,10 @@ pub struct TaskUpdateArgs {
     #[serde(default)]
     pub test_result: Option<serde_json::Value>,
     /// The review result of the reviewer: {"decision": "approved"|"changes", "worker":
-    /// "<reviewer hub id>", "findings": [{"severity": "critical"|"high"|"other", "critical": bool,
+    /// "<reviewer hub id>", "findings": [{"severity": "blocking"|"high"|"medium"|"low", "critical": bool,
     /// "category": "security"|"secret"|"performance"|"patterns"|"docs"|"behavior"|null, "location": "…",
-    /// "problem": "…", "required_action": "…"}]}. Recorded in Review. "changes" needs a critical or high
-    /// finding; an approved review carries only "other" ones.
+    /// "problem": "…", "required_action": "…"}]}. Recorded in Review. Findings severity is blocking|high|medium|low
+    /// (critical also accepted); an approved review carries only medium/low findings; "changes" needs a blocking/high (or critical) finding.
     #[serde(default)]
     pub review_result: Option<serde_json::Value>,
     /// The run folder name (`.team/runs/<run-id>/`).
@@ -170,7 +170,7 @@ pub struct TaskUpdateArgs {
 pub struct TaskMoveArgs {
     /// The task key (JGT-12).
     pub key: String,
-    /// The column: backlog, on_queue, working, testing, review or done.
+    /// The column: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.
     pub to: String,
     /// Why, for the task's activity log.
     #[serde(default)]
@@ -274,7 +274,7 @@ fn render_tasks(tasks: &[Task]) -> String {
 }
 
 /// Short Markdown for a task after a change: key, column, round, waiting.
-fn render_change(t: &Task) -> String {
+pub(crate) fn render_change(t: &Task) -> String {
     let mut out = format!("{} is in {}", t.key, t.status.label());
     if t.shows_round() {
         let (round, limit) = t.round();
@@ -284,6 +284,14 @@ fn render_change(t: &Task) -> String {
         out.push_str(&format!(". Waiting for the user: {}", w.reason));
     }
     out.push('.');
+    out
+}
+
+pub(crate) fn render_move(r: &MoveResponse) -> String {
+    let mut out = render_change(&r.task);
+    if !r.git_steps.is_empty() {
+        out.push_str(&format!(" Run now: {}.", r.git_steps.join(", ")));
+    }
     out
 }
 
@@ -486,7 +494,7 @@ impl JgtMcp {
     }
 
     #[tool(description = "List this folder's Board in column order (Done left out unless include_done). \
-        Filter with status: backlog, on_queue, working, testing, review or done.")]
+        Filter with status: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.")]
     async fn task_list(&self, Parameters(args): Parameters<TaskListArgs>) -> Result<CallToolResult, McpError> {
         let (_, workspace) = match self.board(args.jgt_session.as_deref()).await {
             Ok(b) => b,
@@ -587,7 +595,8 @@ impl JgtMcp {
     }
 
     #[tool(description = "Coordinator only. Move a task to another column: backlog, on_queue, working, \
-        testing, review or done. The hub checks the gates; a refusal is final, so report it. \
+        testing, review, to_commit, to_merge, to_push or done (done from Review is routed by git policy). \
+        The hub checks the gates; a refusal is final, so report it. \
         Review->Done: Done is accepted for an approved review at any round, and for a review with changes \
         only when no fix round is left; the hub files a follow-up in Backlog with a priority it sets itself.")]
     async fn task_move(&self, Parameters(args): Parameters<TaskMoveArgs>) -> Result<CallToolResult, McpError> {
@@ -601,7 +610,7 @@ impl JgtMcp {
         };
         let req = MoveTaskRequest { actor, to, position: None, reason: args.reason };
         match self.client.post::<_, MoveResponse>(&task_path(&workspace, &args.key, "/move"), &req).await {
-            Ok(r) => ok(render_change(&r.task)),
+            Ok(r) => ok(render_move(&r)),
             Err(e) => tool_error(describe(&e)),
         }
     }
@@ -710,5 +719,73 @@ mod tests {
         assert_eq!(render_tasks(&[a.clone(), b]), "- JGT-1 [Review] fix navbar (high) · round 2/2\n- JGT-2 [Backlog] later");
         assert_eq!(render_change(&a), "JGT-1 is in Review, round 2/2.");
         assert_eq!(task_path("/w", " JGT-1 ", "/move"), "/v1/tasks/JGT-1/move?workspace=%2Fw");
+    }
+
+    #[test]
+    fn render_move_shows_git_steps() {
+        let a = Task::new("/w", 1, "fix navbar", TaskStatus::ToMerge);
+        let mut r = MoveResponse {
+            task: a,
+            coordinator: None,
+            queued: false,
+            git_steps: Vec::new(),
+        };
+        assert_eq!(render_move(&r), "JGT-1 is in To merge.");
+
+        r.git_steps = vec!["commit".into()];
+        assert_eq!(render_move(&r), "JGT-1 is in To merge. Run now: commit.");
+
+        r.task.status = TaskStatus::ToPush;
+        r.git_steps = vec!["commit".into(), "merge".into()];
+        assert_eq!(render_move(&r), "JGT-1 is in To push. Run now: commit, merge.");
+    }
+
+    #[test]
+    fn task_list_includes_git_columns_by_default_and_filters() {
+        let tasks = vec![
+            Task::new("/w", 1, "backlog task", TaskStatus::Backlog),
+            Task::new("/w", 2, "review task", TaskStatus::Review),
+            Task::new("/w", 3, "commit task", TaskStatus::ToCommit),
+            Task::new("/w", 4, "merge task", TaskStatus::ToMerge),
+            Task::new("/w", 5, "push task", TaskStatus::ToPush),
+            Task::new("/w", 6, "done task", TaskStatus::Done),
+        ];
+
+        // Without filter (status = None, include_done = false), only Done is left out
+        let default_view: Vec<&Task> = tasks.iter().filter(|t| t.status != TaskStatus::Done).collect();
+        assert_eq!(default_view.len(), 5);
+        assert!(default_view.iter().any(|t| t.status == TaskStatus::ToCommit));
+        assert!(default_view.iter().any(|t| t.status == TaskStatus::ToMerge));
+        assert!(default_view.iter().any(|t| t.status == TaskStatus::ToPush));
+        assert!(!default_view.iter().any(|t| t.status == TaskStatus::Done));
+
+        // Filter by to_commit
+        let filter_commit = parse_column("to_commit").unwrap();
+        let commit_view: Vec<&Task> = tasks.iter().filter(|t| t.status == filter_commit).collect();
+        assert_eq!(commit_view.len(), 1);
+        assert_eq!(commit_view[0].key, "JGT-3");
+
+        // Filter using alias "commit"
+        let alias_commit = parse_column("commit").unwrap();
+        let alias_view: Vec<&Task> = tasks.iter().filter(|t| t.status == alias_commit).collect();
+        assert_eq!(alias_view.len(), 1);
+        assert_eq!(alias_view[0].key, "JGT-3");
+    }
+
+    #[test]
+    fn tool_descriptions_mention_git_columns_and_routing() {
+        let tools = JgtMcp::tool_router().list_all();
+        let move_tool = tools.iter().find(|t| t.name == "task_move").expect("task_move tool");
+        let desc = move_tool.description.as_deref().unwrap_or("");
+        assert!(desc.contains("done from Review is routed by git policy"), "{desc}");
+        for col in ["backlog", "on_queue", "working", "testing", "review", "to_commit", "to_merge", "to_push", "done"] {
+            assert!(desc.contains(col), "task_move description missing {col}: {desc}");
+        }
+
+        let list_tool = tools.iter().find(|t| t.name == "task_list").expect("task_list tool");
+        let desc = list_tool.description.as_deref().unwrap_or("");
+        for col in ["backlog", "on_queue", "working", "testing", "review", "to_commit", "to_merge", "to_push", "done"] {
+            assert!(desc.contains(col), "task_list description missing {col}: {desc}");
+        }
     }
 }

@@ -335,6 +335,9 @@ string_enum! {
         Working => "working",
         Testing => "testing",
         Review => "review",
+        ToCommit => "to_commit",
+        ToMerge => "to_merge",
+        ToPush => "to_push",
         Done => "done",
     }
 }
@@ -348,6 +351,9 @@ impl TaskStatus {
             TaskStatus::Working => "Working",
             TaskStatus::Testing => "Testing",
             TaskStatus::Review => "Review",
+            TaskStatus::ToCommit => "To commit",
+            TaskStatus::ToMerge => "To merge",
+            TaskStatus::ToPush => "To push",
             TaskStatus::Done => "Done",
         }
     }
@@ -370,6 +376,26 @@ impl TaskStatus {
     /// The team is working on a task in this column (counts toward the WIP limit).
     pub fn in_progress(self) -> bool {
         matches!(self, TaskStatus::Working | TaskStatus::Testing | TaskStatus::Review)
+    }
+
+    /// True for the three git columns: To commit, To merge, To push.
+    pub fn is_git_stage(self) -> bool {
+        matches!(self, TaskStatus::ToCommit | TaskStatus::ToMerge | TaskStatus::ToPush)
+    }
+
+    /// The git step the column waits for: "commit", "merge" or "push".
+    pub fn git_step(self) -> Option<&'static str> {
+        match self {
+            TaskStatus::ToCommit => Some("commit"),
+            TaskStatus::ToMerge => Some("merge"),
+            TaskStatus::ToPush => Some("push"),
+            _ => None,
+        }
+    }
+
+    /// A git column or Done.
+    pub fn is_past_review(self) -> bool {
+        self.is_git_stage() || self == TaskStatus::Done
     }
 }
 
@@ -741,10 +767,28 @@ mod tests {
         assert_eq!(TaskStatus::Done.next(), None);
         assert_eq!(TaskStatus::Review.prev(), Some(TaskStatus::Testing));
         assert!(TaskStatus::Testing.in_progress() && !TaskStatus::OnQueue.in_progress());
-        assert_eq!(TaskStatus::Review.next(), Some(TaskStatus::Done));
-        assert_eq!(TaskStatus::Done.prev(), Some(TaskStatus::Review));
+        assert_eq!(TaskStatus::Review.next(), Some(TaskStatus::ToCommit));
+        assert_eq!(TaskStatus::ToCommit.next(), Some(TaskStatus::ToMerge));
+        assert_eq!(TaskStatus::ToMerge.next(), Some(TaskStatus::ToPush));
+        assert_eq!(TaskStatus::ToPush.next(), Some(TaskStatus::Done));
+        assert_eq!(TaskStatus::Done.prev(), Some(TaskStatus::ToPush));
         assert!(!TaskStatus::Done.in_progress());
-        assert_eq!(TaskStatus::ALL.len(), 6);
+        assert!(!TaskStatus::ToCommit.in_progress());
+        assert!(TaskStatus::ToCommit.is_git_stage());
+        assert!(TaskStatus::ToMerge.is_git_stage());
+        assert!(TaskStatus::ToPush.is_git_stage());
+        assert!(!TaskStatus::Review.is_git_stage());
+        assert!(!TaskStatus::Done.is_git_stage());
+        assert_eq!(TaskStatus::ToCommit.git_step(), Some("commit"));
+        assert_eq!(TaskStatus::ToMerge.git_step(), Some("merge"));
+        assert_eq!(TaskStatus::ToPush.git_step(), Some("push"));
+        assert_eq!(TaskStatus::Review.git_step(), None);
+        assert!(TaskStatus::ToCommit.is_past_review());
+        assert!(TaskStatus::ToMerge.is_past_review());
+        assert!(TaskStatus::ToPush.is_past_review());
+        assert!(TaskStatus::Done.is_past_review());
+        assert!(!TaskStatus::Review.is_past_review());
+        assert_eq!(TaskStatus::ALL.len(), 9);
     }
 
     #[test]

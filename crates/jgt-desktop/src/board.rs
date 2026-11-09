@@ -1,4 +1,4 @@
-//! The Board tab of a Coordinator's chat: six columns of task cards and the task side panel.
+//! The Board tab of a Coordinator's chat: nine columns of task cards and the task side panel.
 //! The pure helpers (column order, Done limit, labels) sit at the top and are unit-tested.
 
 use crate::{
@@ -325,16 +325,25 @@ pub fn describe(e: &TaskEvent) -> String {
 }
 
 /// A column choice for the "Move to…" list.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Column(TaskStatus);
 
 /// The "Move to…" choices of a card in each column: every other column.
-static MOVE_TO: [[Column; 5]; 6] = [others(0), others(1), others(2), others(3), others(4), others(5)];
+static MOVE_TO: [[Column; 8]; 9] = [
+    others(0),
+    others(1),
+    others(2),
+    others(3),
+    others(4),
+    others(5),
+    others(6),
+    others(7),
+    others(8),
+];
 
-const fn others(skip: usize) -> [Column; 5] {
-    use TaskStatus::*;
-    let all = [Backlog, OnQueue, Working, Testing, Review, Done];
-    let mut out = [Column(Backlog); 5];
+const fn others(skip: usize) -> [Column; 8] {
+    let all = TaskStatus::ALL;
+    let mut out = [Column(TaskStatus::Backlog); 8];
     let (mut i, mut j) = (0, 0);
     while i < all.len() {
         if i != skip {
@@ -951,18 +960,60 @@ mod tests {
             task(4, TaskStatus::Backlog, 1),
         ];
         let board = Board::new(tasks);
+        assert_eq!(order(&board).len(), 9);
         assert_eq!(keys(board.column(TaskStatus::Backlog)), ["JGT-3", "JGT-4", "JGT-1"]);
         assert_eq!(keys(board.column(TaskStatus::OnQueue)), ["JGT-2"]);
         assert!(board.column(TaskStatus::Working).is_empty());
+        assert!(board.column(TaskStatus::Testing).is_empty());
+        assert!(board.column(TaskStatus::Review).is_empty());
+        assert!(board.column(TaskStatus::ToCommit).is_empty());
+        assert!(board.column(TaskStatus::ToMerge).is_empty());
+        assert!(board.column(TaskStatus::ToPush).is_empty());
+        assert!(board.column(TaskStatus::Done).is_empty());
         assert_eq!(board.tasks().iter().map(|t| t.number).collect::<Vec<_>>(), [3, 4, 1, 2]);
     }
 
     #[test]
     fn move_to_lists_the_other_columns() {
+        assert_eq!(MOVE_TO.len(), 9);
         for status in TaskStatus::ALL.iter().copied() {
+            assert_eq!(MOVE_TO[status.index()].len(), 8);
             let expected: Vec<Column> = TaskStatus::ALL.iter().copied().filter(|s| *s != status).map(Column).collect();
             assert_eq!(MOVE_TO[status.index()].to_vec(), expected);
         }
+    }
+
+    #[test]
+    fn to_merge_card_can_be_moved_to_done_and_to_on_queue() {
+        use TaskStatus::*;
+        let mut board = Board::new(vec![task(1, ToMerge, 0)]);
+        assert_eq!(keys(board.column(ToMerge)), ["JGT-1"]);
+
+        // Moving to Done via drop (goes to end as date-ordered)
+        assert_eq!(drop_move(&board, "t1", Target::Before(Done, 0)), Some((Done, None)));
+        assert_eq!(drop_move(&board, "t1", Target::End(Done)), Some((Done, None)));
+
+        // Moving to On Queue via drop
+        assert_eq!(drop_move(&board, "t1", Target::Before(OnQueue, 0)), Some((OnQueue, Some(0))));
+        assert_eq!(drop_move(&board, "t1", Target::End(OnQueue)), Some((OnQueue, None)));
+
+        // "Move to…" pick_list choices for ToMerge include both Done and OnQueue
+        let choices = MOVE_TO[ToMerge.index()];
+        assert!(choices.contains(&Column(Done)));
+        assert!(choices.contains(&Column(OnQueue)));
+
+        // Upserting the moved task places it in the new column
+        let mut to_done = task(1, Done, 0);
+        to_done.updated_at = 10;
+        assert!(board.upsert(to_done));
+        assert!(board.column(ToMerge).is_empty());
+        assert_eq!(keys(board.column(Done)), ["JGT-1"]);
+
+        let mut to_queue = task(1, OnQueue, 0);
+        to_queue.updated_at = 20;
+        assert!(board.upsert(to_queue));
+        assert!(board.column(Done).is_empty());
+        assert_eq!(keys(board.column(OnQueue)), ["JGT-1"]);
     }
 
     #[test]
@@ -1013,7 +1064,7 @@ mod tests {
         older.updated_at = 10;
         let _ = app.update(Msg::TaskChanged(Ok(older.clone())));
         assert_eq!(title(&app), "newer");
-        let moved = jgt_core::api::MoveResponse { task: older.clone(), coordinator: None, queued: false };
+        let moved = jgt_core::api::MoveResponse { task: older.clone(), coordinator: None, queued: false, git_steps: Vec::new() };
         let _ = app.update(Msg::TaskMoved(Ok(Box::new(moved))));
         assert_eq!(title(&app), "newer");
         let _ = app.update(Msg::BoardLoaded { workspace: "/w".into(), result: Ok(vec![older, task(2, TaskStatus::Backlog, 0)]) });
@@ -1098,7 +1149,14 @@ mod tests {
     #[test]
     fn drops_land_where_the_line_shows() {
         use TaskStatus::*;
-        let board = Board::new(vec![task(1, Backlog, 0), task(2, Backlog, 1), task(3, Backlog, 2), task(4, OnQueue, 0), task(5, Done, 0)]);
+        let board = Board::new(vec![
+            task(1, Backlog, 0),
+            task(2, Backlog, 1),
+            task(3, Backlog, 2),
+            task(4, OnQueue, 0),
+            task(5, Done, 0),
+            task(6, ToMerge, 0),
+        ]);
         // Inside a column: the index among the other cards.
         assert_eq!(drop_move(&board, "t1", Target::Before(Backlog, 3)), Some((Backlog, Some(2))));
         assert_eq!(drop_move(&board, "t1", Target::End(Backlog)), Some((Backlog, Some(2))));
@@ -1114,6 +1172,9 @@ mod tests {
         // Done is ordered by date.
         assert_eq!(drop_move(&board, "t4", Target::Before(Done, 0)), Some((Done, None)));
         assert_eq!(drop_move(&board, "t5", Target::End(Done)), None);
+        // Git columns: To merge can drop into Done or OnQueue.
+        assert_eq!(drop_move(&board, "t6", Target::Before(Done, 0)), Some((Done, None)));
+        assert_eq!(drop_move(&board, "t6", Target::Before(OnQueue, 0)), Some((OnQueue, Some(0))));
     }
 
     #[test]
@@ -1157,7 +1218,7 @@ mod tests {
         let moved = |coordinator, queued| {
             let mut t = task(1, TaskStatus::OnQueue, 0);
             t.updated_at = 5;
-            Msg::TaskMoved(Ok(Box::new(jgt_core::api::MoveResponse { task: t, coordinator, queued })))
+            Msg::TaskMoved(Ok(Box::new(jgt_core::api::MoveResponse { task: t, coordinator, queued, git_steps: Vec::new() })))
         };
         let _ = app.update(moved(None, false));
         assert_eq!(app.offer_team, None, "a reorder says nothing");
@@ -1219,6 +1280,16 @@ mod tests {
                 assert_eq!(id, "t3");
                 assert_eq!(to, OnQueue);
                 assert_eq!(position, Some(0));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+
+        // Git columns reorder like the others
+        match reorder_msg("t6", ToMerge, 0, 3) {
+            Some(Msg::MoveTask { id, to, position }) => {
+                assert_eq!(id, "t6");
+                assert_eq!(to, ToMerge);
+                assert_eq!(position, None);
             }
             other => panic!("unexpected message: {other:?}"),
         }
