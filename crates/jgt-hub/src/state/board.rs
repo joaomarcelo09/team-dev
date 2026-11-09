@@ -1,14 +1,14 @@
 //! The Board: tasks, their activity log, and the gates the team cannot skip (K6, K8, K10, K12,
-//! K17, and the team-efficiency flow D3/D4: one automatic fix round, then Orchestrator review). Every rule lives here, in the hub, so the app, the CLI, the MCP tools and a raw HTTP
+//! K17, and the team-efficiency flow D3/D4: one automatic fix round). Every rule lives here, in the hub, so the app, the CLI, the MCP tools and a raw HTTP
 //! client all get the same answers. The user may move any task anywhere (K7); a move that skips a
 //! gate is allowed and logged with the gate it skipped.
 
 use super::{Hub, HubError, HubResult};
 use crate::db::{Board, NewTask};
 use jgt_core::{
-    Actor, Decision, Finding, MORE_ROUNDS, QuestionStatus, ROUND_LIMIT, ReviewDecision, ReviewResult, Session,
+    Actor, Finding, ROUND_LIMIT, ReviewDecision, ReviewResult, Session,
     Severity, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus, TestResult, TestStatus, WaitingKind, api::*,
-    now_ms, parse_task_key,
+    follow_up_priority, now_ms, parse_task_key,
 };
 use serde_json::json;
 use std::{
@@ -43,14 +43,11 @@ fn usage_limit(meta: &serde_json::Value) -> Option<(String, Option<i64>, Option<
     Some((resets, until, resume))
 }
 
-/// Moves that are the user's to make (Backlog and On Queue are theirs, reopening a Done task,
-/// and the decision on a task in Orchestrator review): never logged as skipping a gate.
+/// Moves that are the user's to make (Backlog and On Queue are theirs, and reopening a Done task):
+/// never logged as skipping a gate.
 fn users_own_move(from: TaskStatus, to: TaskStatus) -> bool {
     use TaskStatus::*;
-    matches!(
-        (from, to),
-        (Backlog, OnQueue) | (OnQueue, Backlog) | (Done, OnQueue) | (OrchestratorReview, Done | Working | Backlog)
-    )
+    matches!((from, to), (Backlog, OnQueue) | (OnQueue, Backlog) | (Done, OnQueue))
 }
 
 /// Roles whose results the hub records: coder records tests, reviewer records reviews.
@@ -117,8 +114,15 @@ fn validate_findings(input: &[FindingInput]) -> HubResult<Vec<Finding>> {
             let critical = f.critical.or(label.map(|l| l == Severity::Critical)).ok_or_else(|| {
                 HubError::BadRequest(format!("finding {n}: mark it critical or non-critical (K17)"))
             })?;
-            let severity = if critical { Severity::Critical } else { label.unwrap_or(Severity::Other) };
-            let severity = if severity == Severity::Critical && !critical { Severity::High } else { severity };
+            let severity = if critical {
+                "critical".to_string()
+            } else {
+                match f.severity.as_deref().map(|s| s.trim().to_ascii_lowercase()) {
+                    Some(s) if s == "critical" => "high".to_string(),
+                    Some(s) if !s.is_empty() => s,
+                    _ => "other".to_string(),
+                }
+            };
             if critical && f.category.is_none() {
                 return Err(HubError::BadRequest(format!(
                     "finding {n} is critical: give its category ({})",
@@ -131,7 +135,7 @@ fn validate_findings(input: &[FindingInput]) -> HubResult<Vec<Finding>> {
             Ok(Finding {
                 critical,
                 category: f.category,
-                severity: Some(severity.as_str().to_string()),
+                severity: Some(severity),
                 location: f.location.clone(),
                 problem: f.problem.clone(),
                 required_action: f.required_action.clone(),
@@ -400,22 +404,14 @@ impl Hub {
         Ok(())
     }
 
-    /// The team's transition table (plan §1.4, changed by PRD D3/D4). `Err` names the gate that
-    /// refuses the move.
+    /// The team's transition table (plan §1.4). `Err` names the gate that refuses the move.
     ///
     /// The flow: coder → first verification → Done when clean; otherwise one automatic fix round
-    /// (Review or Testing → Working) → second verification → Orchestrator review, where only the
-    /// user decides.
+    /// (Review or Testing → Working) → second verification → Done.
     fn check_team_move(&self, b: &Board, task: &Task, to: TaskStatus, wip_limit: u8) -> HubResult<Result<(), String>> {
         use TaskStatus::*;
         let from = task.status;
         let refused = |why: String| Ok(Err(why));
-        if from == OrchestratorReview && to != from {
-            return refused(format!(
-                "{} is in Orchestrator review: only the user decides (done, one more fix, take over or stop)",
-                task.key
-            ));
-        }
         match (from, to) {
             (Backlog, OnQueue) => {
                 if b.taken_from_team(&task.id)? {
@@ -455,18 +451,10 @@ impl Hub {
                 }
                 if !task.fix_round_left() {
                     return refused(format!(
-                        "verification {} of {} is done: no further automatic fix; move it to Orchestrator review (D3)",
+                        "verification {} of {} is done: no further automatic fix; report it to the user, who moves the card",
                         task.round().0,
                         task.round_limit
                     ));
-                }
-            }
-            (Testing, OrchestratorReview) => {
-                if task.test_result.as_ref().map(|t| t.status) != Some(TestStatus::Fail) || task.fix_round_left() {
-                    return refused(
-                        "Orchestrator review from Testing needs a red test of the last verification before the user decides"
-                            .into(),
-                    );
                 }
             }
             (Testing, Review) => {
@@ -480,19 +468,9 @@ impl Hub {
                 };
                 if !task.fix_round_left() {
                     return refused(format!(
-                        "verification {} of {} is done: no further automatic fix; move it to Orchestrator review (D3)",
+                        "verification {} of {} is done: no further automatic fix; report it to the user, who moves the card",
                         review.round, task.round_limit
                     ));
-                }
-            }
-            (Review, OrchestratorReview) => {
-                if task.review_result.is_none() {
-                    return refused("Orchestrator review needs the review of this pass".into());
-                }
-                if task.review_rounds == 0 {
-                    return refused(
-                        "the first verification goes to Done when clean, or back to Working for the fix round (D3)".into(),
-                    );
                 }
             }
             (Review, Done) => {
@@ -502,13 +480,8 @@ impl Hub {
                 let Some(review) = &task.review_result else {
                     return refused("Done needs a review of this pass (K6)".into());
                 };
-                if review.decision != ReviewDecision::Approved {
-                    return refused("Done needs an approved review (K6)".into());
-                }
-                if task.review_rounds > 0 {
-                    return refused(
-                        "a task that needed a fix round goes to Orchestrator review for the user's decision (D3)".into(),
-                    );
+                if review.decision == ReviewDecision::Changes && task.fix_round_left() {
+                    return refused("the fix round is still left: move it to Working".into());
                 }
             }
             (a, b) if a == b => return refused(format!("{} is already in {}", task.key, a.label())),
@@ -524,6 +497,7 @@ impl Hub {
         let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
         let mut changes = Changes::default();
         let mut queued = false;
+        let mut follow_up_task = None;
         self.db.board(|b| {
             // Re-read inside the transaction, so the gates see what is committed now.
             let mut task = b.task(&task.id)?.ok_or(HubError::NotFound("task"))?;
@@ -563,7 +537,7 @@ impl Hub {
             }
             changes.log(b, &task.id, TaskEventKind::Moved, &actor, &body, meta)?;
             if to == TaskStatus::Done {
-                self.follow_up(b, &task, &mut changes)?;
+                follow_up_task = self.follow_up(b, &task, &mut changes)?;
             }
             Ok(())
         })?;
@@ -571,14 +545,15 @@ impl Hub {
         let before = task.status;
         let task = self.task(&task.id, None)?;
         if task.status == TaskStatus::Done && before != TaskStatus::Done && actor != Actor::User {
+            let extra = match &follow_up_task {
+                Some(f) => format!(" A {}-priority follow-up {} is in Backlog.", f.priority, f.key),
+                None => String::new(),
+            };
             let body = format!(
-                "{} \"{}\" is Done: tested and reviewed. It is ready to merge once you agree.",
+                "{} \"{}\" is Done: tested and reviewed. It is ready to merge once you agree.{extra}",
                 task.key, task.title
             );
             self.notify_task(&task, "success", &format!("{} is Done", task.key), &body)?;
-        }
-        if task.status == TaskStatus::OrchestratorReview && before != task.status && actor != Actor::User {
-            self.notify_orchestrator_review(&task)?;
         }
         // Queueing a task is the request (K4): the Coordinator hears of it, and the caller wakes it.
         let coordinator = if queued {
@@ -607,32 +582,6 @@ impl Hub {
             self.agent_message(&coordinator.id, &req)?;
         }
         Ok(())
-    }
-
-    /// A task reached Orchestrator review: the user decides (done, one more fix, take over, stop).
-    fn notify_orchestrator_review(&self, task: &Task) -> HubResult<()> {
-        let result = match &task.review_result {
-            Some(r) => {
-                let count = |l: Severity| r.findings.iter().filter(|f| f.level() == l).count();
-                format!(
-                    "verification {}: {}, {} critical, {} high, {} other",
-                    r.round,
-                    r.decision,
-                    count(Severity::Critical),
-                    count(Severity::High),
-                    count(Severity::Other)
-                )
-            }
-            None => match &task.test_result {
-                Some(t) => format!("verification {}: test {}", task.round().0, t.status),
-                None => "no verification recorded".into(),
-            },
-        };
-        let body = format!(
-            "{} \"{}\" waits for your review ({result}). Decide on its card: Done, One more fix, Take over or Stop.",
-            task.key, task.title
-        );
-        self.notify_task(task, "warning", &format!("{} waits for your review", task.key), &body)
     }
 
     fn notify_waiting(&self, task: &Task) -> HubResult<()> {
@@ -749,13 +698,9 @@ impl Hub {
             task.waiting = None;
             task.done_at = None;
         }
-        if matches!(from, Review | Testing | OrchestratorReview) && to == Working {
-            // A fix round. Out of Orchestrator review it is the user's "one more fix" (by a
-            // decision or a drag): it grants the verification that follows.
+        if matches!(from, Review | Testing) && to == Working {
+            // A fix round.
             task.review_rounds += 1;
-            if from == OrchestratorReview {
-                task.round_limit = task.round_limit.max(task.review_rounds) + MORE_ROUNDS;
-            }
             if from == Review {
                 task.test_result = None;
             }
@@ -770,8 +715,8 @@ impl Hub {
                 task.review_result = task.review_result.take().filter(|r| r.decision == ReviewDecision::Changes);
             }
             Testing => task.test_result = None,
-            // Only a test of the pass that just left Testing counts for this review: a green test
-            // kept through a Stop or a take-over must not reach Done by a user move to Review.
+            // Only a test of the pass that just left Testing counts for this review: an earlier
+            // green test must not reach Done by a user move straight to Review.
             Review => {
                 task.review_result = None;
                 if from != Testing {
@@ -790,14 +735,13 @@ impl Hub {
     }
 
     /// On Done with review findings left (an approved review with findings that are neither
-    /// critical nor high, the user's Done from Orchestrator review, or a user move): a follow-up
-    /// task in Backlog that carries them (K8, E4).
-    fn follow_up(&self, b: &Board, task: &Task, changes: &mut Changes) -> HubResult<()> {
+    /// critical nor high, or a user move): a follow-up task in Backlog that carries them (K8, E4).
+    fn follow_up(&self, b: &Board, task: &Task, changes: &mut Changes) -> HubResult<Option<Task>> {
         let Some(review) = &task.review_result else {
-            return Ok(());
+            return Ok(None);
         };
         if review.findings.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let description = format!(
             "Findings left by review round {} of {} \"{}\":\n\n{}\n",
@@ -806,11 +750,12 @@ impl Hub {
             task.title,
             render_findings(&review.findings)
         );
+        let priority = follow_up_priority(&review.findings);
         let follow = b.insert_task(&NewTask {
             workspace: &task.workspace,
             title: &format!("Follow-up: {}", task.title),
             description: &description,
-            priority: TaskPriority::Normal,
+            priority,
             status: TaskStatus::Backlog,
             parent_id: Some(&task.id),
         })?;
@@ -818,9 +763,9 @@ impl Hub {
         changes.log(b, &follow.id, TaskEventKind::Created, &Actor::Hub, "", meta)?;
         let body = format!("follow-up of {}", task.key);
         changes.log(b, &follow.id, TaskEventKind::FollowUp, &Actor::Hub, &body, json!({ "task": task.id }))?;
-        let body = format!("{} findings moved to {}", review.findings.len(), follow.key);
+        let body = format!("{} findings moved to {} (priority {})", review.findings.len(), follow.key, priority);
         changes.log(b, &task.id, TaskEventKind::FollowUp, &Actor::Hub, &body, json!({ "follow_up": follow.id }))?;
-        Ok(())
+        Ok(Some(follow))
     }
 
     /// Checks that `worker` is a session with one of `roles`, started by the acting Coordinator.
@@ -953,77 +898,6 @@ impl Hub {
             }
             _ => return Err(HubError::BadRequest("send either a test or a review result".into())),
         }
-        self.publish(changes);
-        self.task(&task.id, None)
-    }
-
-    /// The user's decision on a task in Orchestrator review (PRD D3/D4): done, one more fix, take
-    /// over or stop. The Coordinator must cite the `chat_ask` question the user answered, asked
-    /// after the task got there.
-    pub fn decide(&self, id: &str, workspace: Option<&str>, req: &DecisionRequest) -> HubResult<Task> {
-        let task = self.task(id, workspace)?;
-        let actor = self.writer(&req.actor, &task.workspace)?;
-        let not_waiting =
-            |task: &Task| HubError::Conflict(format!("{} is not in Orchestrator review: there is nothing to decide", task.key));
-        if task.status != TaskStatus::OrchestratorReview {
-            return Err(not_waiting(&task));
-        }
-        // The cited question, read before the transaction (`Db::board` holds the connection);
-        // it is checked against the task as the transaction sees it.
-        let question = match &actor {
-            Actor::Coordinator { session } => {
-                let question_id = req.question_id.as_deref().ok_or_else(|| {
-                    HubError::Forbidden("this is the user's decision: cite the chat_ask question they answered".into())
-                })?;
-                let question = self
-                    .db
-                    .question(question_id)?
-                    .ok_or_else(|| HubError::Forbidden(format!("question {question_id} does not exist")))?;
-                Some((session, question))
-            }
-            _ => None,
-        };
-        let mut changes = Changes::default();
-        self.db.board(|b| {
-            let mut task = b.task(&task.id)?.ok_or(HubError::NotFound("task"))?;
-            // Re-checked here: a second decision sent meanwhile finds the task gone from the column.
-            if task.status != TaskStatus::OrchestratorReview {
-                return Err(not_waiting(&task));
-            }
-            if let Some((session, question)) = &question {
-                let since = b.entered(&task.id, TaskStatus::OrchestratorReview)?.unwrap_or(task.updated_at);
-                if question.session_id != **session
-                    || question.status != QuestionStatus::Answered
-                    || question.created_at < since
-                {
-                    return Err(HubError::Forbidden(format!(
-                        "question {} is not an answered question you asked after {} reached Orchestrator review",
-                        question.id, task.key
-                    )));
-                }
-            }
-            let from = task.status;
-            let (to, body) = match req.choice {
-                Decision::Done => (TaskStatus::Done, "accepted: Done".to_string()),
-                Decision::MoreRounds => (TaskStatus::Working, "one more fix and verification".to_string()),
-                Decision::TakeOver => (TaskStatus::Backlog, "the user took over; the team leaves this task".to_string()),
-                Decision::Stop => (TaskStatus::Backlog, "stopped; back to Backlog with the findings".to_string()),
-            };
-            self.apply_move(b, &mut task, to, &actor, &mut changes)?;
-            let mut meta = json!({ "choice": req.choice, "question_id": req.question_id });
-            if req.choice == Decision::MoreRounds {
-                meta["round_limit"] = json!(task.round_limit);
-            }
-            b.save(&task)?;
-            changes.log(b, &task.id, TaskEventKind::Decision, &actor, &body, meta)?;
-            b.place(&task.id, &task.workspace, to, None)?;
-            let meta = json!({ "from": from, "to": to, "reason": req.choice });
-            changes.log(b, &task.id, TaskEventKind::Moved, &actor, &body, meta)?;
-            if to == TaskStatus::Done {
-                self.follow_up(b, &task, &mut changes)?;
-            }
-            Ok::<_, HubError>(())
-        })?;
         self.publish(changes);
         self.task(&task.id, None)
     }

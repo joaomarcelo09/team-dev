@@ -565,7 +565,7 @@ fn schema_4_databases_are_upgraded_without_data_loss() {
 }
 
 #[test]
-fn round_limit_tasks_move_to_orchestrator_review_on_upgrade() {
+fn round_limit_tasks_move_to_review_on_upgrade() {
     let dir = std::env::temp_dir().join(format!("jgt-upgrade6-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -586,9 +586,36 @@ fn round_limit_tasks_move_to_orchestrator_review_on_upgrade() {
     }
     let hub = Hub::new(Db::open(&path).unwrap(), Config::default());
     let stuck = hub.task("t1", None).unwrap();
-    assert_eq!((stuck.status, stuck.waiting), (jgt_core::TaskStatus::OrchestratorReview, None));
+    assert_eq!((stuck.status, stuck.waiting), (jgt_core::TaskStatus::Review, None));
     let asking = hub.task("t2", None).unwrap();
     assert_eq!(asking.waiting.map(|w| w.kind), Some(jgt_core::WaitingKind::Question));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn schema_7_orchestrator_review_tasks_move_to_review_on_upgrade() {
+    let dir = std::env::temp_dir().join(format!("jgt-upgrade8-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hub.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
+        conn.execute_batch(crate::db::TASKS_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, workspace, number, title, status, position, created_at, updated_at)
+             VALUES ('t1', '/w', 1, 'in_orch_review', 'orchestrator_review', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 7).unwrap();
+    }
+    let hub = Hub::new(Db::open(&path).unwrap(), Config::default());
+    let task = hub.task("t1", None).unwrap();
+    assert_eq!(task.status, jgt_core::TaskStatus::Review);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+    assert_eq!(version, crate::db::SCHEMA_VERSION);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -597,7 +624,7 @@ fn round_limit_tasks_move_to_orchestrator_review_on_upgrade() {
 mod board {
     use super::*;
     use jgt_core::{
-        Actor, Decision, Event, FindingCategory, ReviewDecision, Session, Task, TaskEvent, TaskEventKind, TaskStatus,
+        Actor, Event, FindingCategory, ReviewDecision, Session, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus,
         TestStatus, WaitingKind,
     };
     use TaskStatus::*;
@@ -677,6 +704,14 @@ mod board {
     /// A high finding: not critical, but it starts the fix round (PRD E3, Q13).
     fn high() -> FindingInput {
         FindingInput { severity: Some("high".into()), ..finding(Some(false), Some(FindingCategory::Behavior)) }
+    }
+
+    fn medium_finding() -> FindingInput {
+        FindingInput { severity: Some("medium".into()), ..finding(Some(false), None) }
+    }
+
+    fn low_finding() -> FindingInput {
+        FindingInput { severity: Some("low".into()), ..finding(Some(false), None) }
     }
 
     fn conflict<T: std::fmt::Debug>(r: Result<T, HubError>) -> String {
@@ -773,22 +808,6 @@ mod board {
         fn working(&self, title: &str) -> Task {
             let t = self.queued(title);
             self.mv(&t, Working).unwrap()
-        }
-
-        /// The flow up to the user (PRD D3): a first verification with a high finding, the fix
-        /// round, a second verification with `last` (changes when it holds a critical or high
-        /// finding, else approved), then Orchestrator review.
-        fn to_orchestrator_review(&self, t: &Task, last: Vec<FindingInput>) -> Task {
-            self.pass(t, ReviewDecision::Changes, vec![high()]);
-            self.mv(t, Working).unwrap();
-            let blocking = last.iter().any(|f| f.critical == Some(true) || f.severity.as_deref() == Some("high"));
-            let decision = if blocking { ReviewDecision::Changes } else { ReviewDecision::Approved };
-            self.pass(t, decision, last);
-            self.mv(t, OrchestratorReview).unwrap()
-        }
-
-        fn decide(&self, t: &Task, choice: Decision) -> Result<Task, HubError> {
-            self.hub.decide(&t.id, None, &DecisionRequest { actor: ActorRequest::User, choice, question_id: None })
         }
     }
 
@@ -1122,8 +1141,8 @@ mod board {
         let task = t.working("x");
         t.mv(&task, Testing).unwrap();
         t.test(&task, TestStatus::Fail).unwrap();
-        // The first verification is not the last: no Orchestrator review yet.
-        conflict(t.mv(&task, OrchestratorReview));
+        conflict(t.mv(&task, Review));
+        conflict(t.mv(&task, Done));
         let back = t.mv(&task, Working).unwrap();
         assert_eq!(back.review_rounds, 1, "a red test starts the one automatic fix round");
         assert_eq!(back.test_result.map(|r| r.status), Some(TestStatus::Fail), "the coder sees the failures");
@@ -1131,9 +1150,9 @@ mod board {
         assert_eq!(task.test_result, None, "a new pass starts without a test");
         // Red again on the second verification: no second fix, the user decides.
         t.test(&task, TestStatus::Fail).unwrap();
-        assert!(conflict(t.mv(&task, Working)).contains("D3"));
-        let task = t.mv(&task, OrchestratorReview).unwrap();
-        assert_eq!((task.status, task.round()), (OrchestratorReview, (2, 2)));
+        assert!(conflict(t.mv(&task, Working)).contains("no further automatic fix"));
+        conflict(t.mv(&task, Review));
+        conflict(t.mv(&task, Done));
     }
 
     #[test]
@@ -1149,8 +1168,7 @@ mod board {
         assert!(conflict(t.mv(&task, Done)).contains("K6"));
         // Changes requested in round 1.
         t.review(&task, ReviewDecision::Changes, vec![high()]).unwrap();
-        conflict(t.mv(&task, Done));
-        conflict(t.mv(&task, OrchestratorReview));
+        assert!(conflict(t.mv(&task, Done)).contains("the fix round is still left"));
         let task = t.mv(&task, Working).unwrap();
         assert_eq!(task.review_rounds, 1);
         assert_eq!(task.test_result, None, "the green test of the old pass is gone");
@@ -1161,10 +1179,8 @@ mod board {
         assert_eq!(task.review_result, None, "the old review is gone");
         let task = t.review(&task, ReviewDecision::Approved, vec![minor()]).unwrap();
         assert_eq!(task.review_result.as_ref().map(|r| r.round), Some(2));
-        // After a fix round even a clean verification goes to the user (D3/D4).
-        assert!(conflict(t.mv(&task, Done)).contains("Orchestrator review"));
-        let task = t.mv(&task, OrchestratorReview).unwrap();
-        let done = t.decide(&task, Decision::Done).unwrap();
+        // Approved at round 2 is accepted directly.
+        let done = t.mv(&task, Done).unwrap();
         assert_eq!(done.status, Done);
         assert!(done.done_at.is_some());
         // Done is final for the team.
@@ -1217,38 +1233,6 @@ mod board {
     }
 
     #[test]
-    fn a_second_decision_is_a_conflict() {
-        let t = team();
-        let task = t.working("feature");
-        let task = t.to_orchestrator_review(&task, vec![critical()]);
-        let more = || DecisionRequest { actor: ActorRequest::User, choice: Decision::MoreRounds, question_id: None };
-        assert_eq!(t.hub.decide(&task.id, None, &more()).unwrap().round_limit, 3);
-        conflict(t.hub.decide(&task.id, None, &more()));
-        assert_eq!(t.get(&task).round_limit, 3);
-
-        // Decisions sent at the same time: one wins, the limit is raised once.
-        let t = team();
-        let task = t.working("feature");
-        let task = t.to_orchestrator_review(&task, vec![critical()]);
-        let barrier = std::sync::Barrier::new(8);
-        let ok = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..8)
-                .map(|_| {
-                    s.spawn(|| {
-                        barrier.wait();
-                        t.hub.decide(&task.id, None, &more())
-                    })
-                })
-                .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).filter(|r| r.is_ok()).count()
-        });
-        assert_eq!(ok, 1);
-        assert_eq!(t.get(&task).round_limit, 3);
-        let decisions = t.events(&task).iter().filter(|e| e.kind == TaskEventKind::Decision).count();
-        assert_eq!(decisions, 1);
-    }
-
-    #[test]
     fn a_green_test_does_not_survive_a_return_to_working() {
         let t = team();
         let task = t.working("x");
@@ -1266,19 +1250,19 @@ mod board {
     }
 
     #[test]
-    fn a_green_test_does_not_survive_a_stop() {
-        for choice in [Decision::Stop, Decision::TakeOver] {
-            let t = team();
-            let task = t.working("feature");
-            let task = t.to_orchestrator_review(&task, vec![critical()]);
-            assert_eq!(task.test_result.as_ref().map(|r| r.status), Some(TestStatus::Pass));
-            t.decide(&task, choice).unwrap();
-            // The user sends it straight to Review: the old green test is not this pass's test.
-            let review = t.user_move(&task, Review);
-            assert_eq!(review.test_result, None);
-            t.review(&task, ReviewDecision::Approved, vec![]).unwrap();
-            assert!(conflict(t.mv(&task, Done)).contains("green test"), "{choice}");
-        }
+    fn a_green_test_does_not_survive_a_move_to_backlog() {
+        let t = team();
+        let task = t.working("feature");
+        t.mv(&task, Testing).unwrap();
+        t.test(&task, TestStatus::Pass).unwrap();
+        let task = t.mv(&task, Review).unwrap();
+        assert_eq!(task.test_result.as_ref().map(|r| r.status), Some(TestStatus::Pass));
+        let task = t.user_move(&task, Backlog);
+        // The user sends it straight to Review: the old green test is not this pass's test.
+        let review = t.user_move(&task, Review);
+        assert_eq!(review.test_result, None);
+        t.review(&task, ReviewDecision::Approved, vec![]).unwrap();
+        assert!(conflict(t.mv(&task, Done)).contains("green test"));
     }
 
     #[test]
@@ -1549,8 +1533,6 @@ mod board {
         let t = team();
         let task = t.working("feature");
         let task = t.pass(&task, ReviewDecision::Approved, vec![minor(), minor()]);
-        // Not through Orchestrator review: that column is for tasks that needed the fix round.
-        assert!(conflict(t.mv(&task, OrchestratorReview)).contains("first verification"));
         let done = t.mv(&task, Done).unwrap();
         assert_eq!(done.status, Done);
         let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
@@ -1563,7 +1545,7 @@ mod board {
     }
 
     #[test]
-    fn the_second_verification_goes_to_orchestrator_review() {
+    fn round_2_review_with_critical_finding_moves_to_done_with_high_follow_up() {
         let t = team();
         let task = t.working("feature");
         let first = t.pass(&task, ReviewDecision::Changes, vec![critical(), minor()]);
@@ -1571,40 +1553,159 @@ mod board {
         t.mv(&task, Working).unwrap();
         let second = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
         assert_eq!(second.review_result.as_ref().map(|r| r.round), Some(2));
-        // One automatic fix round only (K8 as changed by D3), and no Done without the user.
-        assert!(conflict(t.mv(&task, Working)).contains("D3"));
-        conflict(t.mv(&task, Done));
-        let task = t.mv(&task, OrchestratorReview).unwrap();
-        assert!(task.waiting.is_none(), "the column replaces the old round-limit flag");
-        assert_eq!(task.review_result.as_ref().map(|r| r.round), Some(2), "the card shows the second verification");
-        // The team can never move it out; the user decides.
-        for to in [Working, Done, Backlog, Review] {
-            assert!(conflict(t.mv(&task, to)).contains("only the user decides"), "{to}");
-        }
-        // It waits for the user: a desktop notification through the Coordinator's chat.
-        let n = notices(&t.hub, &t.coord);
-        let note = n.iter().find(|m| m.meta_str("title") == Some("JGT-1 waits for your review")).expect("a notice");
-        assert!(note.body.contains("verification 2: changes, 1 critical, 0 high, 0 other"), "{}", note.body);
-        // Not in progress: it does not hold a WIP slot.
-        t.mv(&t.queued("next"), Working).unwrap();
+        assert!(!second.fix_round_left());
+        // No further automatic fix round.
+        assert!(conflict(t.mv(&task, Working)).contains("no further automatic fix"));
+        // Accepted for Done in round 2 even with changes requested.
+        let done = t.mv(&task, Done).unwrap();
+        assert_eq!(done.status, Done);
+        assert!(done.done_at.is_some());
+        let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
+        assert_eq!(follow.status, Backlog);
+        assert_eq!(follow.priority, TaskPriority::High);
+        assert_eq!(follow.parent_id.as_deref(), Some(task.id.as_str()));
+        assert!(follow.description.contains("a problem"));
+        assert!(t.events(&task).iter().any(|e| e.kind == TaskEventKind::FollowUp && e.body.contains(&follow.key)));
     }
 
     #[test]
-    fn decide_done_accepts_the_task() {
+    fn follow_up_priority_high_with_one_high_three_medium_one_low() {
         let t = team();
         let task = t.working("feature");
-        let task = t.to_orchestrator_review(&task, vec![high(), minor()]);
-        let done = t.decide(&task, Decision::Done).unwrap();
+        // Round 1: high finding requests changes
+        t.pass(&task, ReviewDecision::Changes, vec![high()]);
+        t.mv(&task, Working).unwrap();
+        // Round 2: 1 high + 3 medium + 1 low findings
+        let findings = vec![
+            high(),
+            medium_finding(),
+            medium_finding(),
+            medium_finding(),
+            low_finding(),
+        ];
+        t.pass(&task, ReviewDecision::Changes, findings);
+        let done = t.mv(&task, Done).unwrap();
+        assert_eq!(done.status, Done);
+        let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
+        assert_eq!(follow.priority, TaskPriority::High);
+        assert_eq!(follow.status, Backlog);
+        assert_eq!(follow.parent_id.as_deref(), Some(task.id.as_str()));
+    }
+
+    #[test]
+    fn follow_up_priority_normal_with_one_medium_ten_low() {
+        let t = team();
+        let task = t.working("feature");
+        let mut findings = vec![medium_finding()];
+        for _ in 0..10 {
+            findings.push(low_finding());
+        }
+        t.pass(&task, ReviewDecision::Approved, findings);
+        let done = t.mv(&task, Done).unwrap();
+        assert_eq!(done.status, Done);
+        let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
+        assert_eq!(follow.priority, TaskPriority::Normal);
+        assert_eq!(follow.status, Backlog);
+        assert_eq!(follow.parent_id.as_deref(), Some(task.id.as_str()));
+    }
+
+    #[test]
+    fn follow_up_priority_normal_with_medium_and_low_findings() {
+        let t = team();
+        let task = t.working("feature");
+        let task = t.pass(&task, ReviewDecision::Approved, vec![medium_finding(), low_finding()]);
+        let done = t.mv(&task, Done).unwrap();
+        assert_eq!(done.status, Done);
+        let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
+        assert_eq!(follow.priority, TaskPriority::Normal);
+        assert_eq!(follow.status, Backlog);
+        assert_eq!(follow.parent_id.as_deref(), Some(task.id.as_str()));
+    }
+
+    #[test]
+    fn follow_up_priority_low_with_only_low_findings() {
+        let t = team();
+        let task = t.working("feature");
+        let task = t.pass(&task, ReviewDecision::Approved, vec![low_finding(), low_finding()]);
+        let done = t.mv(&task, Done).unwrap();
+        assert_eq!(done.status, Done);
+        let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
+        assert_eq!(follow.priority, TaskPriority::Low);
+        assert_eq!(follow.status, Backlog);
+        assert_eq!(follow.parent_id.as_deref(), Some(task.id.as_str()));
+    }
+
+    #[test]
+    fn round_1_changes_with_critical_finding_refuses_done() {
+        let t = team();
+        let task = t.working("feature");
+        let first = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
+        assert!(first.fix_round_left());
+        let err = conflict(t.mv(&task, Done));
+        assert!(err.contains("the fix round is still left"), "expected fix round left refusal, got {err}");
+    }
+
+    #[test]
+    fn approved_at_round_2_moves_to_done() {
+        let t = team();
+        let task = t.working("feature");
+        t.pass(&task, ReviewDecision::Changes, vec![high()]);
+        t.mv(&task, Working).unwrap();
+        let second = t.pass(&task, ReviewDecision::Approved, vec![]);
+        assert_eq!(second.review_result.as_ref().map(|r| r.round), Some(2));
+        let done = t.mv(&task, Done).unwrap();
         assert_eq!(done.status, Done);
         assert!(done.done_at.is_some());
-        // Whatever is left goes to the follow-up; the decision and the move are logged.
-        let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
-        assert!(follow.description.contains("a problem"));
-        let log = t.events(&task);
-        assert!(log.iter().any(|e| e.kind == TaskEventKind::Decision && e.meta["choice"] == "done"));
-        assert!(log.iter().any(|e| e.kind == TaskEventKind::Moved && e.meta["to"] == "done" && e.actor == Actor::User));
-        // Deciding again: nothing to decide.
-        conflict(t.decide(&task, Decision::Done));
+    }
+
+    #[test]
+    fn done_without_green_test_or_without_review_is_refused() {
+        let t = team();
+        // Case 1: In Review without a green test.
+        let task = t.working("no-test");
+        t.user_move(&task, Review);
+        t.review(&task, ReviewDecision::Approved, vec![]).unwrap();
+        let err = conflict(t.mv(&task, Done));
+        assert!(err.contains("green test"), "expected green test error, got {err}");
+        t.user_move(&task, Backlog);
+
+        // Case 2: In Review with a green test, but without a review.
+        let task2 = t.working("no-review");
+        t.mv(&task2, Testing).unwrap();
+        t.test(&task2, TestStatus::Pass).unwrap();
+        t.mv(&task2, Review).unwrap();
+        let err2 = conflict(t.mv(&task2, Done));
+        assert!(err2.contains("review of this pass"), "expected review error, got {err2}");
+    }
+
+    #[test]
+    fn done_notification_mentions_follow_up() {
+        let t = team();
+        let task = t.working("feature");
+        t.pass(&task, ReviewDecision::Changes, vec![high()]);
+        t.mv(&task, Working).unwrap();
+        // Round 2 changes with critical finding -> follow-up priority High
+        t.pass(&task, ReviewDecision::Changes, vec![critical()]);
+        let task = t.mv(&task, Done).unwrap();
+
+        let n = notices(&t.hub, &t.coord);
+        let note = n.iter().find(|m| m.meta_str("title") == Some("JGT-1 is Done")).expect("done notice");
+        assert_eq!(note.meta_str("level"), Some("success"));
+        assert!(
+            note.body.contains("A high-priority follow-up JGT-2 is in Backlog."),
+            "body was: {}",
+            note.body
+        );
+
+        // Reopening the task and reaching Done again without findings must not mention the old follow-up
+        let reopened = t.user_move(&task, OnQueue);
+        let task = t.mv(&reopened, Working).unwrap();
+        let task = t.pass(&task, ReviewDecision::Approved, vec![]);
+        t.mv(&task, Done).unwrap();
+
+        let n = notices(&t.hub, &t.coord);
+        let note = n.iter().filter(|m| m.meta_str("title") == Some("JGT-1 is Done")).last().expect("second done notice");
+        assert!(!note.body.contains("follow-up"), "reopened done notice should not mention old follow-up: {}", note.body);
     }
 
     #[test]
@@ -1642,72 +1743,6 @@ mod board {
     }
 
     #[test]
-    fn more_rounds_needs_the_users_answer() {
-        let t = team();
-        let task = t.working("feature");
-        let ask = |prompt: &str| {
-            t.hub
-                .ask(&t.coord.id, &QuestionRequest {
-                    kind: MessageKind::Question,
-                    prompt: prompt.into(),
-                    options: vec![],
-                    meta: serde_json::Value::Null,
-                    timeout_secs: None,
-                })
-                .unwrap()
-        };
-        let early = ask("unrelated, asked before");
-        t.hub.answer(&early.id, "yes").unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        let task = t.to_orchestrator_review(&task, vec![critical()]);
-        let decide = |question_id: Option<String>| {
-            t.hub.decide(&task.id, None, &DecisionRequest {
-                actor: t.coordinator(),
-                choice: Decision::MoreRounds,
-                question_id,
-            })
-        };
-        forbidden(decide(None));
-        forbidden(decide(Some(early.id.clone())));
-        let pending = ask("Done, one more fix, take over, or stop?");
-        forbidden(decide(Some(pending.id.clone())));
-        t.hub.answer(&pending.id, "One more fix").unwrap();
-        let task = decide(Some(pending.id.clone())).unwrap();
-        // One more coder: the task is back in Working for the third verification.
-        assert_eq!((task.status, task.review_rounds, task.round_limit), (Working, 2, 3));
-        assert_eq!(task.review_result.as_ref().map(|r| r.decision), Some(ReviewDecision::Changes), "the coder sees them");
-        let task = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
-        assert_eq!(task.review_result.as_ref().map(|r| r.round), Some(3));
-        // ... and the card comes back to Orchestrator review, not to another automatic fix.
-        conflict(t.mv(&task, Working));
-        let task = t.mv(&task, OrchestratorReview).unwrap();
-        t.decide(&task, Decision::Stop).unwrap();
-        // Not in Orchestrator review any more: deciding again is a conflict.
-        conflict(t.hub.decide(&task.id, None, &DecisionRequest {
-            actor: ActorRequest::User,
-            choice: Decision::Stop,
-            question_id: None,
-        }));
-    }
-
-    #[test]
-    fn take_over_and_stop_send_the_task_to_backlog() {
-        for choice in [Decision::TakeOver, Decision::Stop] {
-            let t = team();
-            let task = t.working("feature");
-            let task = t.to_orchestrator_review(&task, vec![critical()]);
-            let task = t.decide(&task, choice).unwrap();
-            assert_eq!(task.status, Backlog);
-            assert!(task.waiting.is_none());
-            assert!(task.review_result.is_some(), "the findings stay");
-            let log = t.events(&task);
-            assert!(log.iter().any(|e| e.kind == TaskEventKind::Decision && e.actor == Actor::User));
-            // The team leaves it alone, even as a subtask.
-            conflict(t.mv(&task, OnQueue));
-        }
-    }
-
-    #[test]
     fn user_moves_skip_gates_and_are_logged() {
         let t = team();
         let task = t.create(ActorRequest::User, "x", None).unwrap();
@@ -1730,8 +1765,10 @@ mod board {
     fn reopening_resets_rounds() {
         let t = team();
         let task = t.working("feature");
-        let task = t.to_orchestrator_review(&task, vec![minor()]);
-        let done = t.decide(&task, Decision::Done).unwrap();
+        t.pass(&task, ReviewDecision::Changes, vec![high()]);
+        t.mv(&task, Working).unwrap();
+        let task = t.pass(&task, ReviewDecision::Approved, vec![minor()]);
+        let done = t.mv(&task, Done).unwrap();
         assert_eq!(done.review_rounds, 1);
         let reopened = t.user_move(&done, OnQueue);
         assert_eq!(reopened.status, OnQueue);
@@ -1839,11 +1876,10 @@ mod board {
         assert_eq!(after.review_result.as_ref().unwrap().round, 1);
         let back = t.mv(&task, Working).unwrap();
         assert_eq!(back.review_rounds, 1);
-        // Round 2: approved; the user reviews it and accepts it.
+        // Round 2: approved; the coordinator moves it to Done.
         let approved = t.pass(&task, ReviewDecision::Approved, vec![]);
         assert_eq!(approved.review_result.as_ref().unwrap().round, 2);
-        t.mv(&task, OrchestratorReview).unwrap();
-        let done = t.decide(&task, Decision::Done).unwrap();
+        let done = t.mv(&task, Done).unwrap();
         assert!(done.done_at.is_some());
         assert_eq!(done.description, "the user's words", "the description is never touched");
 
@@ -1864,18 +1900,17 @@ mod board {
             expect("working", &coordinator),
             expect("testing", &coordinator),
             expect("review", &coordinator),
-            expect("orchestrator_review", &coordinator),
-            expect("done", &Actor::User),
+            expect("done", &coordinator),
         ]);
         let kinds: Vec<TaskEventKind> = t.events(&task).into_iter().map(|e| e.kind).collect();
         for kind in [TaskEventKind::Details, TaskEventKind::Link, TaskEventKind::TestResult, TaskEventKind::ReviewResult] {
             assert!(kinds.contains(&kind), "{kind} logged");
         }
         assert_eq!(t.hub.tasks(WS, true).unwrap().len(), 1, "no follow-up task");
-        // Orchestrator review is announced in the Coordinator's chat; the user's own Done is not.
+        // Done by the team is announced in the Coordinator's chat.
         let titles: Vec<String> =
             notices(&t.hub, &t.coord).iter().filter_map(|m| m.meta_str("title").map(str::to_owned)).collect();
-        assert_eq!(titles, ["JGT-1 waits for your review"]);
+        assert_eq!(titles, ["JGT-1 is Done"]);
     }
 
     #[test]
@@ -1929,12 +1964,11 @@ mod board {
     }
 
     #[test]
-    fn stop_keeps_backlog_positions_contiguous() {
+    fn moving_to_backlog_keeps_positions_contiguous() {
         let t = team();
         let [a, b] = ["a", "b"].map(|x| t.create(ActorRequest::User, x, None).unwrap());
         let task = t.working("stopped");
-        let task = t.to_orchestrator_review(&task, vec![critical()]);
-        t.decide(&task, Decision::Stop).unwrap();
+        t.user_move(&task, Backlog);
         let backlog: Vec<(String, i64)> =
             t.hub.tasks(WS, false).unwrap().into_iter().filter(|x| x.status == Backlog).map(|x| (x.title, x.position)).collect();
         assert_eq!(backlog, [("b".to_string(), 0), ("a".to_string(), 1), ("stopped".to_string(), 2)]);
@@ -2145,20 +2179,14 @@ mod board {
         assert_eq!(notices(&t.hub, &t.coord).len(), 1);
         t.user_move(&task, Backlog);
 
-        // Orchestrator review after the second verification.
-        let limit = t.working("limit");
-        t.to_orchestrator_review(&limit, vec![critical()]);
-        assert!(notices(&t.hub, &t.coord).iter().any(|m| m.meta_str("title") == Some("JGT-2 waits for your review")));
-        t.decide(&limit, Decision::Stop).unwrap();
-
         // Done by the team is announced; the user's own move to Done is not.
         let done = t.working("done");
         t.pass(&done, ReviewDecision::Approved, vec![]);
         t.mv(&done, Done).unwrap();
-        assert!(notices(&t.hub, &t.coord).iter().any(|m| m.meta_str("title") == Some("JGT-3 is Done")));
+        assert!(notices(&t.hub, &t.coord).iter().any(|m| m.meta_str("title") == Some("JGT-2 is Done")));
         let mine = t.create(ActorRequest::User, "mine", None).unwrap();
         t.user_move(&mine, Done);
-        assert!(!notices(&t.hub, &t.coord).iter().any(|m| m.meta_str("title") == Some("JGT-4 is Done")));
+        assert!(!notices(&t.hub, &t.coord).iter().any(|m| m.meta_str("title") == Some("JGT-3 is Done")));
     }
 
     fn done_task(t: &Team, title: &str, days_ago: i64) -> Task {

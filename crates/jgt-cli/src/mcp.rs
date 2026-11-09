@@ -4,12 +4,12 @@
 //! from the harness process id (Claude Code: one session per process) or from the
 //! `jgt_session` argument the opencode plugin fills in.
 
-use crate::tasks::{describe as describe_event, parse_column, parse_decision, show};
+use crate::tasks::{describe as describe_event, parse_column, show};
 use jgt_core::{
     ClientError, Harness, HubClient, Message, MessageKind, NotifyLevel, QuestionStatus, Session, Task, TaskEvent,
     TaskEventKind, TaskPriority, TaskStatus,
     api::{
-        ActorRequest, AgentMessageRequest, CreateTaskRequest, DecisionRequest, MessagesResponse, MoveResponse,
+        ActorRequest, AgentMessageRequest, CreateTaskRequest, MessagesResponse, MoveResponse,
         MoveTaskRequest, PatchSessionRequest, PatchTaskRequest, QuestionRequest, ResultRequest, TaskEventRequest,
         TaskEventsResponse, TasksResponse, WaitingInput,
     },
@@ -170,7 +170,7 @@ pub struct TaskUpdateArgs {
 pub struct TaskMoveArgs {
     /// The task key (JGT-12).
     pub key: String,
-    /// The column: backlog, on_queue, working, testing, review, orchestrator_review or done.
+    /// The column: backlog, on_queue, working, testing, review or done.
     pub to: String,
     /// Why, for the task's activity log.
     #[serde(default)]
@@ -192,19 +192,6 @@ pub struct TaskCreateArgs {
     /// Queue the subtask right away (only a subtask of a task the user queued).
     #[serde(default)]
     pub queue: bool,
-    #[schemars(description = "Internal: filled in automatically by the client. Leave empty.")]
-    #[serde(default)]
-    pub jgt_session: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TaskDecideArgs {
-    /// The task key (JGT-12).
-    pub key: String,
-    /// The user's answer: done, more_rounds (one more fix), take_over or stop.
-    pub choice: String,
-    /// The answered chat_ask question that carries the user's choice.
-    pub question_id: String,
     #[schemars(description = "Internal: filled in automatically by the client. Leave empty.")]
     #[serde(default)]
     pub jgt_session: Option<String>,
@@ -499,7 +486,7 @@ impl JgtMcp {
     }
 
     #[tool(description = "List this folder's Board in column order (Done left out unless include_done). \
-        Filter with status: backlog, on_queue, working, testing, review, orchestrator_review or done.")]
+        Filter with status: backlog, on_queue, working, testing, review or done.")]
     async fn task_list(&self, Parameters(args): Parameters<TaskListArgs>) -> Result<CallToolResult, McpError> {
         let (_, workspace) = match self.board(args.jgt_session.as_deref()).await {
             Ok(b) => b,
@@ -600,7 +587,9 @@ impl JgtMcp {
     }
 
     #[tool(description = "Coordinator only. Move a task to another column: backlog, on_queue, working, \
-        testing, review, orchestrator_review or done. The hub checks the gates; a refusal is final, so report it.")]
+        testing, review or done. The hub checks the gates; a refusal is final, so report it. \
+        Review->Done: Done is accepted for an approved review at any round, and for a review with changes \
+        only when no fix round is left; the hub files a follow-up in Backlog with a priority it sets itself.")]
     async fn task_move(&self, Parameters(args): Parameters<TaskMoveArgs>) -> Result<CallToolResult, McpError> {
         let (actor, workspace) = match self.coordinator_board(args.jgt_session.as_deref()).await {
             Ok(b) => b,
@@ -651,24 +640,6 @@ impl JgtMcp {
         match self.client.post::<_, MoveResponse>(&task_path(&workspace, &task.id, "/move"), &req).await {
             Ok(r) => ok(format!("{} created and queued. {}", r.task.key, render_change(&r.task))),
             Err(e) => tool_error(format!("{} created in Backlog, but not queued: {}", task.key, describe(&e))),
-        }
-    }
-
-    #[tool(description = "Coordinator only. Pass on the user's decision on a task in Orchestrator review: \
-        done, more_rounds (one more fix), take_over or stop, citing the answered chat_ask question_id.")]
-    async fn task_decide(&self, Parameters(args): Parameters<TaskDecideArgs>) -> Result<CallToolResult, McpError> {
-        let (actor, workspace) = match self.coordinator_board(args.jgt_session.as_deref()).await {
-            Ok(b) => b,
-            Err(e) => return tool_error(e),
-        };
-        let choice = match parse_decision(&args.choice) {
-            Ok(c) => c,
-            Err(e) => return tool_error(e),
-        };
-        let req = DecisionRequest { actor, choice, question_id: Some(args.question_id) };
-        match self.client.post::<_, Task>(&task_path(&workspace, &args.key, "/decision"), &req).await {
-            Ok(t) => ok(render_change(&t)),
-            Err(e) => tool_error(describe(&e)),
         }
     }
 
@@ -723,9 +694,10 @@ mod tests {
     #[test]
     fn the_board_tools_are_listed() {
         let names: Vec<String> = JgtMcp::tool_router().list_all().into_iter().map(|t| t.name.to_string()).collect();
-        for tool in ["task_list", "task_get", "task_update", "task_move", "task_create", "task_decide", "task_log"] {
+        for tool in ["task_list", "task_get", "task_update", "task_move", "task_create", "task_log"] {
             assert!(names.iter().any(|n| n == tool), "{tool} in {names:?}");
         }
+        assert!(!names.iter().any(|n| n == "task_decide"));
     }
 
     #[test]

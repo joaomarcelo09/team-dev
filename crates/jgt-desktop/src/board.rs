@@ -14,7 +14,7 @@ use iced::{
     },
 };
 use jgt_core::{
-    Actor, Decision, Finding, ReviewDecision, Session, Severity, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus,
+    Actor, Finding, ReviewDecision, Session, Severity, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus,
     TestStatus, WaitingKind,
 };
 
@@ -329,12 +329,12 @@ pub fn describe(e: &TaskEvent) -> String {
 struct Column(TaskStatus);
 
 /// The "Move to…" choices of a card in each column: every other column.
-static MOVE_TO: [[Column; 6]; 7] = [others(0), others(1), others(2), others(3), others(4), others(5), others(6)];
+static MOVE_TO: [[Column; 5]; 6] = [others(0), others(1), others(2), others(3), others(4), others(5)];
 
-const fn others(skip: usize) -> [Column; 6] {
+const fn others(skip: usize) -> [Column; 5] {
     use TaskStatus::*;
-    let all = [Backlog, OnQueue, Working, Testing, Review, OrchestratorReview, Done];
-    let mut out = [Column(Backlog); 6];
+    let all = [Backlog, OnQueue, Working, Testing, Review, Done];
+    let mut out = [Column(Backlog); 5];
     let (mut i, mut j) = (0, 0);
     while i < all.len() {
         if i != skip {
@@ -540,13 +540,6 @@ fn card<'a>(app: &'a App, task: &'a Task, index: usize, len: usize, at: Target, 
             container(text(label).size(style::fs(11)).font(bold())).padding([1, 7]).style(style::badge(p.warning.base.color)),
         );
     }
-    if task.status == TaskStatus::OrchestratorReview {
-        info = info.push(
-            container(text(review_summary(task)).size(style::fs(11)).font(bold()))
-                .padding([1, 7])
-                .style(style::badge(p.warning.base.color)),
-        );
-    }
     let arrow = |label: &'static str, to: Option<TaskStatus>| {
         button(text(label).size(style::fs(12)))
             .on_press_maybe(to.map(|to| Msg::MoveTask { id: task.id.clone(), to, position: None }))
@@ -576,7 +569,7 @@ fn card<'a>(app: &'a App, task: &'a Task, index: usize, len: usize, at: Target, 
     let card = container(column![info, controls].spacing(6))
         .padding([8, 10])
         .width(Fill)
-        .style(style::task_card(open || dragged, task.waiting.is_some() || task.status == TaskStatus::OrchestratorReview));
+        .style(style::task_card(open || dragged, task.waiting.is_some()));
     // A press starts a drag; a release where it started is a click that opens the task. The
     // buttons and the menu take their own presses.
     let mut area = mouse_area(card)
@@ -587,24 +580,6 @@ fn card<'a>(app: &'a App, task: &'a Task, index: usize, len: usize, at: Target, 
         area = area.on_enter(Msg::DragOver(at));
     }
     area.into()
-}
-
-/// The second verification's result in a few words, for a card in Orchestrator review.
-fn review_summary(task: &Task) -> String {
-    match (&task.review_result, &task.test_result) {
-        (Some(r), _) => {
-            let count = |l: Severity| r.findings.iter().filter(|f| f.level() == l).count();
-            let verdict = if r.decision == ReviewDecision::Approved { "clean" } else { "changes" };
-            format!(
-                "Verification {}: {verdict} · {} critical, {} high",
-                r.round,
-                count(Severity::Critical),
-                count(Severity::High)
-            )
-        }
-        (None, Some(t)) if t.status == TestStatus::Fail => format!("Verification {}: tests failed", task.round().0),
-        _ => "Waiting for your review".into(),
-    }
 }
 
 fn priority_tip(priority: TaskPriority) -> &'static str {
@@ -640,25 +615,6 @@ fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Ms
         let title = if waiting.kind == WaitingKind::UsageLimit { "Waiting: usage limit" } else { "Waiting for you" };
         let banner = column![text(title).size(style::fs(12)).font(bold()), text(waiting.reason.as_str()).size(style::fs(12))]
             .spacing(6);
-        col = col.push(container(banner).padding([8, 10]).width(Fill).style(style::banner(p.warning.base.color)));
-    }
-    // Orchestrator review: the second verification is done and the user decides (PRD D3/D4).
-    if task.status == TaskStatus::OrchestratorReview {
-        let choice = |label: &'static str, choice: Decision, style: fn(&Theme, button::Status) -> button::Style| {
-            button(text(label).size(style::fs(12))).on_press(Msg::Decide { id: task.id.clone(), choice }).style(style).padding([4, 10])
-        };
-        let banner = column![
-            text("Your review").size(style::fs(12)).font(bold()),
-            text(review_summary(task)).size(style::fs(12)),
-            row![
-                choice("Done", Decision::Done, style::primary_button),
-                choice("One more fix", Decision::MoreRounds, style::pill_button),
-                choice("Take over", Decision::TakeOver, style::pill_button),
-                choice("Stop", Decision::Stop, style::danger_button),
-            ]
-            .spacing(6),
-        ]
-        .spacing(6);
         col = col.push(container(banner).padding([8, 10]).width(Fill).style(style::banner(p.warning.base.color)));
     }
 
@@ -1094,8 +1050,6 @@ mod tests {
         // Sent back once: the second cycle, as `task list` shows it.
         t.status = TaskStatus::Working;
         t.review_rounds = 1;
-        assert_eq!(super::round_label(&t).as_deref(), Some("round 2/2"));
-        t.status = TaskStatus::OrchestratorReview;
         assert_eq!(super::round_label(&t).as_deref(), Some("round 2/2"));
         t.status = TaskStatus::Backlog;
         t.review_rounds = 2;

@@ -2,10 +2,10 @@
 
 use futures::{SinkExt, Stream, channel::mpsc};
 use jgt_core::{
-    Decision, Event, HubClient, Message, Question, ReconnectMode, Session, SessionStatus, Task, TaskEvent, TaskEventKind,
+    Event, HubClient, Message, Question, ReconnectMode, Session, SessionStatus, Task, TaskEvent, TaskEventKind,
     TaskStatus,
     api::{
-        ActorRequest, AnswerRequest, CreateTaskRequest, DecisionRequest, MessagesResponse, MoveResponse,
+        ActorRequest, AnswerRequest, CreateTaskRequest, MessagesResponse, MoveResponse,
         MoveTaskRequest, PatchSessionRequest, PatchTaskRequest, PresenceRequest, SendRequest, SessionsResponse,
         TaskEventRequest, TaskEventsResponse, TasksResponse,
     },
@@ -241,9 +241,4 @@ pub async fn comment(task_id: String, workspace: String, text: String) -> Result
 
 pub async fn delete_task(task_id: String) -> Result<(), String> {
     client().delete::<()>(&format!("/v1/tasks/{task_id}?actor=user")).await.map_err(|e| e.to_string())
-}
-
-pub async fn decide(task_id: String, choice: Decision) -> Result<Task, String> {
-    let req = DecisionRequest { actor: ActorRequest::User, choice, question_id: None };
-    client().post(&format!("/v1/tasks/{task_id}/decision"), &req).await.map_err(|e| e.to_string())
 }

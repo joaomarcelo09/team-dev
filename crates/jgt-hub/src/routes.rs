@@ -76,7 +76,6 @@ pub fn router(hub: SharedHub) -> Router {
         .route("/v1/tasks/{id}", get(get_task).patch(patch_task).delete(delete_task))
         .route("/v1/tasks/{id}/move", post(move_task))
         .route("/v1/tasks/{id}/results", post(task_results))
-        .route("/v1/tasks/{id}/decision", post(task_decision))
         .route("/v1/tasks/{id}/events", get(task_events).post(task_event))
         .route("/v1/ui/presence", post(presence))
         .route("/v1/ui/focus", post(focus))
@@ -365,15 +364,6 @@ async fn task_results(
     Json(req): Json<ResultRequest>,
 ) -> ApiResult<jgt_core::Task> {
     Ok(Json(hub.record_results(&id, q.workspace.as_deref(), &req)?))
-}
-
-async fn task_decision(
-    State(hub): State<SharedHub>,
-    Path(id): Path<String>,
-    Query(q): Query<TaskQuery>,
-    Json(req): Json<DecisionRequest>,
-) -> ApiResult<jgt_core::Task> {
-    Ok(Json(hub.decide(&id, q.workspace.as_deref(), &req)?))
 }
 
 async fn task_events(

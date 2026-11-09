@@ -317,16 +317,6 @@ pub struct ResultRequest {
     pub review: Option<ReviewResultInput>,
 }
 
-/// Answers a task waiting after the last review round (K8).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecisionRequest {
-    pub actor: ActorRequest,
-    pub choice: Decision,
-    /// For the Coordinator: the answered `chat_ask` question that carries the user's choice.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub question_id: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskEventRequest {
     pub actor: ActorRequest,
