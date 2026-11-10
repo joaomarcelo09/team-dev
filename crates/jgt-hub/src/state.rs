@@ -39,6 +39,8 @@ pub struct Hub {
     reconnecting: Mutex<HashMap<String, Instant>>,
     /// Queue reminder loop guard: last reminded queue key-set and when it was sent per session.
     queue_reminders: Mutex<HashMap<String, (String, Instant)>>,
+    /// Stalled card ping guard: (task_id:updated_at) -> last ping timestamp (ms).
+    stalled_reminders: Mutex<HashMap<String, i64>>,
 }
 
 pub type SharedHub = Arc<Hub>;
@@ -81,6 +83,7 @@ impl Hub {
             ui_clients: AtomicUsize::new(0),
             reconnecting: Mutex::new(HashMap::new()),
             queue_reminders: Mutex::new(HashMap::new()),
+            stalled_reminders: Mutex::new(HashMap::new()),
         })
     }
 
