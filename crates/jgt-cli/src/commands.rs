@@ -311,19 +311,26 @@ mod tests {
         let mut config = Config::default();
         config.git = Git {
             auto_commit: true,
-            auto_merge: false,
+            branch_pattern: "feat/{key}-{slug}".into(),
             auto_push: true,
-            allow_main: true,
+            auto_open_pr: false,
+            auto_merge_pr: true,
         };
         let text = git_policy_text(&config);
         assert_eq!(
             text,
-            "auto-commit: ON (commit without asking)\n\
-             auto-merge: OFF (ask first)\n\
-             auto-push: ON (push without asking)\n\
-             main branch: ON (the ON actions also apply to main)\n\
-             Always: reviewer approval (card past Review) before any commit, merge or push; never force-push."
+            "auto-commit: ON (commit on the task's own branch without asking)\n\
+             branch pattern: feat/{key}-{slug}\n\
+             auto-push: ON (push the task branch without asking)\n\
+             auto-open-PR: OFF (ask first)\n\
+             auto-merge-PR: ON (merge the pull request once its checks pass without asking)\n\
+             Always: reviewer approval (card past Review) before any commit, push or pull request.\n\
+             Never: commit, merge or push on main; force-push."
         );
+        // The default: everything OFF, the default branch name.
+        let text = git_policy_text(&Config::default());
+        assert!(text.starts_with("auto-commit: OFF (ask first)\nbranch pattern: jgt/{key}\n"), "{text}");
+        assert!(!text.contains("main branch:"), "{text}");
     }
 }
 

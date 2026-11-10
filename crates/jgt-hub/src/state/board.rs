@@ -58,6 +58,54 @@ fn users_own_move(from: TaskStatus, to: TaskStatus) -> bool {
     false
 }
 
+/// The step of a git column in words, for messages to the user: "open the pull request".
+fn git_step_words(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::ToCommit => "commit",
+        TaskStatus::ToPush => "push",
+        TaskStatus::ToOpenPr => "open the pull request",
+        TaskStatus::ToMerge => "merge the pull request",
+        _ => "",
+    }
+}
+
+/// The step of a git column as a thing to OK: "opening the pull request".
+fn git_step_noun(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::ToCommit => "the commit",
+        TaskStatus::ToPush => "the push",
+        TaskStatus::ToOpenPr => "opening the pull request",
+        TaskStatus::ToMerge => "merging the pull request",
+        _ => "it",
+    }
+}
+
+/// `git_steps` tokens in words, for the Done notification: "commit, push, open PR, merge PR".
+fn git_step_list(steps: &[String]) -> String {
+    steps.iter().map(|s| s.replace("_pr", " PR").replace('_', " ")).collect::<Vec<_>>().join(", ")
+}
+
+/// What the workspace's repository can do for the git steps: whether it has a remote, and whether
+/// `gh` is on PATH. A folder that is not a git repository is not checked (both stay true).
+/// Spawns `git`, so it is called outside the Board transaction.
+pub(crate) fn git_caps(workspace: &str) -> jgt_core::config::GitCaps {
+    use jgt_core::config::GitCaps;
+    let remotes = std::process::Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .arg("remote")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output();
+    match remotes {
+        Ok(out) if out.status.success() => GitCaps {
+            remote: !String::from_utf8_lossy(&out.stdout).trim().is_empty(),
+            gh: jgt_core::launch::which("gh").is_some(),
+        },
+        _ => GitCaps::default(),
+    }
+}
+
 /// Roles whose results the hub records: coder records tests, reviewer records reviews.
 const TEST_ROLES: &[&str] = &["coder"];
 const REVIEW_ROLES: &[&str] = &["reviewer"];
@@ -425,13 +473,10 @@ impl Hub {
         Ok(())
     }
 
+    /// Whether the team does the step of the git column `status` on its own. `git` holds the
+    /// switches the workspace allows (`Git::effective`).
     fn is_git_switch_on(status: TaskStatus, git: &jgt_core::config::Git) -> bool {
-        match status {
-            TaskStatus::ToCommit => git.auto_commit,
-            TaskStatus::ToMerge => git.auto_merge,
-            TaskStatus::ToPush => git.auto_push,
-            _ => true,
-        }
+        git.switch(status)
     }
 
     /// The team's transition table (plan §1.4). `Err` names the gate that refuses the move.
@@ -515,13 +560,13 @@ impl Hub {
                 if let Err(why) = Self::review_passed(task, to) {
                     return refused(why);
                 }
-                for col in [ToCommit, ToMerge, ToPush] {
+                for col in TaskStatus::GIT_STAGES {
                     if col.index() > from.index() && col.index() < to.index() && !Self::is_git_switch_on(col, git) {
                         return refused(format!(
                             "{} waits in {} for the user's OK to {}",
                             task.key,
                             col.label(),
-                            col.git_step().unwrap_or("")
+                            git_step_words(col)
                         ));
                     }
                 }
@@ -531,13 +576,13 @@ impl Hub {
                 if !Self::is_git_switch_on(from, git) && (reason.is_none() || reason.unwrap().trim().is_empty()) {
                     return refused(format!("leaving {} needs the user's OK: quote it in reason", from.label()));
                 }
-                for col in [ToCommit, ToMerge, ToPush] {
+                for col in TaskStatus::GIT_STAGES {
                     if col.index() > from.index() && col.index() < to.index() && !Self::is_git_switch_on(col, git) {
                         return refused(format!(
                             "{} waits in {} for the user's OK to {}",
                             task.key,
                             col.label(),
-                            col.git_step().unwrap_or("")
+                            git_step_words(col)
                         ));
                     }
                 }
@@ -553,7 +598,11 @@ impl Hub {
     pub fn move_task(&self, id: &str, workspace: Option<&str>, req: &MoveTaskRequest) -> HubResult<MoveResponse> {
         let task = self.task(id, workspace)?;
         let actor = self.writer(&req.actor, &task.workspace)?;
-        let git = self.config().git;
+        // `policy` is what the user set; `git` is what this workspace can do of it: without a
+        // remote or without `gh`, the steps that need them count as OFF (the card waits there).
+        let policy = self.config().git;
+        let caps = if req.to.is_past_review() { git_caps(&task.workspace) } else { Default::default() };
+        let git = policy.effective(caps);
         let wip_limit = self.config().team.wip_limit(Path::new(&task.workspace));
         let reason = req.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
         let mut changes = Changes::default();
@@ -567,7 +616,7 @@ impl Hub {
             let from = task.status;
             from_status = from;
             let routed = actor != Actor::User && req.to == TaskStatus::Done && (from == TaskStatus::Review || from.is_git_stage());
-            let to = if routed { git.stop_after(from) } else { req.to };
+            let to = if routed { policy.stop_after(from, caps) } else { req.to };
             git_steps = git.steps_between(from, to).into_iter().map(String::from).collect();
             queued = to == TaskStatus::OnQueue && from != to;
             if from == to {
@@ -590,7 +639,8 @@ impl Hub {
             b.save(&task)?;
             b.place(&task.id, &task.workspace, to, req.position)?;
             let body = if routed && to != TaskStatus::Done {
-                let base = format!("routed to {}: auto-{} OFF", to.label(), to.git_step().unwrap_or(""));
+                let why = policy.stop_reason(to, caps).unwrap_or_default();
+                let base = format!("routed to {}: {why}", to.label());
                 match reason {
                     Some(r) => format!("{base}; {r}"),
                     None => base,
@@ -621,6 +671,8 @@ impl Hub {
         self.publish(changes);
         let before = from_status;
         let task = self.task(&task.id, None)?;
+        let branch = (!git_steps.is_empty() || task.status.is_git_stage()).then(|| policy.branch_name(&task.key, &task.title));
+        let on_branch = branch.as_deref().map(|b| format!(" Branch: {b}.")).unwrap_or_default();
         if task.status == TaskStatus::Done && before != TaskStatus::Done && actor != Actor::User {
             let extra = match &follow_up_task {
                 Some(f) => format!(" A {}-priority follow-up {} is in Backlog.", f.priority, f.key),
@@ -629,7 +681,7 @@ impl Hub {
             let steps = if git_steps.is_empty() {
                 "no git steps".to_string()
             } else {
-                git_steps.join(", ")
+                git_step_list(&git_steps)
             };
             let body = format!(
                 "{} \"{}\" is Done: tested, reviewed; {steps} per git policy.{extra}",
@@ -638,11 +690,16 @@ impl Hub {
             self.notify_task(&task, "success", &format!("{} is Done", task.key), &body)?;
         }
         if task.status.is_git_stage() && before != task.status {
-            let step = task.status.git_step().unwrap_or("");
+            let step = git_step_words(task.status);
             let title = format!("{} waits for your OK to {step}", task.key);
+            let cannot = match policy.stop_reason(task.status, caps) {
+                Some(why) if policy.switch(task.status) => format!(" The team cannot do it: {why}."),
+                _ => String::new(),
+            };
             let body = format!(
-                "\"{}\" is tested and reviewed. Move the card (or answer in chat) to OK the {step}.",
-                task.title
+                "\"{}\" is tested and reviewed. Move the card (or answer in chat) to OK {}.{on_branch}{cannot}",
+                task.title,
+                git_step_noun(task.status)
             );
             self.notify_task(&task, "warning", &title, &body)?;
         }
@@ -665,7 +722,7 @@ impl Hub {
             let steps = git.steps_between(before, task.status);
             if !steps.is_empty() {
                 let text = format!(
-                    "[jg-team-dev] The user moved {} from {} to {}: their OK to {}. Run them with the git-coder now.",
+                    "[jg-team-dev] The user moved {} from {} to {}: their OK to {}.{on_branch} Run them with the git-coder now.",
                     task.key,
                     before.label(),
                     task.status.label(),
@@ -678,7 +735,7 @@ impl Hub {
         } else {
             None
         };
-        Ok(MoveResponse { task, coordinator, queued, git_steps })
+        Ok(MoveResponse { task, coordinator, queued, git_steps, branch })
     }
 
     /// Posts a `notify` message in the Coordinator's chat for a task reaching Done or getting

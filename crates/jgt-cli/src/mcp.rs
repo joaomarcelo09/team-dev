@@ -100,7 +100,7 @@ pub struct TextArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TaskListArgs {
-    /// Only this column: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.
+    /// Only this column: backlog, on_queue, working, testing, review, to_commit, to_push, to_open_pr, to_merge or done.
     #[serde(default)]
     pub status: Option<String>,
     /// Include Done tasks (left out by default).
@@ -170,7 +170,7 @@ pub struct TaskUpdateArgs {
 pub struct TaskMoveArgs {
     /// The task key (JGT-12).
     pub key: String,
-    /// The column: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.
+    /// The column: backlog, on_queue, working, testing, review, to_commit, to_push, to_open_pr, to_merge or done.
     pub to: String,
     /// Why, for the task's activity log.
     #[serde(default)]
@@ -291,6 +291,9 @@ pub(crate) fn render_move(r: &MoveResponse) -> String {
     let mut out = render_change(&r.task);
     if !r.git_steps.is_empty() {
         out.push_str(&format!(" Run now: {}.", r.git_steps.join(", ")));
+    }
+    if let Some(branch) = &r.branch {
+        out.push_str(&format!(" Branch: {branch}."));
     }
     out
 }
@@ -494,7 +497,7 @@ impl JgtMcp {
     }
 
     #[tool(description = "List this folder's Board in column order (Done left out unless include_done). \
-        Filter with status: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.")]
+        Filter with status: backlog, on_queue, working, testing, review, to_commit, to_push, to_open_pr, to_merge or done.")]
     async fn task_list(&self, Parameters(args): Parameters<TaskListArgs>) -> Result<CallToolResult, McpError> {
         let (_, workspace) = match self.board(args.jgt_session.as_deref()).await {
             Ok(b) => b,
@@ -595,7 +598,9 @@ impl JgtMcp {
     }
 
     #[tool(description = "Coordinator only. Move a task to another column: backlog, on_queue, working, \
-        testing, review, to_commit, to_merge, to_push or done (done from Review is routed by git policy). \
+        testing, review, to_commit, to_push, to_open_pr, to_merge or done (done from Review is routed by git policy: \
+        the card stops in the column of the first git step that is OFF). The answer lists the git steps to run now \
+        (commit, push, open_pr, merge_pr) and the task's branch. \
         The hub checks the gates; a refusal is final, so report it. \
         Review->Done: Done is accepted for an approved review at any round, and for a review with changes \
         only when no fix round is left; the hub files a follow-up in Backlog with a priority it sets itself.")]
@@ -723,21 +728,36 @@ mod tests {
 
     #[test]
     fn render_move_shows_git_steps() {
-        let a = Task::new("/w", 1, "fix navbar", TaskStatus::ToMerge);
+        let a = Task::new("/w", 1, "fix navbar", TaskStatus::ToPush);
         let mut r = MoveResponse {
             task: a,
             coordinator: None,
             queued: false,
             git_steps: Vec::new(),
+            branch: None,
         };
-        assert_eq!(render_move(&r), "JGT-1 is in To merge.");
+        assert_eq!(render_move(&r), "JGT-1 is in To push.");
 
         r.git_steps = vec!["commit".into()];
-        assert_eq!(render_move(&r), "JGT-1 is in To merge. Run now: commit.");
+        assert_eq!(render_move(&r), "JGT-1 is in To push. Run now: commit.");
 
-        r.task.status = TaskStatus::ToPush;
-        r.git_steps = vec!["commit".into(), "merge".into()];
-        assert_eq!(render_move(&r), "JGT-1 is in To push. Run now: commit, merge.");
+        r.task.status = TaskStatus::ToMerge;
+        r.git_steps = vec!["commit".into(), "push".into(), "open_pr".into()];
+        r.branch = Some("feat/jgt-1-fix-navbar".into());
+        assert_eq!(
+            render_move(&r),
+            "JGT-1 is in To merge. Run now: commit, push, open_pr. Branch: feat/jgt-1-fix-navbar."
+        );
+
+        // Waiting in a git column with nothing to run: the branch is still named.
+        r.task.status = TaskStatus::ToCommit;
+        r.git_steps.clear();
+        assert_eq!(render_move(&r), "JGT-1 is in To commit. Branch: feat/jgt-1-fix-navbar.");
+
+        // An answer from an older hub has no branch.
+        let old: MoveResponse =
+            serde_json::from_value(serde_json::json!({ "task": r.task, "git_steps": ["commit"] })).unwrap();
+        assert_eq!(old.branch, None);
     }
 
     #[test]
@@ -746,17 +766,19 @@ mod tests {
             Task::new("/w", 1, "backlog task", TaskStatus::Backlog),
             Task::new("/w", 2, "review task", TaskStatus::Review),
             Task::new("/w", 3, "commit task", TaskStatus::ToCommit),
-            Task::new("/w", 4, "merge task", TaskStatus::ToMerge),
-            Task::new("/w", 5, "push task", TaskStatus::ToPush),
+            Task::new("/w", 4, "push task", TaskStatus::ToPush),
+            Task::new("/w", 5, "pr task", TaskStatus::ToOpenPr),
+            Task::new("/w", 7, "merge task", TaskStatus::ToMerge),
             Task::new("/w", 6, "done task", TaskStatus::Done),
         ];
 
         // Without filter (status = None, include_done = false), only Done is left out
         let default_view: Vec<&Task> = tasks.iter().filter(|t| t.status != TaskStatus::Done).collect();
-        assert_eq!(default_view.len(), 5);
+        assert_eq!(default_view.len(), 6);
         assert!(default_view.iter().any(|t| t.status == TaskStatus::ToCommit));
         assert!(default_view.iter().any(|t| t.status == TaskStatus::ToMerge));
         assert!(default_view.iter().any(|t| t.status == TaskStatus::ToPush));
+        assert!(default_view.iter().any(|t| t.status == TaskStatus::ToOpenPr));
         assert!(!default_view.iter().any(|t| t.status == TaskStatus::Done));
 
         // Filter by to_commit
@@ -770,6 +792,12 @@ mod tests {
         let alias_view: Vec<&Task> = tasks.iter().filter(|t| t.status == alias_commit).collect();
         assert_eq!(alias_view.len(), 1);
         assert_eq!(alias_view[0].key, "JGT-3");
+
+        // Filter using alias "pr"
+        let alias_pr = parse_column("pr").unwrap();
+        let pr_view: Vec<&Task> = tasks.iter().filter(|t| t.status == alias_pr).collect();
+        assert_eq!(pr_view.len(), 1);
+        assert_eq!(pr_view[0].key, "JGT-5");
     }
 
     #[test]
@@ -778,13 +806,13 @@ mod tests {
         let move_tool = tools.iter().find(|t| t.name == "task_move").expect("task_move tool");
         let desc = move_tool.description.as_deref().unwrap_or("");
         assert!(desc.contains("done from Review is routed by git policy"), "{desc}");
-        for col in ["backlog", "on_queue", "working", "testing", "review", "to_commit", "to_merge", "to_push", "done"] {
+        for col in ["backlog", "on_queue", "working", "testing", "review", "to_commit", "to_push", "to_open_pr", "to_merge", "done"] {
             assert!(desc.contains(col), "task_move description missing {col}: {desc}");
         }
 
         let list_tool = tools.iter().find(|t| t.name == "task_list").expect("task_list tool");
         let desc = list_tool.description.as_deref().unwrap_or("");
-        for col in ["backlog", "on_queue", "working", "testing", "review", "to_commit", "to_merge", "to_push", "done"] {
+        for col in ["backlog", "on_queue", "working", "testing", "review", "to_commit", "to_push", "to_open_pr", "to_merge", "done"] {
             assert!(desc.contains(col), "task_list description missing {col}: {desc}");
         }
     }
