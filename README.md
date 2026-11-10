@@ -154,8 +154,8 @@ effort = "medium"
 
 [team.skills.coder]
 harness = "antigravity"           # Google Antigravity (`agy`)
-model = "gemini-3.8-flash-high"   # Gemini 3.8 Flash, as `agy models` names it
-effort = "high"
+model = "gemini-3.8-flash-medium" # Gemini 3.8 Flash, as `agy models` names it
+effort = "medium"
 # permission_mode = "bypassPermissions"  # agy --dangerously-skip-permissions: see below
 allowed_tools = ["Bash(cargo test:*)"]   # claude --allowedTools (Claude Code only)
 disallowed_tools = ["WebFetch"]          # claude --disallowedTools (Claude Code only)

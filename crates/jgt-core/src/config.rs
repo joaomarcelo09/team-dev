@@ -153,7 +153,7 @@ pub fn role_defaults(role: &str) -> SkillSettings {
                 model: Some("sonnet".into()),
                 effort: Some("medium".into()),
             }),
-            ..set(Some("antigravity"), "gemini-3.8-flash-high", "high")
+            ..set(Some("antigravity"), "gemini-3.8-flash-medium", "medium")
         },
         "reviewer" => set(Some("claude-code"), "opus", "medium"),
         "git-coder" => set(Some("claude-code"), "sonnet", "low"),
@@ -207,7 +207,7 @@ impl SessionSettings {
         Some(SessionSettings { harness: f.harness, model: f.model.clone(), effort: f.effort.clone(), fallback: None, ..self.clone() })
     }
 
-    /// `coder · Antigravity · gemini-3.8-flash-high · high`, for chat headers and logs.
+    /// `coder · Antigravity · gemini-3.8-flash-medium · medium`, for chat headers and logs.
     pub fn describe(&self, role: &str) -> String {
         format!("{role} · {} · {} · {}", self.harness.label(), self.model, self.effort)
     }
@@ -869,7 +869,7 @@ mod tests {
         let none = ProjectTeam::default();
         let get = |role: &str| team.resolve(role, &none).0;
         let coder = get("coder");
-        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-medium · medium");
         let fallback = coder.on_fallback().unwrap();
         assert_eq!(fallback.describe("coder"), "coder · Claude Code · sonnet · medium");
         assert_eq!(get(COORDINATOR).describe("c"), "c · Claude Code · opus · medium");
@@ -886,7 +886,7 @@ mod tests {
         // `[team]` is below the role default: the coder stays on Antigravity with the agy model.
         let user: Config = toml::from_str("[team]\nmodel = \"opus\"\neffort = \"low\"\n").unwrap();
         let coder = user.team.resolve("coder", &none).0;
-        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-medium · medium");
         // Without agy the role's fallback is taken whole, not mixed with `[team]`.
         assert_eq!(coder.on_fallback().unwrap().describe("coder"), "coder · Claude Code · sonnet · medium");
         assert_eq!(user.team.resolve("git-coder", &none).0.describe("g"), "g · Claude Code · sonnet · low");
@@ -1021,7 +1021,7 @@ mod tests {
 
         let cfg = Config::default();
         let coder = cfg.team.for_skill("coder", &root);
-        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+        assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-medium · medium");
 
         let coord = cfg.team.for_skill(COORDINATOR, &root);
         assert_eq!(coord.describe(COORDINATOR), "coordinator · Claude Code · opus · medium");
@@ -1138,7 +1138,7 @@ mod tests {
 
         let desc = resolved.describe();
         assert!(desc.starts_with("Agents: coordinator · Claude Code · opus · medium, planner · "));
-        assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-high · high"));
+        assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-medium · medium"));
 
         resolved.write(&root).unwrap();
         let loaded = TeamAgents::load(&root).unwrap();
