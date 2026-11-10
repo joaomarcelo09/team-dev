@@ -986,7 +986,7 @@ mod tests {
         config.team.model = "opus".into();
         let coder = config.team.for_skill_checked("coder", Path::new("/nonexistent"));
         let (s, _) = pick_settings(coder.clone(), "coder", None, None, |_| Ok(())).unwrap();
-        assert_eq!(s.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+        assert_eq!(s.describe("coder"), "coder · Antigravity · gemini-3.8-flash-medium · medium");
         let no_agy = |h: Harness| if h == Harness::Antigravity { Err("agy is missing".to_string()) } else { Ok(()) };
         let (s, _) = pick_settings(coder, "coder", None, None, no_agy).unwrap();
         assert_eq!(s.describe("coder"), "coder · Claude Code · sonnet · medium");

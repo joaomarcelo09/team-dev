@@ -910,7 +910,7 @@ mod tests {
 
         let desc = agents.describe();
         assert!(desc.starts_with("Agents: coordinator · Claude Code · opus · medium"));
-        assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-high · high"));
+        assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-medium · medium"));
 
         // Modifying config afterwards does not affect worker settings in this folder:
         let mut modified = config.clone();
@@ -924,8 +924,8 @@ mod tests {
         );
 
         let (settings, _) = modified.team.for_skill_checked("coder", &dir);
-        // Still the saved gemini-3.8-flash-high / high on Antigravity:
-        assert_eq!(settings.describe("coder"), "coder · Antigravity · gemini-3.8-flash-high · high");
+        // Still the saved gemini-3.8-flash-medium / medium on Antigravity:
+        assert_eq!(settings.describe("coder"), "coder · Antigravity · gemini-3.8-flash-medium · medium");
 
         // CLI flags --model and --effort still override (when Antigravity is installed):
         if let Ok((settings, _)) = crate::workers::worker_settings(&modified, "coder", &dir, Some("custom-model"), Some("low"))

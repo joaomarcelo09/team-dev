@@ -24,7 +24,7 @@ pub struct AgentSetting {
 pub type AgentSettings = AgentSetting;
 
 impl AgentSetting {
-    /// `coder · Antigravity · gemini-3.8-flash-high · high`, matching `SessionSettings::describe`.
+    /// `coder · Antigravity · gemini-3.8-flash-medium · medium`, matching `SessionSettings::describe`.
     pub fn describe(&self, role: &str) -> String {
         format!("{role} · {} · {} · {}", self.harness.label(), self.model, self.effort)
     }

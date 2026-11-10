@@ -259,7 +259,7 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
         assert!(prompt.contains("short recap of the steps"), "{prompt}");
         assert_eq!(
             plan.args[2..],
-            ["--output-format", "json", "--model", "gemini-3.8-flash-high", "--effort", "high", "--mode", "auto", "--print-timeout", "2h"]
+            ["--output-format", "json", "--model", "gemini-3.8-flash-medium", "--effort", "medium", "--mode", "auto", "--print-timeout", "2h"]
         );
         assert_eq!(plan.path_prepend.as_deref(), Some(Path::new("/home/u/.local/bin")));
         let _ = std::fs::remove_dir_all(&files);
