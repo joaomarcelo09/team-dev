@@ -17,8 +17,6 @@ The app, its hub and its data run on your machine; the agents use Claude Code or
 you ⇄ jg-team-dev app ⇄ jg-team-dev-hub (SQLite, unix socket) ⇄ MCP + hooks ⇄ Coordinator ─ claude -p ─▶ workers
 ```
 
-Product requirements: [PRD — jg-team-dev](https://claude.ai/code/artifact/06b0ae58-d1b1-414b-9d9e-57b3258b0483).
-
 The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an MCP server, session hooks, and an iced desktop application (`jg-team-dev-desktop`). The system operates with its own unix socket, SQLite database, and configuration, and passes its hooks to sessions with `--settings` instead of modifying `~/.claude/settings.json`.
 
 ## Features
