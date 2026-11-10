@@ -4,6 +4,9 @@ mod app;
 mod board;
 mod hub;
 mod icons;
+mod ide;
+mod ide_git;
+mod ide_view;
 mod style;
 mod view;
 

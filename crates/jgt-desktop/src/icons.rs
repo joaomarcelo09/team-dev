@@ -59,6 +59,8 @@ pub enum Icon {
     ArrowUpward,
     /// Arrow downward (`arrow_downward`, U+E5DB)
     ArrowDownward,
+    /// Lock icon for secret files (`lock`, U+E897)
+    Lock,
 }
 
 impl Icon {
@@ -83,6 +85,7 @@ impl Icon {
         Icon::Folder,
         Icon::ArrowUpward,
         Icon::ArrowDownward,
+        Icon::Lock,
     ];
 
     /// Unicode code point for this icon in the Private Use Area.
@@ -109,6 +112,7 @@ impl Icon {
             Icon::Folder => '\u{e2c7}',
             Icon::ArrowUpward => '\u{e5d8}',
             Icon::ArrowDownward => '\u{e5db}',
+            Icon::Lock => '\u{e897}',
         }
     }
 
@@ -142,6 +146,7 @@ impl Icon {
             Icon::Folder => "\u{e2c7}",
             Icon::ArrowUpward => "\u{e5d8}",
             Icon::ArrowDownward => "\u{e5db}",
+            Icon::Lock => "\u{e897}",
         }
     }
 }

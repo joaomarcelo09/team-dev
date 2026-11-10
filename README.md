@@ -239,6 +239,25 @@ runs without one. `jg-team-dev worker … --model <m> --effort <e>` overrides on
 Settings apply when a team starts (saved in `.team/agents.json` when the Coordinator starts);
 editing `config.toml` afterwards does not change a running team.
 
+## IDE tab
+
+The desktop app includes an **IDE** module (in the sidebar below Board, or opened via the **Open in IDE** button on a task panel) for viewing project files and worktree changes:
+
+- **Read-only viewer**: displays highlighted file contents with line numbers. There is no editing, saving, or code execution.
+- **Source selector**: choose between `main` (the committed `main` branch from git, reflecting committed state) and any task worktree under `.team/worktrees/` (showing working tree files, including uncommitted coder changes).
+- **Picker on the right**: directory tree on the right side of the view, sorted folders-first and lazily expanded.
+- **M/A/D marks and "Changed only"**: worktree files display badges for Modified (`M`), Added (`A`), Deleted (`D`), and Renamed (`R`) changes relative to the merge base with `main`. A **Changed only** checkbox filters the tree to only show files with changes.
+- **File | Diff toggle**: for changed files, toggle between the full file text and the unified diff view with colored additions and deletions. Deleted files show the diff view directly.
+- **Limits and safety**:
+  - File size cap: 1 MB (`File too large to show`).
+  - Binary files (NUL byte in the first 8 KB or invalid UTF-8) are refused (`Binary file`).
+  - Directory listings are capped at 20,000 entries (`Listing truncated`).
+  - Diff output capped at 1 MB / 20,000 lines.
+  - Automatically skipped folders: `.git`, `target`, `node_modules`, `.team`.
+  - Secret files (`.env`, `.env.*` except `.env.example`, `.env.sample`, `.env.template`; `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*.p12`, `.npmrc`, `.pypirc`) are listed with a lock icon, and their contents and diffs are never read or shown (`Secret file: not shown`).
+  - Symlinks are not followed (`Symlink: not followed`), and path traversal (`..` components or paths escaping the root) is rejected.
+- **Refresh button**: reloads sources and file listings manually on demand; there is no auto-refresh or background file watching.
+
 ## Installation
 
 ### From AUR (Arch Linux)

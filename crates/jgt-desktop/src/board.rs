@@ -606,16 +606,30 @@ fn section<'a>(label: &'a str) -> Element<'a, Msg> {
 
 fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
-    let mut col = column![
-        row![
-            text(task.key.as_str()).size(style::fs(13)).font(bold()),
-            muted(format!("· {}", task.status.label())).size(style::fs(12)),
-            space::horizontal(),
-            button(text("Close").size(style::fs(12))).on_press(Msg::CloseTask).style(style::ghost).padding([2, 8]),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center),
+    let mut header = row![
+        text(task.key.as_str()).size(style::fs(13)).font(bold()),
+        muted(format!("· {}", task.status.label())).size(style::fs(12)),
+        space::horizontal(),
     ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    if crate::ide::source_for_task(&app.ide.sources, &task.key).is_some() {
+        header = header.push(
+            button(text("Open in IDE").size(style::fs(12)))
+                .on_press(Msg::OpenInIde(task.key.clone()))
+                .style(style::ghost)
+                .padding([2, 8]),
+        );
+    }
+    header = header.push(
+        button(text("Close").size(style::fs(12)))
+            .on_press(Msg::CloseTask)
+            .style(style::ghost)
+            .padding([2, 8]),
+    );
+
+    let mut col = column![header]
     .spacing(12)
     // Room on the right for the scrollbar.
     .padding(Padding { top: 14.0, right: 24.0, bottom: 14.0, left: 16.0 });
@@ -1328,5 +1342,45 @@ mod tests {
         // Done column is ordered by date, manual reorder disabled
         assert!(reorder_msg("t4", Done, 0, 3).is_none());
         assert!(reorder_msg("t5", Done, 1, 3).is_none());
+    }
+
+    #[test]
+    fn test_task_panel_open_in_ide_button() {
+        let (mut app, _) = App::new(None);
+        let t = task(34, TaskStatus::Working, 0);
+        let theme = Theme::Dark;
+
+        // Without matching worktree: source_for_task is None
+        assert!(crate::ide::source_for_task(&app.ide.sources, &t.key).is_none());
+        {
+            let _without_wt = task_panel(&app, &t, &theme);
+        }
+
+        // With matching worktree: source_for_task is Some
+        app.ide.sources = vec![
+            crate::ide::Source {
+                label: "Main".to_string(),
+                root: std::path::PathBuf::from("/repo"),
+                kind: crate::ide::SourceKind::Main,
+            },
+            crate::ide::Source {
+                label: "jgt-34".to_string(),
+                root: std::path::PathBuf::from("/repo/.team/worktrees/jgt-34"),
+                kind: crate::ide::SourceKind::Worktree {
+                    branch: "jgt/jgt-34".to_string(),
+                },
+            },
+        ];
+        assert!(crate::ide::source_for_task(&app.ide.sources, &t.key).is_some());
+        {
+            let _with_wt = task_panel(&app, &t, &theme);
+        }
+
+        // Another task without worktree: None
+        let t99 = task(99, TaskStatus::Working, 0);
+        assert!(crate::ide::source_for_task(&app.ide.sources, &t99.key).is_none());
+        {
+            let _other_task = task_panel(&app, &t99, &theme);
+        }
     }
 }
