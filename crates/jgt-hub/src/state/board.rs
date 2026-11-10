@@ -31,6 +31,12 @@ pub const ARCHIVE_AFTER_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// How long after a usage limit resets the hub wakes the Coordinator to resume (PRD E7).
 pub const RESUME_AFTER_MS: i64 = 2 * 60 * 1000;
 
+/// How long a task sits in Working, Testing or Review with no worker running before the hub pings the Coordinator.
+pub const STALLED_AFTER_MS: i64 = 10 * 60 * 1000;
+
+/// How long before re-pinging a stalled card that has not changed.
+pub const STALLED_REPING_AFTER_MS: i64 = 30 * 60 * 1000;
+
 /// `meta.usage_limit` of a `worker_finished` event: (resets, until, resume brief path).
 fn usage_limit(meta: &serde_json::Value) -> Option<(String, Option<i64>, Option<String>)> {
     let limit = meta.get("usage_limit").filter(|l| l.is_object())?;
@@ -1108,6 +1114,86 @@ impl Hub {
                 && !wake.iter().any(|w| w.id == c.id)
             {
                 wake.push(c);
+            }
+        }
+        Ok(wake)
+    }
+
+    /// Finds tasks in Working, Testing or Review with no worker running and pings their Coordinator.
+    pub fn check_stalled_tasks(&self) -> HubResult<Vec<Session>> {
+        self.check_stalled_tasks_at(now_ms(), STALLED_AFTER_MS)
+    }
+
+    /// Finds tasks in Working, Testing or Review with no worker running whose last activity is older
+    /// than `stalled_after_ms`, and pings their Coordinator. Threshold and time are parameterized
+    /// for tests.
+    pub fn check_stalled_tasks_at(
+        &self,
+        now: i64,
+        stalled_after_ms: i64,
+    ) -> HubResult<Vec<Session>> {
+        let tasks = self.db.board(|b| b.in_progress_tasks())?;
+        let stalled: Vec<(Task, i64)> = tasks
+            .into_iter()
+            .filter(|(t, last_activity)| {
+                t.current_worker.is_none()
+                    && t.waiting.is_none()
+                    && !t.archived
+                    && *last_activity + stalled_after_ms <= now
+            })
+            .collect();
+
+        let mut to_ping = vec![];
+        {
+            let mut reminders = self
+                .stalled_reminders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let stalled_ids: std::collections::HashSet<&str> =
+                stalled.iter().map(|(t, _)| t.id.as_str()).collect();
+            reminders.retain(|k, _| {
+                k.rsplit_once(':')
+                    .map(|(id, _)| stalled_ids.contains(id))
+                    .unwrap_or(false)
+            });
+            for (task, last_activity) in stalled {
+                let key = format!("{}:{last_activity}", task.id);
+                if let Some(&last_ping) = reminders.get(&key)
+                    && now < last_ping + STALLED_REPING_AFTER_MS
+                {
+                    continue;
+                }
+                to_ping.push((task, last_activity));
+            }
+        }
+
+        let mut wake: Vec<Session> = vec![];
+        for (task, last_activity) in to_ping {
+            if self.db.current_coordinator(&task.workspace)?.is_none() {
+                continue;
+            }
+            let minutes = ((now - last_activity).max(0) / (60 * 1000)).max(1);
+            let text = format!(
+                "[jg-team-dev] Task {} \"{}\" has sat in {} for {minutes} min with no worker running. \
+                 Take the next step of the flow now (test_result → review → reviewer → review_result → Done → git-coder), \
+                 or tell the user what blocks it.",
+                task.key,
+                task.title,
+                task.status.label()
+            );
+            if let Some(c) = self.tell_coordinator(&task, &text)?
+                && !wake.iter().any(|w| w.id == c.id)
+            {
+                wake.push(c);
+            }
+            {
+                let mut reminders = self
+                    .stalled_reminders
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let prefix = format!("{}:", task.id);
+                reminders.retain(|k, _| !k.starts_with(&prefix));
+                reminders.insert(format!("{}:{last_activity}", task.id), now);
             }
         }
         Ok(wake)

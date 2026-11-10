@@ -993,7 +993,7 @@ pub struct NewTask<'a> {
 
 /// Board queries inside one transaction (see `Db::board`).
 pub struct Board<'a> {
-    c: &'a Connection,
+    pub(crate) c: &'a Connection,
 }
 
 impl Board<'_> {
@@ -1222,6 +1222,16 @@ impl Board<'_> {
             .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         ids.iter().filter_map(|id| self.task(id).transpose()).collect()
+    }
+
+    /// Tasks in Working, Testing or Review across all workspaces with each task's last activity timestamp.
+    pub fn in_progress_tasks(&self) -> rusqlite::Result<Vec<(Task, i64)>> {
+        let mut stmt = self.c.prepare(&format!(
+            "SELECT {TASK_COLUMNS}, MAX(t.updated_at, COALESCE((SELECT MAX(e.created_at) FROM task_events e WHERE e.task_id = t.id), 0))
+             FROM tasks t WHERE t.status IN ('working', 'testing', 'review') AND t.archived = 0"
+        ))?;
+        stmt.query_map([], |row| Ok((task_from_row(row)?, row.get(22)?)))?
+            .collect()
     }
 
     /// Whether a K8 decision taking the task away from the team (take over, stop) was made.

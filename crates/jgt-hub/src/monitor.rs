@@ -22,15 +22,19 @@ pub fn start(hub: SharedHub) {
 fn check(hub: &SharedHub, slow: bool) -> Result<(), crate::state::HubError> {
     for session in hub.db.connected_sessions()? {
         if let Some(pid) = session.pid
-            && !procs::is_alive(pid, session.pid_start) {
-                tracing::info!("session {} lost its process {pid}", session.id);
-                hub.mark_disconnected(&session, "process exited")?;
-            }
+            && !procs::is_alive(pid, session.pid_start)
+        {
+            tracing::info!("session {} lost its process {pid}", session.id);
+            hub.mark_disconnected(&session, "process exited")?;
+        }
     }
     if slow {
         for session in hub.db.sessions_with_status(SessionStatus::Disconnected)? {
             let gone = session.harness == Harness::ClaudeCode
-                && session.transcript_path.as_deref().is_some_and(|p| !std::path::Path::new(p).exists());
+                && session
+                    .transcript_path
+                    .as_deref()
+                    .is_some_and(|p| !std::path::Path::new(p).exists());
             if gone {
                 hub.mark_ended(&session, "transcript deleted")?;
             }
@@ -39,13 +43,16 @@ fn check(hub: &SharedHub, slow: bool) -> Result<(), crate::state::HubError> {
         for coordinator in hub.resume_usage_limits()? {
             wake(coordinator);
         }
+        for coordinator in hub.check_stalled_tasks()? {
+            wake(coordinator);
+        }
     }
     hub.expire_questions()?;
     hub.check_reconnects()?;
     Ok(())
 }
 
-/// Wakes a sleeping Coordinator after a usage limit reset (E7). The one place the hub starts an
+/// Wakes a sleeping Coordinator after a usage-limit reset or a stalled card. The one place the hub starts an
 /// agent: no app or CLI is there to do it at the reset time. It runs the same reconnect plan the
 /// app would, in the background; the queued message reaches the Coordinator either way.
 fn wake(session: jgt_core::Session) {
@@ -54,9 +61,17 @@ fn wake(session: jgt_core::Session) {
     }
     tokio::spawn(async move {
         let client = jgt_core::HubClient::default();
-        match jgt_core::launch::reconnect(&client, &session, jgt_core::ReconnectMode::Background).await {
-            Ok(started) => tracing::info!("woke {} after the usage limit: {started}", session.id),
-            Err(e) => tracing::warn!("could not wake {} after the usage limit: {e}", session.id),
+        match jgt_core::launch::reconnect(&client, &session, jgt_core::ReconnectMode::Background)
+            .await
+        {
+            Ok(started) => tracing::info!(
+                "woke {} after a usage-limit reset or a stalled card: {started}",
+                session.id
+            ),
+            Err(e) => tracing::warn!(
+                "could not wake {} after a usage-limit reset or a stalled card: {e}",
+                session.id
+            ),
         }
     });
 }

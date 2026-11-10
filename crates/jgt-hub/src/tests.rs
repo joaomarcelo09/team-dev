@@ -2240,6 +2240,360 @@ mod board {
     }
 
     #[test]
+    fn stalled_card_gets_one_ping_and_repinged_only_when_changed_or_after_window() {
+        use crate::state::board::STALLED_AFTER_MS;
+
+        let t = team();
+        let task = t.working("stalled feature");
+        let initial_updated = t
+            .events(&task)
+            .iter()
+            .map(|e| e.created_at)
+            .max()
+            .unwrap_or(0)
+            .max(t.get(&task).updated_at);
+        let before = inbox(&t.hub, &t.coord).len();
+
+        // Fresh card is not pinged.
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(initial_updated + 5 * 60 * 1000, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before);
+
+        // Stalled card (10 min old) gets one ping.
+        let now = initial_updated + 10 * 60 * 1000;
+        let wake = t.hub.check_stalled_tasks_at(now, STALLED_AFTER_MS).unwrap();
+        assert_eq!(wake.len(), 1);
+        assert_eq!(wake[0].id, t.coord.id);
+
+        let msgs = inbox(&t.hub, &t.coord);
+        assert_eq!(msgs.len(), before + 1);
+        let expected_msg = format!(
+            "[jg-team-dev] Task {} \"stalled feature\" has sat in Working for 10 min with no worker running. \
+             Take the next step of the flow now (test_result → review → reviewer → review_result → Done → git-coder), \
+             or tell the user what blocks it.",
+            task.key
+        );
+        let ping1 = msgs.last().unwrap();
+        assert_eq!(ping1.body, expected_msg);
+        assert_eq!(ping1.meta.get("relay_from"), Some(&serde_json::Value::Null));
+        assert_eq!(ping1.meta["task_id"], task.id.as_str());
+
+        // Not re-pinged on the next tick.
+        let next_tick = now + 3000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(next_tick, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before + 1);
+
+        // Re-pinged after 30 minutes without changing.
+        let later = now + 30 * 60 * 1000;
+        let wake_later = t
+            .hub
+            .check_stalled_tasks_at(later, STALLED_AFTER_MS)
+            .unwrap();
+        assert_eq!(wake_later.len(), 1);
+        let msgs_later = inbox(&t.hub, &t.coord);
+        assert_eq!(msgs_later.len(), before + 2);
+        assert!(
+            msgs_later
+                .last()
+                .unwrap()
+                .body
+                .contains("has sat in Working for 40 min with no worker running")
+        );
+
+        // Card with a running worker is not pinged.
+        let coder = session(&t.hub, "coder", "coder", WS, Some(&t.coord.id));
+        t.hub
+            .add_task_event(
+                &task.id,
+                None,
+                &TaskEventRequest {
+                    actor: t.coordinator(),
+                    kind: TaskEventKind::WorkerStarted,
+                    body: String::new(),
+                    meta: serde_json::json!({ "worker": coder.id.clone(), "skill": "coder" }),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            t.get(&task).current_worker.as_deref(),
+            Some(coder.id.as_str())
+        );
+        let worker_now = later + 35 * 60 * 1000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(worker_now, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before + 2);
+
+        // Card with waiting is not pinged.
+        t.hub
+            .add_task_event(
+                &task.id,
+                None,
+                &TaskEventRequest {
+                    actor: as_session(&coder),
+                    kind: TaskEventKind::WorkerFinished,
+                    body: String::new(),
+                    meta: serde_json::json!({ "worker": coder.id.clone() }),
+                },
+            )
+            .unwrap();
+        assert_eq!(t.get(&task).current_worker, None);
+
+        let mut req = PatchTaskRequest::new(t.coordinator());
+        req.waiting = Some(Some(WaitingInput {
+            reason: "waiting on input".into(),
+            question_id: None,
+        }));
+        t.hub.patch_task(&task.id, None, &req).unwrap();
+        assert!(t.get(&task).waiting.is_some());
+
+        let waiting_now = worker_now + 35 * 60 * 1000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(waiting_now, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before + 2);
+
+        // Clearing waiting and letting it stall pings again.
+        let mut clear_req = PatchTaskRequest::new(t.coordinator());
+        clear_req.waiting = Some(None);
+        t.hub.patch_task(&task.id, None, &clear_req).unwrap();
+        assert!(t.get(&task).waiting.is_none());
+
+        let cleared_updated = t
+            .events(&task)
+            .iter()
+            .map(|e| e.created_at)
+            .max()
+            .unwrap_or(0)
+            .max(t.get(&task).updated_at);
+        let fresh_after_clear = cleared_updated + 5 * 60 * 1000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(fresh_after_clear, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before + 2);
+
+        let stalled_again = cleared_updated + 10 * 60 * 1000;
+        let wake_again = t
+            .hub
+            .check_stalled_tasks_at(stalled_again, STALLED_AFTER_MS)
+            .unwrap();
+        assert_eq!(wake_again.len(), 1);
+        let msgs_again = inbox(&t.hub, &t.coord);
+        assert_eq!(msgs_again.len(), before + 3);
+    }
+
+    #[test]
+    fn stalled_card_long_worker_measured_from_finish_not_card_update() {
+        use crate::state::board::STALLED_AFTER_MS;
+
+        let t = team();
+        let task = t.working("long worker feature");
+        let t0 = t.get(&task).updated_at;
+        let before = inbox(&t.hub, &t.coord).len();
+
+        let coder = session(&t.hub, "coder", "coder", WS, Some(&t.coord.id));
+        let ev_start = t
+            .hub
+            .add_task_event(
+                &task.id,
+                None,
+                &TaskEventRequest {
+                    actor: t.coordinator(),
+                    kind: TaskEventKind::WorkerStarted,
+                    body: String::new(),
+                    meta: serde_json::json!({ "worker": coder.id.clone(), "skill": "coder" }),
+                },
+            )
+            .unwrap();
+        t.hub
+            .db
+            .board::<_, rusqlite::Error>(|b| {
+                b.c.execute(
+                    "UPDATE task_events SET created_at = ?1 WHERE id = ?2",
+                    rusqlite::params![t0, ev_start.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // Worker finishes after 15 minutes (> threshold of 10 min).
+        let t_finish = t0 + 15 * 60 * 1000;
+        let ev_finish = t
+            .hub
+            .add_task_event(
+                &task.id,
+                None,
+                &TaskEventRequest {
+                    actor: as_session(&coder),
+                    kind: TaskEventKind::WorkerFinished,
+                    body: String::new(),
+                    meta: serde_json::json!({ "worker": coder.id.clone() }),
+                },
+            )
+            .unwrap();
+        t.hub
+            .db
+            .board::<_, rusqlite::Error>(|b| {
+                b.c.execute(
+                    "UPDATE task_events SET created_at = ?1 WHERE id = ?2",
+                    rusqlite::params![t_finish, ev_finish.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        // 30 seconds after worker finished, the card's updated_at is 15.5 min old,
+        // but last activity (the finish event) was only 30s ago -> no ping!
+        let tick_after_finish = t_finish + 30 * 1000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(tick_after_finish, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before);
+
+        // 5 minutes after finish -> still within threshold -> no ping.
+        let five_min_after_finish = t_finish + 5 * 60 * 1000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(five_min_after_finish, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before);
+
+        // 10 minutes (threshold) after finish -> exactly one ping.
+        let stalled_now = t_finish + STALLED_AFTER_MS;
+        let wake = t
+            .hub
+            .check_stalled_tasks_at(stalled_now, STALLED_AFTER_MS)
+            .unwrap();
+        assert_eq!(wake.len(), 1);
+        assert_eq!(wake[0].id, t.coord.id);
+        let msgs = inbox(&t.hub, &t.coord);
+        assert_eq!(msgs.len(), before + 1);
+        assert!(
+            msgs.last()
+                .unwrap()
+                .body
+                .contains("has sat in Working for 10 min with no worker running")
+        );
+
+        // Next tick: not re-pinged.
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(stalled_now + 3000, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before + 1);
+    }
+
+    #[test]
+    fn stalled_card_excludes_done_archived_and_git_columns() {
+        use crate::state::board::STALLED_AFTER_MS;
+
+        let t = team();
+        let done = t.create(ActorRequest::User, "done task", None).unwrap();
+        t.user_move(&done, Done);
+
+        let archived = t.working("archived task");
+        t.hub
+            .db
+            .board::<_, rusqlite::Error>(|b| b.archive(&archived.id))
+            .unwrap();
+
+        let git = t.create(ActorRequest::User, "git task", None).unwrap();
+        t.user_move(&git, ToCommit);
+
+        let before = inbox(&t.hub, &t.coord).len();
+        let future = jgt_core::now_ms() + 100 * 60 * 1000;
+        assert!(
+            t.hub
+                .check_stalled_tasks_at(future, STALLED_AFTER_MS)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before);
+    }
+
+    #[test]
+    fn stalled_cards_deduplicate_coordinator_in_wake_list() {
+        use crate::state::board::STALLED_AFTER_MS;
+
+        let t = team();
+        let mut config = t.hub.config();
+        config.team.wip_limit = 2;
+        *t.hub.config.write().unwrap() = config;
+
+        let task1 = t.working("task 1");
+        let task2 = t.working("task 2");
+        let t_max = t
+            .events(&task1)
+            .iter()
+            .chain(t.events(&task2).iter())
+            .map(|e| e.created_at)
+            .max()
+            .unwrap_or(0)
+            .max(t.get(&task1).updated_at)
+            .max(t.get(&task2).updated_at);
+        let before = inbox(&t.hub, &t.coord).len();
+
+        let now = t_max + 10 * 60 * 1000;
+        let wake = t.hub.check_stalled_tasks_at(now, STALLED_AFTER_MS).unwrap();
+        // Both tasks stalled, coordinator notified for both, but wake list deduplicates coordinator.
+        assert_eq!(wake.len(), 1);
+        assert_eq!(wake[0].id, t.coord.id);
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before + 2);
+    }
+
+    #[test]
+    fn stalled_card_skips_when_no_coordinator() {
+        use crate::state::board::STALLED_AFTER_MS;
+
+        let t = team();
+        let task = t.working("task without coordinator");
+        let t0 = t.get(&task).updated_at;
+        // Move task to a workspace with no coordinator.
+        t.hub
+            .db
+            .board::<_, rusqlite::Error>(|b| {
+                b.c.execute(
+                    "UPDATE tasks SET workspace = 'no-coord-ws' WHERE id = ?1",
+                    rusqlite::params![task.id],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        let now = t0 + 10 * 60 * 1000;
+        let wake = t.hub.check_stalled_tasks_at(now, STALLED_AFTER_MS).unwrap();
+        assert!(wake.is_empty());
+        // Verify no NO_COORDINATOR note was logged.
+        let events = t.hub.db.board(|b| b.events(&task.id)).unwrap();
+        assert!(!events.iter().any(|e| e.body.contains("Coordinator")));
+    }
+
+    #[test]
     fn a_usage_limit_does_not_replace_an_open_question() {
         let t = team();
         let coder = session(&t.hub, "coder", "coder", WS, Some(&t.coord.id));

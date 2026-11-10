@@ -170,6 +170,9 @@ gate: **a refusal (409 or 403) is final.** Report it to the user; never work aro
   (WIP permitting; git columns do not count toward WIP). The hub reminder `N task(s) are on the queue`
   means the same: take the next one.
 - **Always move the card before announcing the step.**
+- **Never end a turn with a card in Working, Testing or Review and no worker running**: a digest is
+  a worker event, act on it right away; the hub pings you after ~10 min of a card with no worker.
+  Take the next flow step or tell the user what blocks it.
 - **The flow for a task** (one automatic fix round, then Done):
   1. `jg-team-dev run start --task-id JGT-n`, then `task_move JGT-n working`.
   2. Read the task (`task_get`) and the code; write the plan, files, what must not change and the
