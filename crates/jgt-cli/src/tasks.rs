@@ -69,7 +69,7 @@ pub enum TaskCommand {
         file: Option<PathBuf>,
         text: Vec<String>,
     },
-    /// Move a task to a column: backlog, on_queue, working, testing, review, to_commit, to_merge, to_push or done.
+    /// Move a task to a column: backlog, on_queue, working, testing, review, to_commit, to_push, to_open_pr, to_merge or done.
     Move {
         task: String,
         #[arg(value_parser = parse_column)]
@@ -122,14 +122,15 @@ fn parse_priority(s: &str) -> Result<TaskPriority, String> {
     s.to_lowercase().parse()
 }
 
-/// Column names as typed: `on_queue`, `on-queue`, `"On Queue"`, `queue`, `commit`, `merge`, `push`.
+/// Column names as typed: `on_queue`, `on-queue`, `"On Queue"`, `queue`, `commit`, `push`, `pr`, `merge`.
 pub(crate) fn parse_column(s: &str) -> Result<TaskStatus, String> {
     let s = s.trim().to_lowercase().replace(['-', ' '], "_");
     let s = match s.as_str() {
         "queue" | "onqueue" => "on_queue".to_string(),
         "commit" | "tocommit" => "to_commit".to_string(),
-        "merge" | "tomerge" => "to_merge".to_string(),
         "push" | "topush" => "to_push".to_string(),
+        "pr" | "openpr" | "open_pr" | "toopenpr" => "to_open_pr".to_string(),
+        "merge" | "tomerge" => "to_merge".to_string(),
         _ => s,
     };
     s.parse().map_err(|_| {
@@ -480,6 +481,15 @@ mod tests {
             ("to-push", TaskStatus::ToPush),
             ("to_push", TaskStatus::ToPush),
             ("topush", TaskStatus::ToPush),
+            ("pr", TaskStatus::ToOpenPr),
+            ("PR", TaskStatus::ToOpenPr),
+            ("openpr", TaskStatus::ToOpenPr),
+            ("open-pr", TaskStatus::ToOpenPr),
+            ("open pr", TaskStatus::ToOpenPr),
+            ("To open PR", TaskStatus::ToOpenPr),
+            ("to-open-pr", TaskStatus::ToOpenPr),
+            ("to_open_pr", TaskStatus::ToOpenPr),
+            ("toopenpr", TaskStatus::ToOpenPr),
             ("Done", TaskStatus::Done),
             ("done", TaskStatus::Done),
             ("backlog", TaskStatus::Backlog),
@@ -490,6 +500,7 @@ mod tests {
             assert_eq!(parse_column(s), Ok(expected), "{s}");
         }
         assert!(parse_column("doing").is_err());
+        assert!(parse_column("doing").unwrap_err().contains("to_open_pr"));
         assert_eq!(parse_test("green"), Ok(TestStatus::Pass));
     }
 
@@ -506,15 +517,16 @@ mod tests {
 
     #[test]
     fn render_move_cli_shows_run_now_only_for_team_moves() {
-        let task = Task::new("/w", 1, "fix navbar", TaskStatus::ToMerge);
+        let task = Task::new("/w", 1, "fix navbar", TaskStatus::ToPush);
         let resp = MoveResponse {
             task,
             coordinator: None,
             queued: false,
             git_steps: vec!["commit".into()],
+            branch: Some("jgt/jgt-1".into()),
         };
-        assert_eq!(render_move_cli(&resp, &ActorRequest::User), "JGT-1 is in To merge.");
+        assert_eq!(render_move_cli(&resp, &ActorRequest::User), "JGT-1 is in To push.");
         let team_actor = ActorRequest::Session { session: "sess-1".into() };
-        assert_eq!(render_move_cli(&resp, &team_actor), "JGT-1 is in To merge. Run now: commit.");
+        assert_eq!(render_move_cli(&resp, &team_actor), "JGT-1 is in To push. Run now: commit. Branch: jgt/jgt-1.");
     }
 }

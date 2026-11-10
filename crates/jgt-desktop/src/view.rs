@@ -391,13 +391,16 @@ fn settings(app: &App) -> Element<'_, Msg> {
                                 .into(),
                         ),
                         line(
-                            "Auto-merge",
-                            button(text(if app.auto_merge { "On" } else { "Off" }).size(style::fs(13)))
-                                .on_press(Msg::ToggleGit(GitSwitch::Merge))
-                                .style(if app.auto_merge { style::primary_button } else { style::pill_button })
-                                .padding([4, 12])
+                            "Branch name",
+                            text_input("jgt/{key}", &app.branch_pattern)
+                                .on_input(Msg::GitBranchPattern)
+                                .size(style::fs(13))
+                                .padding([4, 8])
+                                .style(style::input)
+                                .width(220)
                                 .into(),
                         ),
+                        muted("{key} {slug} {title}, empty = jgt/<key>").size(style::fs(12)),
                         line(
                             "Auto-push",
                             button(text(if app.auto_push { "On" } else { "Off" }).size(style::fs(13)))
@@ -407,14 +410,22 @@ fn settings(app: &App) -> Element<'_, Msg> {
                                 .into(),
                         ),
                         line(
-                            "Also for main",
-                            button(text(if app.allow_main { "On" } else { "Off" }).size(style::fs(13)))
-                                .on_press(Msg::ToggleGit(GitSwitch::Main))
-                                .style(if app.allow_main { style::primary_button } else { style::pill_button })
+                            "Auto-open PR",
+                            button(text(if app.auto_open_pr { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::ToggleGit(GitSwitch::OpenPr))
+                                .style(if app.auto_open_pr { style::primary_button } else { style::pill_button })
                                 .padding([4, 12])
                                 .into(),
                         ),
-                        muted("ON = the Coordinator does it without asking. Merge and push still wait for review and Done. Never force-push. Without \"Also for main\" it still asks before touching main.")
+                        line(
+                            "Auto-merge PR",
+                            button(text(if app.auto_merge_pr { "On" } else { "Off" }).size(style::fs(13)))
+                                .on_press(Msg::ToggleGit(GitSwitch::MergePr))
+                                .style(if app.auto_merge_pr { style::primary_button } else { style::pill_button })
+                                .padding([4, 12])
+                                .into(),
+                        ),
+                        muted("ON = the team does it after review. Never on main, never force-push.")
                             .size(style::fs(12)),
                         line(
                             "Style",

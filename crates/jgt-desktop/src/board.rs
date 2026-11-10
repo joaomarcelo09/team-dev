@@ -329,7 +329,7 @@ pub fn describe(e: &TaskEvent) -> String {
 struct Column(TaskStatus);
 
 /// The "Move to…" choices of a card in each column: every other column.
-static MOVE_TO: [[Column; 8]; 9] = [
+static MOVE_TO: [[Column; 9]; 10] = [
     others(0),
     others(1),
     others(2),
@@ -339,11 +339,12 @@ static MOVE_TO: [[Column; 8]; 9] = [
     others(6),
     others(7),
     others(8),
+    others(9),
 ];
 
-const fn others(skip: usize) -> [Column; 8] {
+const fn others(skip: usize) -> [Column; 9] {
     let all = TaskStatus::ALL;
-    let mut out = [Column(TaskStatus::Backlog); 8];
+    let mut out = [Column(TaskStatus::Backlog); 9];
     let (mut i, mut j) = (0, 0);
     while i < all.len() {
         if i != skip {
@@ -960,27 +961,57 @@ mod tests {
             task(4, TaskStatus::Backlog, 1),
         ];
         let board = Board::new(tasks);
-        assert_eq!(order(&board).len(), 9);
+        assert_eq!(order(&board).len(), 10);
         assert_eq!(keys(board.column(TaskStatus::Backlog)), ["JGT-3", "JGT-4", "JGT-1"]);
         assert_eq!(keys(board.column(TaskStatus::OnQueue)), ["JGT-2"]);
         assert!(board.column(TaskStatus::Working).is_empty());
         assert!(board.column(TaskStatus::Testing).is_empty());
         assert!(board.column(TaskStatus::Review).is_empty());
         assert!(board.column(TaskStatus::ToCommit).is_empty());
-        assert!(board.column(TaskStatus::ToMerge).is_empty());
         assert!(board.column(TaskStatus::ToPush).is_empty());
+        assert!(board.column(TaskStatus::ToOpenPr).is_empty());
+        assert!(board.column(TaskStatus::ToMerge).is_empty());
         assert!(board.column(TaskStatus::Done).is_empty());
         assert_eq!(board.tasks().iter().map(|t| t.number).collect::<Vec<_>>(), [3, 4, 1, 2]);
     }
 
     #[test]
     fn move_to_lists_the_other_columns() {
-        assert_eq!(MOVE_TO.len(), 9);
+        assert_eq!(MOVE_TO.len(), 10);
         for status in TaskStatus::ALL.iter().copied() {
-            assert_eq!(MOVE_TO[status.index()].len(), 8);
+            assert_eq!(MOVE_TO[status.index()].len(), 9);
             let expected: Vec<Column> = TaskStatus::ALL.iter().copied().filter(|s| *s != status).map(Column).collect();
             assert_eq!(MOVE_TO[status.index()].to_vec(), expected);
         }
+    }
+
+    #[test]
+    fn to_open_pr_column_sits_between_to_push_and_to_merge() {
+        use TaskStatus::*;
+        let git: Vec<TaskStatus> = TaskStatus::ALL.iter().copied().filter(|s| s.is_git_stage()).collect();
+        assert_eq!(git, [ToCommit, ToPush, ToOpenPr, ToMerge]);
+        assert_eq!(ToOpenPr.label(), "To open PR");
+
+        let mut board = Board::new(vec![task(1, ToPush, 0), task(2, ToOpenPr, 0)]);
+        assert_eq!(keys(board.column(ToOpenPr)), ["JGT-2"]);
+
+        // Dragging a card into To open PR, before the card there and at the end
+        assert_eq!(drop_move(&board, "t1", Target::Before(ToOpenPr, 0)), Some((ToOpenPr, Some(0))));
+        assert_eq!(drop_move(&board, "t1", Target::End(ToOpenPr)), Some((ToOpenPr, None)));
+        // And out of it, on to To merge and Done
+        assert_eq!(drop_move(&board, "t2", Target::End(ToMerge)), Some((ToMerge, None)));
+        assert_eq!(drop_move(&board, "t2", Target::End(Done)), Some((Done, None)));
+
+        // "Move to…" offers To open PR from every other column, and not from itself
+        for status in TaskStatus::ALL.iter().copied() {
+            assert_eq!(MOVE_TO[status.index()].contains(&Column(ToOpenPr)), status != ToOpenPr);
+        }
+
+        let mut moved = task(1, ToOpenPr, 1);
+        moved.updated_at = 10;
+        assert!(board.upsert(moved));
+        assert!(board.column(ToPush).is_empty());
+        assert_eq!(keys(board.column(ToOpenPr)), ["JGT-2", "JGT-1"]);
     }
 
     #[test]
@@ -1064,7 +1095,7 @@ mod tests {
         older.updated_at = 10;
         let _ = app.update(Msg::TaskChanged(Ok(older.clone())));
         assert_eq!(title(&app), "newer");
-        let moved = jgt_core::api::MoveResponse { task: older.clone(), coordinator: None, queued: false, git_steps: Vec::new() };
+        let moved = jgt_core::api::MoveResponse { task: older.clone(), coordinator: None, queued: false, git_steps: Vec::new(), branch: None };
         let _ = app.update(Msg::TaskMoved(Ok(Box::new(moved))));
         assert_eq!(title(&app), "newer");
         let _ = app.update(Msg::BoardLoaded { workspace: "/w".into(), result: Ok(vec![older, task(2, TaskStatus::Backlog, 0)]) });
@@ -1218,7 +1249,7 @@ mod tests {
         let moved = |coordinator, queued| {
             let mut t = task(1, TaskStatus::OnQueue, 0);
             t.updated_at = 5;
-            Msg::TaskMoved(Ok(Box::new(jgt_core::api::MoveResponse { task: t, coordinator, queued, git_steps: Vec::new() })))
+            Msg::TaskMoved(Ok(Box::new(jgt_core::api::MoveResponse { task: t, coordinator, queued, git_steps: Vec::new(), branch: None })))
         };
         let _ = app.update(moved(None, false));
         assert_eq!(app.offer_team, None, "a reorder says nothing");

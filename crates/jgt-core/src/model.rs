@@ -336,8 +336,9 @@ string_enum! {
         Testing => "testing",
         Review => "review",
         ToCommit => "to_commit",
-        ToMerge => "to_merge",
         ToPush => "to_push",
+        ToOpenPr => "to_open_pr",
+        ToMerge => "to_merge",
         Done => "done",
     }
 }
@@ -352,8 +353,9 @@ impl TaskStatus {
             TaskStatus::Testing => "Testing",
             TaskStatus::Review => "Review",
             TaskStatus::ToCommit => "To commit",
-            TaskStatus::ToMerge => "To merge",
             TaskStatus::ToPush => "To push",
+            TaskStatus::ToOpenPr => "To open PR",
+            TaskStatus::ToMerge => "To merge",
             TaskStatus::Done => "Done",
         }
     }
@@ -378,17 +380,22 @@ impl TaskStatus {
         matches!(self, TaskStatus::Working | TaskStatus::Testing | TaskStatus::Review)
     }
 
-    /// True for the three git columns: To commit, To merge, To push.
+    /// The git columns, in the order of their steps: To commit, To push, To open PR, To merge.
+    pub const GIT_STAGES: [TaskStatus; 4] =
+        [TaskStatus::ToCommit, TaskStatus::ToPush, TaskStatus::ToOpenPr, TaskStatus::ToMerge];
+
+    /// True for the four git columns: To commit, To push, To open PR, To merge.
     pub fn is_git_stage(self) -> bool {
-        matches!(self, TaskStatus::ToCommit | TaskStatus::ToMerge | TaskStatus::ToPush)
+        Self::GIT_STAGES.contains(&self)
     }
 
-    /// The git step the column waits for: "commit", "merge" or "push".
+    /// The git step the column waits for: "commit", "push", "open_pr" or "merge_pr".
     pub fn git_step(self) -> Option<&'static str> {
         match self {
             TaskStatus::ToCommit => Some("commit"),
-            TaskStatus::ToMerge => Some("merge"),
             TaskStatus::ToPush => Some("push"),
+            TaskStatus::ToOpenPr => Some("open_pr"),
+            TaskStatus::ToMerge => Some("merge_pr"),
             _ => None,
         }
     }
@@ -768,27 +775,33 @@ mod tests {
         assert_eq!(TaskStatus::Review.prev(), Some(TaskStatus::Testing));
         assert!(TaskStatus::Testing.in_progress() && !TaskStatus::OnQueue.in_progress());
         assert_eq!(TaskStatus::Review.next(), Some(TaskStatus::ToCommit));
-        assert_eq!(TaskStatus::ToCommit.next(), Some(TaskStatus::ToMerge));
-        assert_eq!(TaskStatus::ToMerge.next(), Some(TaskStatus::ToPush));
-        assert_eq!(TaskStatus::ToPush.next(), Some(TaskStatus::Done));
-        assert_eq!(TaskStatus::Done.prev(), Some(TaskStatus::ToPush));
+        assert_eq!(TaskStatus::ToCommit.next(), Some(TaskStatus::ToPush));
+        assert_eq!(TaskStatus::ToPush.next(), Some(TaskStatus::ToOpenPr));
+        assert_eq!(TaskStatus::ToOpenPr.next(), Some(TaskStatus::ToMerge));
+        assert_eq!(TaskStatus::ToMerge.next(), Some(TaskStatus::Done));
+        assert_eq!(TaskStatus::Done.prev(), Some(TaskStatus::ToMerge));
         assert!(!TaskStatus::Done.in_progress());
         assert!(!TaskStatus::ToCommit.in_progress());
         assert!(TaskStatus::ToCommit.is_git_stage());
         assert!(TaskStatus::ToMerge.is_git_stage());
         assert!(TaskStatus::ToPush.is_git_stage());
+        assert!(TaskStatus::ToOpenPr.is_git_stage());
         assert!(!TaskStatus::Review.is_git_stage());
         assert!(!TaskStatus::Done.is_git_stage());
         assert_eq!(TaskStatus::ToCommit.git_step(), Some("commit"));
-        assert_eq!(TaskStatus::ToMerge.git_step(), Some("merge"));
         assert_eq!(TaskStatus::ToPush.git_step(), Some("push"));
+        assert_eq!(TaskStatus::ToOpenPr.git_step(), Some("open_pr"));
+        assert_eq!(TaskStatus::ToMerge.git_step(), Some("merge_pr"));
+        assert_eq!(TaskStatus::ToOpenPr.label(), "To open PR");
+        assert_eq!("to_open_pr".parse::<TaskStatus>().ok(), Some(TaskStatus::ToOpenPr));
         assert_eq!(TaskStatus::Review.git_step(), None);
         assert!(TaskStatus::ToCommit.is_past_review());
         assert!(TaskStatus::ToMerge.is_past_review());
         assert!(TaskStatus::ToPush.is_past_review());
+        assert!(TaskStatus::ToOpenPr.is_past_review());
         assert!(TaskStatus::Done.is_past_review());
         assert!(!TaskStatus::Review.is_past_review());
-        assert_eq!(TaskStatus::ALL.len(), 9);
+        assert_eq!(TaskStatus::ALL.len(), 10);
     }
 
     #[test]

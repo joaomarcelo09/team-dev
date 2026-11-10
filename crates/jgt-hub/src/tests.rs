@@ -13,8 +13,9 @@ fn hub() -> SharedHub {
     let mut config = Config::default();
     config.notifications.enabled = false;
     config.git.auto_commit = true;
-    config.git.auto_merge = true;
     config.git.auto_push = true;
+    config.git.auto_open_pr = true;
+    config.git.auto_merge_pr = true;
     Hub::new(Db::open(std::path::Path::new(":memory:")).unwrap(), config)
 }
 
@@ -623,7 +624,7 @@ fn schema_7_orchestrator_review_tasks_move_to_review_on_upgrade() {
 }
 
 #[test]
-fn schema_8_database_with_review_task_opens_at_version_9_with_task_unchanged() {
+fn schema_8_database_with_review_task_opens_at_the_current_version_with_task_unchanged() {
     let dir = std::env::temp_dir().join(format!("jgt-upgrade9-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -646,7 +647,44 @@ fn schema_8_database_with_review_task_opens_at_version_9_with_task_unchanged() {
     assert_eq!(task.title, "in_review_task");
     let conn = rusqlite::Connection::open(&path).unwrap();
     let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, crate::db::SCHEMA_VERSION);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn schema_9_to_merge_tasks_move_to_to_push_on_upgrade() {
+    let dir = std::env::temp_dir().join(format!("jgt-upgrade10-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("hub.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(crate::db::SCHEMA).unwrap();
+        conn.execute_batch(crate::db::TASKS_SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, workspace, number, title, status, position, created_at, updated_at)
+             VALUES ('t1', '/w', 1, 'committed, not merged', 'to_merge', 0, 1, 1),
+                    ('t2', '/w', 2, 'merged, not pushed', 'to_push', 0, 1, 1),
+                    ('t3', '/w', 3, 'waits for the commit', 'to_commit', 0, 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 9).unwrap();
+    }
+    let hub = Hub::new(Db::open(&path).unwrap(), Config::default());
+    // The old To merge card was committed but not merged: its next step is now the push.
+    assert_eq!(hub.task("t1", None).unwrap().status, jgt_core::TaskStatus::ToPush);
+    assert_eq!(hub.task("t2", None).unwrap().status, jgt_core::TaskStatus::ToPush);
+    assert_eq!(hub.task("t3", None).unwrap().status, jgt_core::TaskStatus::ToCommit);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+    assert_eq!(version, 10);
+    drop(conn);
+    // Opening it again changes nothing: a card the user later puts in To merge stays there.
+    hub.move_task("t1", None, &MoveTaskRequest { actor: ActorRequest::User, to: jgt_core::TaskStatus::ToMerge, position: None, reason: None }).unwrap();
+    drop(hub);
+    let hub = Hub::new(Db::open(&path).unwrap(), Config::default());
+    assert_eq!(hub.task("t1", None).unwrap().status, jgt_core::TaskStatus::ToMerge);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -703,14 +741,21 @@ mod board {
         coord: Session,
         coder: Session,
         reviewer: Session,
+        /// The folder its tasks are created in.
+        ws: String,
     }
 
     fn team() -> Team {
+        team_in(WS)
+    }
+
+    /// A team whose workspace is `ws`.
+    fn team_in(ws: &str) -> Team {
         let hub = hub();
-        let coord = session(&hub, "coord", jgt_core::COORDINATOR, WS, None);
-        let coder = session(&hub, "coder", "coder", WS, Some(&coord.id));
-        let reviewer = session(&hub, "reviewer", "reviewer", WS, Some(&coord.id));
-        Team { hub, coord, coder, reviewer }
+        let coord = session(&hub, "coord", jgt_core::COORDINATOR, ws, None);
+        let coder = session(&hub, "coder", "coder", ws, Some(&coord.id));
+        let reviewer = session(&hub, "reviewer", "reviewer", ws, Some(&coord.id));
+        Team { hub, coord, coder, reviewer, ws: ws.into() }
     }
 
     fn finding(critical: Option<bool>, category: Option<FindingCategory>) -> FindingInput {
@@ -768,7 +813,7 @@ mod board {
         fn create(&self, actor: ActorRequest, title: &str, status: Option<TaskStatus>) -> Result<Task, HubError> {
             self.hub.create_task(&CreateTaskRequest {
                 actor,
-                workspace: WS.into(),
+                workspace: self.ws.clone(),
                 title: title.into(),
                 description: "the user's words".into(),
                 priority: None,
@@ -833,11 +878,13 @@ mod board {
             })
         }
 
-        fn set_git_switches(&self, auto_commit: bool, auto_merge: bool, auto_push: bool) {
+        /// The `[git]` switches, in the order of their steps.
+        fn set_git_switches(&self, auto_commit: bool, auto_push: bool, auto_open_pr: bool, auto_merge_pr: bool) {
             let mut config = self.hub.config();
             config.git.auto_commit = auto_commit;
-            config.git.auto_merge = auto_merge;
             config.git.auto_push = auto_push;
+            config.git.auto_open_pr = auto_open_pr;
+            config.git.auto_merge_pr = auto_merge_pr;
             *self.hub.config.write().unwrap() = config;
         }
 
@@ -1181,8 +1228,9 @@ mod board {
         let mut config = Config::default();
         config.notifications.enabled = false;
         config.git.auto_commit = true;
-        config.git.auto_merge = true;
         config.git.auto_push = true;
+        config.git.auto_open_pr = true;
+        config.git.auto_merge_pr = true;
         config.team.wip_limit = 2;
         *t.hub.config.write().unwrap() = config;
         let third = t.queued("third");
@@ -1430,7 +1478,7 @@ mod board {
         let coord = session_with_id(&hub, "01ARZ3NDEK0000000000000001", "coord", jgt_core::COORDINATOR, WS, None);
         let coder = session_with_id(&hub, "01BRZ3NDEK0000000000000002", "coder", "coder", WS, Some(&coord.id));
         let reviewer = session_with_id(&hub, "01CRZ3NDEK0000000000000003", "reviewer", "reviewer", WS, Some(&coord.id));
-        let t = Team { hub, coord, coder, reviewer };
+        let t = Team { hub, coord, coder, reviewer, ws: WS.into() };
         let task = t.working("task1");
         t.mv(&task, Testing).unwrap();
 
@@ -2385,51 +2433,173 @@ mod board {
     #[test]
     fn routing_all_switches_off_routes_to_to_commit() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let resp = t.mv_full(&reviewed, Done).unwrap();
         assert_eq!(resp.task.status, ToCommit);
         assert_eq!(resp.git_steps, Vec::<String>::new());
+        // The card waits in a git column: the branch the commit will go to is named.
+        assert_eq!(resp.branch.as_deref(), Some("jgt/jgt-1"));
     }
 
     #[test]
-    fn routing_auto_commit_on_routes_to_to_merge() {
+    fn routing_auto_commit_on_routes_to_to_push() {
         let t = team();
-        t.set_git_switches(true, false, false);
-        let task = t.working("feature");
-        let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
-        let resp = t.mv_full(&reviewed, Done).unwrap();
-        assert_eq!(resp.task.status, ToMerge);
-        assert_eq!(resp.git_steps, vec!["commit".to_string()]);
-    }
-
-    #[test]
-    fn routing_commit_and_merge_on_routes_to_to_push() {
-        let t = team();
-        t.set_git_switches(true, true, false);
+        t.set_git_switches(true, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let resp = t.mv_full(&reviewed, Done).unwrap();
         assert_eq!(resp.task.status, ToPush);
-        assert_eq!(resp.git_steps, vec!["commit".to_string(), "merge".to_string()]);
+        assert_eq!(resp.git_steps, vec!["commit".to_string()]);
+        assert_eq!(resp.branch.as_deref(), Some("jgt/jgt-1"));
+    }
+
+    #[test]
+    fn routing_commit_and_push_on_routes_to_to_open_pr() {
+        let t = team();
+        t.set_git_switches(true, true, false, false);
+        let task = t.working("feature");
+        let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
+        let resp = t.mv_full(&reviewed, Done).unwrap();
+        assert_eq!(resp.task.status, ToOpenPr);
+        assert_eq!(resp.git_steps, vec!["commit".to_string(), "push".to_string()]);
+    }
+
+    #[test]
+    fn routing_three_switches_on_routes_to_to_merge() {
+        let t = team();
+        t.set_git_switches(true, true, true, false);
+        let task = t.working("feature");
+        let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
+        let resp = t.mv_full(&reviewed, Done).unwrap();
+        assert_eq!(resp.task.status, ToMerge);
+        assert_eq!(resp.git_steps, ["commit", "push", "open_pr"]);
+        let events = t.events(&resp.task);
+        let move_event = events.iter().rfind(|e| e.kind == TaskEventKind::Moved).unwrap();
+        assert_eq!(move_event.body, "routed to To merge: auto-merge-PR OFF");
+    }
+
+    #[test]
+    fn routing_goes_to_the_first_off_column_for_every_switch_combination() {
+        let order = [ToCommit, ToPush, ToOpenPr, ToMerge];
+        let tokens = ["commit", "push", "open_pr", "merge_pr"];
+        for bits in 0..16u8 {
+            let on = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0];
+            let t = team();
+            t.set_git_switches(on[0], on[1], on[2], on[3]);
+            let task = t.working("feature");
+            let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
+            let resp = t.mv_full(&reviewed, Done).unwrap();
+            let first_off = on.iter().position(|s| !s);
+            assert_eq!(resp.task.status, first_off.map_or(Done, |i| order[i]), "{on:?}");
+            assert_eq!(resp.git_steps, tokens[..first_off.unwrap_or(4)], "{on:?}");
+            // No branch only when nothing is run and the card is not in a git column: never here.
+            assert_eq!(resp.branch.as_deref(), Some("jgt/jgt-1"), "{on:?}");
+        }
+    }
+
+    #[test]
+    fn response_branch_follows_the_pattern_and_is_empty_without_git_work() {
+        let t = team();
+        let mut config = t.hub.config();
+        config.git.branch_pattern = "feat/{key}-{slug}".into();
+        *t.hub.config.write().unwrap() = config;
+        let task = t.working("Fix the NavBar!");
+        // A move before the git columns names no branch.
+        let resp = t.mv_full(&task, Testing).unwrap();
+        assert_eq!((resp.git_steps.len(), resp.branch), (0, None));
+        t.test(&task, TestStatus::Pass).unwrap();
+        t.mv(&task, Review).unwrap();
+        let reviewed = t.review(&task, ReviewDecision::Approved, vec![]).unwrap();
+        let resp = t.mv_full(&reviewed, Done).unwrap();
+        assert_eq!(resp.task.status, Done);
+        assert_eq!(resp.branch.as_deref(), Some("feat/jgt-1-fix-the-navbar"));
+    }
+
+    /// A git repository without a remote, in a new temp folder.
+    fn repo_without_remote(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("jgt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let init = std::process::Command::new("git").arg("init").arg("-q").arg(&dir).output().unwrap();
+        assert!(init.status.success(), "git init: {}", String::from_utf8_lossy(&init.stderr));
+        dir
+    }
+
+    #[test]
+    fn routing_stops_in_to_push_when_the_repo_has_no_remote() {
+        let dir = repo_without_remote("no-remote");
+        let t = team_in(dir.to_str().unwrap());
+        // Every switch is ON, but there is nowhere to push to.
+        t.set_git_switches(true, true, true, true);
+        let task = t.working("feature");
+        let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
+        let initial_count = notices(&t.hub, &t.coord).len();
+        let resp = t.mv_full(&reviewed, Done).unwrap();
+        assert_eq!(resp.task.status, ToPush);
+        assert_eq!(resp.git_steps, ["commit"]);
+        assert_eq!(resp.branch.as_deref(), Some("jgt/jgt-1"));
+        let events = t.events(&resp.task);
+        let move_event = events.iter().rfind(|e| e.kind == TaskEventKind::Moved).unwrap();
+        assert_eq!(move_event.body, "routed to To push: no git remote");
+        let note = notices(&t.hub, &t.coord).into_iter().nth(initial_count).expect("a notice");
+        assert_eq!(
+            note.body,
+            "\"feature\" is tested and reviewed. Move the card (or answer in chat) to OK the push. Branch: jgt/jgt-1. The team cannot do it: no git remote."
+        );
+
+        // The push is not the team's to do here: leaving the column needs the user's OK, and
+        // the team cannot jump over it.
+        let err = conflict(t.mv(&resp.task, Done));
+        assert!(err.contains("leaving To push needs the user's OK: quote it in reason"), "was: {err}");
+        let next = t.mv_with_reason(&resp.task, Done, "user: I added the remote").unwrap();
+        assert_eq!(next.task.status, ToOpenPr);
+        assert_eq!(next.git_steps, ["push"]);
+        let events = t.events(&next.task);
+        let move_event = events.iter().rfind(|e| e.kind == TaskEventKind::Moved).unwrap();
+        assert_eq!(move_event.body, "routed to To open PR: no git remote; user: I added the remote");
+
+        // The user may still move it on.
+        let done = t.user_mv_full(&next.task, Done).unwrap();
+        assert_eq!(done.task.status, Done);
+        assert_eq!(done.git_steps, ["open_pr", "merge_pr"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn git_caps_checks_only_git_repositories() {
+        use jgt_core::config::GitCaps;
+        // Not a repository (or not a folder at all): not checked.
+        assert_eq!(crate::state::board::git_caps("/tmp/jgt-board-test/no-such-folder"), GitCaps::default());
+        let dir = repo_without_remote("caps");
+        let ws = dir.to_str().unwrap();
+        assert!(!crate::state::board::git_caps(ws).remote);
+        let add = std::process::Command::new("git")
+            .args(["-C", ws, "remote", "add", "origin", "https://example.invalid/repo.git"])
+            .output()
+            .unwrap();
+        assert!(add.status.success());
+        assert!(crate::state::board::git_caps(ws).remote);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn routing_all_switches_on_routes_to_done() {
         let t = team();
-        t.set_git_switches(true, true, true);
+        t.set_git_switches(true, true, true, true);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let resp = t.mv_full(&reviewed, Done).unwrap();
         assert_eq!(resp.task.status, Done);
-        assert_eq!(resp.git_steps, vec!["commit".to_string(), "merge".to_string(), "push".to_string()]);
+        assert_eq!(resp.git_steps, ["commit", "push", "open_pr", "merge_pr"]);
+        assert_eq!(resp.branch.as_deref(), Some("jgt/jgt-1"));
     }
 
     #[test]
-    fn routing_commit_off_merge_on_routes_to_commit_then_with_reason_to_push() {
+    fn routing_commit_off_push_on_routes_to_commit_then_with_reason_to_open_pr() {
         let t = team();
-        t.set_git_switches(false, true, false);
+        t.set_git_switches(false, true, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let resp1 = t.mv_full(&reviewed, Done).unwrap();
@@ -2437,14 +2607,14 @@ mod board {
         assert_eq!(resp1.git_steps, Vec::<String>::new());
 
         let resp2 = t.mv_with_reason(&resp1.task, Done, "user says OK to commit").unwrap();
-        assert_eq!(resp2.task.status, ToPush);
-        assert_eq!(resp2.git_steps, vec!["commit".to_string(), "merge".to_string()]);
+        assert_eq!(resp2.task.status, ToOpenPr);
+        assert_eq!(resp2.git_steps, vec!["commit".to_string(), "push".to_string()]);
     }
 
     #[test]
     fn team_refused_git_column_to_working_testing_review() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_git = t.mv(&reviewed, Done).unwrap();
@@ -2459,42 +2629,42 @@ mod board {
     #[test]
     fn team_refused_jumping_over_column_whose_switch_is_off() {
         let t = team();
-        // commit is ON, merge is OFF, push is ON
-        t.set_git_switches(true, false, true);
+        // commit is ON, push is OFF, open PR and merge PR are ON
+        t.set_git_switches(true, false, true, true);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_git = t.mv(&reviewed, Done).unwrap();
-        assert_eq!(in_git.status, ToMerge);
+        assert_eq!(in_git.status, ToPush);
 
-        // Move task into ToCommit as user to test jumping over ToMerge
+        // Move task into ToCommit as user to test jumping over ToPush
         let in_commit = t.user_move(&in_git, ToCommit);
         assert_eq!(in_commit.status, ToCommit);
 
-        // Try team move to ToPush jumping over ToMerge whose switch is OFF
-        let err = conflict(t.mv_with_reason(&in_commit, ToPush, "user ok"));
-        assert!(err.contains("waits in To merge for the user's OK to merge"), "was: {err}");
+        // Try team move to ToOpenPr jumping over ToPush whose switch is OFF
+        let err = conflict(t.mv_with_reason(&in_commit, ToOpenPr, "user ok"));
+        assert!(err.contains("waits in To push for the user's OK to push"), "was: {err}");
     }
 
     #[test]
     fn team_refused_leaving_column_whose_switch_is_off_without_reason() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_commit = t.mv(&reviewed, Done).unwrap();
         assert_eq!(in_commit.status, ToCommit);
 
-        let err = conflict(t.mv(&in_commit, ToMerge));
+        let err = conflict(t.mv(&in_commit, ToPush));
         assert!(err.contains("leaving To commit needs the user's OK: quote it in reason"), "was: {err}");
 
-        let err = conflict(t.mv_with_reason(&in_commit, ToMerge, "   "));
+        let err = conflict(t.mv_with_reason(&in_commit, ToPush, "   "));
         assert!(err.contains("leaving To commit needs the user's OK: quote it in reason"), "was: {err}");
     }
 
     #[test]
     fn team_refused_review_to_git_column_without_green_test_or_review() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         // User moves directly to Review without test
         let in_review = t.user_move(&task, Review);
@@ -2512,61 +2682,67 @@ mod board {
     #[test]
     fn team_move_review_to_git_column_refuses_when_switches_between_are_off() {
         let t = team();
-        // 1. commit OFF: Review -> ToMerge refused (409)
-        t.set_git_switches(false, true, true);
+        // 1. commit OFF: Review -> ToPush refused (409)
+        t.set_git_switches(false, true, true, true);
         let task = t.working("feature1");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
-        let err = conflict(t.mv(&reviewed, ToMerge));
+        let err = conflict(t.mv(&reviewed, ToPush));
         assert!(err.contains("waits in To commit for the user's OK to commit"), "was: {err}");
 
-        // 2. commit ON: Review -> ToMerge accepted with git_steps [commit]
-        t.set_git_switches(true, false, false);
-        let resp = t.mv_full(&reviewed, ToMerge).unwrap();
-        assert_eq!(resp.task.status, ToMerge);
+        // 2. commit ON: Review -> ToPush accepted with git_steps [commit]
+        t.set_git_switches(true, false, false, false);
+        let resp = t.mv_full(&reviewed, ToPush).unwrap();
+        assert_eq!(resp.task.status, ToPush);
         assert_eq!(resp.git_steps, vec!["commit".to_string()]);
 
-        // 3. merge OFF: Review -> ToPush refused
-        // task is now in ToMerge (not in progress), so we can create feature2
-        t.set_git_switches(true, false, true);
+        // 3. push OFF: Review -> ToOpenPr refused
+        // task is now in ToPush (not in progress), so we can create feature2
+        t.set_git_switches(true, false, true, true);
         let task2 = t.working("feature2");
         let reviewed2 = t.pass(&task2, ReviewDecision::Approved, vec![]);
-        let err2 = conflict(t.mv(&reviewed2, ToPush));
-        assert!(err2.contains("waits in To merge for the user's OK to merge"), "was: {err2}");
+        let err2 = conflict(t.mv(&reviewed2, ToOpenPr));
+        assert!(err2.contains("waits in To push for the user's OK to push"), "was: {err2}");
+
+        // 4. open PR OFF: Review -> Done names the pull request step
+        t.set_git_switches(true, true, false, true);
+        let err3 = conflict(t.mv(&reviewed2, ToMerge));
+        assert!(err3.contains("waits in To open PR for the user's OK to open the pull request"), "was: {err3}");
     }
 
     #[test]
     fn user_drag_review_to_git_column_or_done_notifies_coordinator() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
 
-        // Drag Review -> ToMerge tells Coordinator with git_steps [commit]
-        let resp = t.user_mv_full(&reviewed, ToMerge).unwrap();
-        assert_eq!(resp.task.status, ToMerge);
+        // Drag Review -> ToPush tells Coordinator with git_steps [commit]
+        let resp = t.user_mv_full(&reviewed, ToPush).unwrap();
+        assert_eq!(resp.task.status, ToPush);
         assert_eq!(resp.git_steps, vec!["commit".to_string()]);
         assert!(resp.coordinator.is_some());
 
         let msgs = inbox(&t.hub, &t.coord);
         let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit")).expect("coordinator message");
         let expected = format!(
-            "[jg-team-dev] The user moved {} from Review to To merge: their OK to commit. Run them with the git-coder now.",
+            "[jg-team-dev] The user moved {} from Review to To push: their OK to commit. Branch: jgt/jgt-1. Run them with the git-coder now.",
             resp.task.key
         );
         assert_eq!(coord_msg.body, expected);
 
-        // Drag Review -> Done tells Coordinator with git_steps [commit, merge, push]
+        // Drag Review -> Done tells Coordinator with every git step
         let task2 = t.working("feature2");
         let reviewed2 = t.pass(&task2, ReviewDecision::Approved, vec![]);
         let resp2 = t.user_mv_full(&reviewed2, Done).unwrap();
         assert_eq!(resp2.task.status, Done);
-        assert_eq!(resp2.git_steps, vec!["commit".to_string(), "merge".to_string(), "push".to_string()]);
+        assert_eq!(resp2.git_steps, ["commit", "push", "open_pr", "merge_pr"]);
+        assert_eq!(resp2.branch.as_deref(), Some("jgt/jgt-2"));
         assert!(resp2.coordinator.is_some());
 
         let msgs2 = inbox(&t.hub, &t.coord);
-        let coord_msg2 = msgs2.iter().find(|m| m.body.contains("their OK to commit, merge, push")).expect("coordinator message");
+        let coord_msg2 = msgs2.iter().find(|m| m.body.contains("their OK to commit, push, open_pr, merge_pr")).expect("coordinator message");
         let expected2 = format!(
-            "[jg-team-dev] The user moved {} from Review to Done: their OK to commit, merge, push. Run them with the git-coder now.",
+            "[jg-team-dev] The user moved {} from Review to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-2. Run them with the git-coder now.",
             resp2.task.key
         );
         assert_eq!(coord_msg2.body, expected2);
@@ -2575,26 +2751,26 @@ mod board {
     #[test]
     fn routed_body_appends_user_reason_when_leaving_off_column() {
         let t = team();
-        // commit OFF, merge OFF, push ON
-        t.set_git_switches(false, false, true);
+        // commit OFF, push OFF, open PR and merge PR ON
+        t.set_git_switches(false, false, true, true);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_commit = t.mv(&reviewed, Done).unwrap();
         assert_eq!(in_commit.status, ToCommit);
 
-        // Card leaves ToCommit (auto_commit is OFF) with reason; routes to ToMerge (auto_merge is OFF)
+        // Card leaves ToCommit (auto_commit is OFF) with reason; routes to ToPush (auto_push is OFF)
         let resp = t.mv_with_reason(&in_commit, Done, "user agreed in chat").unwrap();
-        assert_eq!(resp.task.status, ToMerge);
+        assert_eq!(resp.task.status, ToPush);
 
         let events = t.events(&resp.task);
         let move_event = events.iter().rfind(|e| e.kind == TaskEventKind::Moved).unwrap();
-        assert_eq!(move_event.body, "routed to To merge: auto-merge OFF; user agreed in chat");
+        assert_eq!(move_event.body, "routed to To push: auto-push OFF; user agreed in chat");
     }
 
     #[test]
     fn user_drag_to_commit_to_done_no_gate_skipped_and_notifies_coordinator() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_commit = t.mv(&reviewed, Done).unwrap();
@@ -2602,7 +2778,7 @@ mod board {
 
         let resp = t.user_mv_full(&in_commit, Done).unwrap();
         assert_eq!(resp.task.status, Done);
-        assert_eq!(resp.git_steps, vec!["commit".to_string(), "merge".to_string(), "push".to_string()]);
+        assert_eq!(resp.git_steps, ["commit", "push", "open_pr", "merge_pr"]);
         assert!(resp.coordinator.is_some());
 
         let events = t.events(&resp.task);
@@ -2610,9 +2786,9 @@ mod board {
         assert!(move_event.meta.get("gate_skipped").is_none() || move_event.meta["gate_skipped"].is_null());
 
         let msgs = inbox(&t.hub, &t.coord);
-        let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit, merge, push")).expect("coordinator message");
+        let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit, push, open_pr, merge_pr")).expect("coordinator message");
         let expected = format!(
-            "[jg-team-dev] The user moved {} from To commit to Done: their OK to commit, merge, push. Run them with the git-coder now.",
+            "[jg-team-dev] The user moved {} from To commit to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-1. Run them with the git-coder now.",
             resp.task.key
         );
         assert_eq!(coord_msg.body, expected);
@@ -2621,7 +2797,7 @@ mod board {
     #[test]
     fn user_drag_git_column_to_working_is_allowed_and_logged_with_gate_skipped() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_commit = t.mv(&reviewed, Done).unwrap();
@@ -2639,7 +2815,7 @@ mod board {
     #[test]
     fn user_drag_to_commit_to_on_queue_resets_rounds() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         t.pass(&task, ReviewDecision::Changes, vec![high()]);
         let task = t.mv(&task, Working).unwrap();
@@ -2660,7 +2836,7 @@ mod board {
     #[test]
     fn card_in_to_commit_does_not_block_working_at_wip_limit_1() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let t1 = t.working("t1");
         let reviewed = t.pass(&t1, ReviewDecision::Approved, vec![]);
         let in_commit = t.mv(&reviewed, Done).unwrap();
@@ -2674,7 +2850,7 @@ mod board {
     #[test]
     fn follow_up_filed_once_on_review_to_to_commit_not_again_on_reaching_done() {
         let t = team();
-        t.set_git_switches(false, false, false);
+        t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         t.pass(&task, ReviewDecision::Changes, vec![critical()]);
         t.mv(&task, Working).unwrap();
@@ -2686,7 +2862,7 @@ mod board {
         let follow_ups: Vec<_> = tasks_before.iter().filter(|x| x.parent_id.as_deref() == Some(&in_commit.id)).collect();
         assert_eq!(follow_ups.len(), 1, "one follow-up created on entering To commit");
 
-        t.set_git_switches(true, true, true);
+        t.set_git_switches(true, true, true, true);
         let in_done = t.mv(&in_commit, Done).unwrap();
         assert_eq!(in_done.status, Done);
 
@@ -2696,33 +2872,36 @@ mod board {
     }
 
     #[test]
-    fn warning_notify_for_card_entering_to_merge() {
+    fn warning_notify_for_card_entering_to_push() {
         let t = team();
-        t.set_git_switches(true, false, false);
+        t.set_git_switches(true, false, false, false);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
 
         let initial_count = notices(&t.hub, &t.coord).len();
-        let in_merge = t.mv(&reviewed, Done).unwrap();
-        assert_eq!(in_merge.status, ToMerge);
+        let in_push = t.mv(&reviewed, Done).unwrap();
+        assert_eq!(in_push.status, ToPush);
 
         let n = notices(&t.hub, &t.coord);
         let new_notices: Vec<_> = n.into_iter().skip(initial_count).collect();
         assert_eq!(new_notices.len(), 1);
         let note = &new_notices[0];
         assert_eq!(note.meta_str("level"), Some("warning"));
-        let expected_title = format!("{} waits for your OK to merge", in_merge.key);
+        let expected_title = format!("{} waits for your OK to push", in_push.key);
         assert_eq!(note.meta_str("title"), Some(expected_title.as_str()));
         assert_eq!(
             note.body,
-            format!("\"{}\" is tested and reviewed. Move the card (or answer in chat) to OK the merge.", in_merge.title)
+            format!(
+                "\"{}\" is tested and reviewed. Move the card (or answer in chat) to OK the push. Branch: jgt/jgt-1.",
+                in_push.title
+            )
         );
     }
 
     #[test]
     fn done_notification_lists_steps_per_git_policy() {
         let t = team();
-        t.set_git_switches(true, true, true);
+        t.set_git_switches(true, true, true, true);
         let task = t.working("feature");
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let initial_count = notices(&t.hub, &t.coord).len();
@@ -2734,7 +2913,7 @@ mod board {
         let done_title = format!("{} is Done", done.key);
         let done_notice = new_notices.iter().find(|m| m.meta_str("title") == Some(done_title.as_str())).expect("done notice");
         assert_eq!(done_notice.meta_str("level"), Some("success"));
-        assert!(done_notice.body.contains("Done: tested, reviewed; commit, merge, push per git policy."));
+        assert!(done_notice.body.contains("Done: tested, reviewed; commit, push, open PR, merge PR per git policy."));
     }
 
     #[test]

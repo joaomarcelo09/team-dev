@@ -270,6 +270,10 @@ pub struct MoveResponse {
     pub queued: bool,
     #[serde(default)]
     pub git_steps: Vec<String>,
+    /// The task's branch (`Git::branch_name`), set when there are `git_steps` or the task is in a
+    /// git column.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

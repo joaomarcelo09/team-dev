@@ -183,9 +183,11 @@ pub struct App {
     pub text_size: u16,
     pub popups: bool,
     pub auto_commit: bool,
-    pub auto_merge: bool,
+    /// Branch name pattern for a task's first commit; empty = `jgt/<key>`.
+    pub branch_pattern: String,
     pub auto_push: bool,
-    pub allow_main: bool,
+    pub auto_open_pr: bool,
+    pub auto_merge_pr: bool,
     pub show_settings: bool,
     /// Problems in the `[team]` config (unknown harness or effort, …), shown as a banner in Settings.
     pub config_warnings: Vec<String>,
@@ -250,9 +252,9 @@ pub enum Step {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitSwitch {
     Commit,
-    Merge,
     Push,
-    Main,
+    OpenPr,
+    MergePr,
 }
 
 #[derive(Debug, Clone)]
@@ -345,6 +347,7 @@ pub enum Msg {
     ToggleSettings,
     TogglePopups,
     ToggleGit(GitSwitch),
+    GitBranchPattern(String),
     // used by M5
     #[allow(dead_code)]
     SetAgentHarness(String, Harness),
@@ -441,9 +444,10 @@ impl App {
             text_size,
             popups: config.notifications.enabled,
             auto_commit: config.git.auto_commit,
-            auto_merge: config.git.auto_merge,
+            branch_pattern: config.git.branch_pattern.clone(),
             auto_push: config.git.auto_push,
-            allow_main: config.git.allow_main,
+            auto_open_pr: config.git.auto_open_pr,
+            auto_merge_pr: config.git.auto_merge_pr,
             show_settings: false,
             config_warnings: config.team.warnings(None),
             agents: Vec::new(),
@@ -1374,9 +1378,10 @@ impl App {
                     let config = Config::load();
                     self.popups = config.notifications.enabled;
                     self.auto_commit = config.git.auto_commit;
-                    self.auto_merge = config.git.auto_merge;
+                    self.branch_pattern = config.git.branch_pattern.clone();
                     self.auto_push = config.git.auto_push;
-                    self.allow_main = config.git.allow_main;
+                    self.auto_open_pr = config.git.auto_open_pr;
+                    self.auto_merge_pr = config.git.auto_merge_pr;
                     self.config_warnings = config.team.warnings(None);
                     self.agents_locked = agents_locked_for(self);
 
@@ -1451,20 +1456,15 @@ impl App {
             Msg::ToggleGit(switch) => {
                 match switch {
                     GitSwitch::Commit => self.auto_commit = !self.auto_commit,
-                    GitSwitch::Merge => self.auto_merge = !self.auto_merge,
                     GitSwitch::Push => self.auto_push = !self.auto_push,
-                    GitSwitch::Main => self.allow_main = !self.allow_main,
+                    GitSwitch::OpenPr => self.auto_open_pr = !self.auto_open_pr,
+                    GitSwitch::MergePr => self.auto_merge_pr = !self.auto_merge_pr,
                 }
-                let flags = Git {
-                    auto_commit: self.auto_commit,
-                    auto_merge: self.auto_merge,
-                    auto_push: self.auto_push,
-                    allow_main: self.allow_main,
-                };
-                let mut config = Config::load();
-                apply_git(&mut config, &flags);
-                let _ = config.save();
-                Task::perform(hub::reload_config(), Msg::Done)
+                self.save_git()
+            }
+            Msg::GitBranchPattern(pattern) => {
+                self.branch_pattern = pattern;
+                self.save_git()
             }
             Msg::SetAgentHarness(role, harness) => {
                 if role == jgt_core::model::COORDINATOR {
@@ -1703,6 +1703,27 @@ pub(crate) fn apply_popups(config: &mut Config, enabled: bool) {
     config.notifications.enabled = enabled;
 }
 
+impl App {
+    /// The `[git]` settings as the Settings screen shows them.
+    fn git_settings(&self) -> Git {
+        Git {
+            auto_commit: self.auto_commit,
+            branch_pattern: self.branch_pattern.trim().to_string(),
+            auto_push: self.auto_push,
+            auto_open_pr: self.auto_open_pr,
+            auto_merge_pr: self.auto_merge_pr,
+        }
+    }
+
+    /// Saves the `[git]` settings and tells the hub to reload its config.
+    fn save_git(&self) -> Task<Msg> {
+        let mut config = Config::load();
+        apply_git(&mut config, &self.git_settings());
+        let _ = config.save();
+        Task::perform(hub::reload_config(), Msg::Done)
+    }
+}
+
 /// Applies git policy settings to a config.
 pub(crate) fn apply_git(config: &mut Config, flags: &Git) {
     config.git = flags.clone();
@@ -1914,35 +1935,40 @@ mod tests {
         let mut config = Config::default();
         // defaults OFF
         assert!(!config.git.auto_commit);
-        assert!(!config.git.auto_merge);
+        assert!(config.git.branch_pattern.is_empty());
         assert!(!config.git.auto_push);
-        assert!(!config.git.allow_main);
+        assert!(!config.git.auto_open_pr);
+        assert!(!config.git.auto_merge_pr);
         assert_eq!(config.git, Git::default());
 
         // apply_git sets keys and keeps other config (notifications, team)
         let flags = Git {
             auto_commit: true,
-            auto_merge: true,
+            branch_pattern: "feat/{key}-{slug}".to_string(),
             auto_push: true,
-            allow_main: true,
+            auto_open_pr: true,
+            auto_merge_pr: true,
         };
         apply_git(&mut config, &flags);
         assert!(config.git.auto_commit);
-        assert!(config.git.auto_merge);
+        assert_eq!(config.git.branch_pattern, "feat/{key}-{slug}");
         assert!(config.git.auto_push);
-        assert!(config.git.allow_main);
+        assert!(config.git.auto_open_pr);
+        assert!(config.git.auto_merge_pr);
         assert_eq!(config.git, flags);
         assert!(config.notifications.enabled);
         assert_eq!(config.team.wip_limit, 1);
 
         let partial = Git {
             auto_commit: true,
-            auto_merge: false,
+            branch_pattern: String::new(),
             auto_push: true,
-            allow_main: false,
+            auto_open_pr: false,
+            auto_merge_pr: false,
         };
         apply_git(&mut config, &partial);
         assert_eq!(config.git, partial);
+        assert!(config.git.branch_pattern.is_empty());
         assert!(config.notifications.enabled);
         assert_eq!(config.team.wip_limit, 1);
     }

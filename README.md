@@ -35,8 +35,12 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   (`jg-team-dev worker coder --worktree <name>`; the reviewer points at the same worktree). In a
   git repository a coder without a worktree is refused unless the Coordinator
   passes `--main-worktree` after warning you. `.team/` is kept out of `git status` through the
-  repository's local exclude file. The git-coder merges into the main worktree only after a
-  review, a test and your OK, then removes the worktree. On a topic change the Coordinator asks,
+  repository's local exclude file. The git-coder commits each task on its own branch, pushes it,
+  opens a pull request and merges it (using `gh pr merge <n> --merge` without `--delete-branch`,
+  deleting the remote branch with `git push origin --delete`, removing the worktree, and deleting
+  the local branch with `git branch -d`), each step only after a review, a test and your OK (or its
+  auto-switch); it never commits, merges or pushes on `main`, and removes the worktree once the
+  pull request is merged. On a topic change the Coordinator asks,
   writes `.team/tasks/task-<date>-<slug>.md`, and runs `jg-team-dev reset --summary <file>`: a
   fresh Coordinator takes over the folder and the old chat is archived, read-only.
 
@@ -48,13 +52,16 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   permission mode and tools can be set per skill and per project (below).
 
 - **Kanban (K-1, board data)**: each workspace (a Coordinator's folder) has a Board of tasks in
-  the hub database, `JGT-1`, `JGT-2`, … per workspace (keys are never reused), in nine columns:
-  Backlog, On Queue, Working, Testing, Review, To commit, To merge, To push, Done. Between Review
-  and Done sits the fixed git line (To commit → To merge → To push → Done), where each column
-  represents the next git step awaiting the user's OK. When the Coordinator moves a card to `done`
+  the hub database, `JGT-1`, `JGT-2`, … per workspace (keys are never reused), in ten columns:
+  Backlog, On Queue, Working, Testing, Review, To commit, To push, To open PR, To merge, Done.
+  Between Review and Done sits the fixed git line (To commit → To push → To open PR → To merge →
+  Done), where each column represents the next git step awaiting the user's OK (To merge = merge
+  the pull request). When the Coordinator moves a card to `done`
   from Review or a git column, the hub routes it to the first later column whose auto-switch is OFF,
-  or to Done if all are ON. The hub returns the ON steps passed along the way (`git_steps`), which
-  the Coordinator runs with the git-coder. Dragging a card forward along the line counts as the user's
+  or to Done if all are ON. The hub returns the ON steps passed along the way (`git_steps`: `commit`,
+  `push`, `open_pr`, `merge_pr`) and the task's branch name (`branch`), which the Coordinator
+  hands to the git-coder. In a git repository with no remote the card stops in To push, and
+  without `gh` on PATH it stops in To open PR, whatever the switches say; the task log says why. Dragging a card forward along the line counts as the user's
   OK for every step it passes, and the hub notifies the Coordinator to run them. Leaving a git column
   whose switch is OFF requires a reason quoting the user's OK. The team can never move a card
   backward from a git column. Git columns do not count toward the WIP limit. Every move, edit, result
@@ -74,7 +81,7 @@ config, and its hooks are passed to sessions with `--settings` instead of being 
   it from a terminal or a session.
 
 - **Kanban (K-2, Board view)**: a Coordinator's chat header has two tabs, **Chat** (the default)
-  and **Board**. The Board shows the workspace's nine columns with their counts, scrolling
+  and **Board**. The Board shows the workspace's ten columns with their counts, scrolling
   sideways in a narrow window; Done shows the 20 newest tasks, with "Show all". "+" in Backlog
   and On Queue adds a task (a title is enough). A card shows its key, title, priority, the worker
   on it (`↳ reviewer`), the review (`round 1/2`) and *Waiting for you* or *Waiting: usage
@@ -168,20 +175,43 @@ model = "sonnet"
 effort = "low"
 
 [git]
-auto_commit = false        # commit coder changes without asking (default: false)
-auto_merge = false         # merge worktree into target branch once reviewed (default: false)
-auto_push = false          # push branch without asking (default: false)
-allow_main = false         # allow auto actions touching main; if false, always ask (default: false)
+auto_commit = false        # commit a reviewed task on its own branch without asking (default: false)
+branch_pattern = ""        # task branch name; {key} {slug} {title}; empty = "jgt/{key}"
+auto_push = false          # push the task branch to the remote without asking (default: false)
+auto_open_pr = false       # open a pull request for the pushed branch (default: false)
+auto_merge_pr = false      # merge the pull request once its checks pass (default: false)
 
 [commands]
 # opencode = "/path/to/opencode"   # when it is not on PATH (e.g. an nvm install)
 # antigravity = "/path/to/agy"
 ```
 
-The `[git]` section configures git autonomy. All four keys default to `false`. When `allow_main`
-is `false`, any commit, merge or push touching `main` still asks first via chat even if the action
-is enabled. Force-push is never allowed under any setting. Inspect the live policy at any time
-with `jg-team-dev git-policy`.
+The `[git]` section configures git autonomy: the steps the team takes on its own once the
+reviewer approved a task. They run in a fixed order, and each one that is `false` (the default)
+makes the card wait in its column for your OK:
+
+1. `auto_commit`: at the task's first commit the team creates the task's branch and commits only
+   there. `branch_pattern` names it: `{key}` is the task key in lowercase (`jgt-31`), `{slug}` a
+   slug of the title (a-z, 0-9 and `-`, at most 40 characters) and `{title}` the title with
+   spaces turned into `-`. Empty, or a pattern that ends up empty or as `main`, `master` or
+   `HEAD`, means `jgt/{key}`.
+2. `auto_push`: push that branch to the remote (a plain push).
+3. `auto_open_pr`: open a pull request for it with `gh`, against the repository's default branch.
+4. `auto_merge_pr`: merge the pull request once its checks pass (using `gh pr merge <n> --merge`
+   without `--delete-branch`, deleting the remote branch with `git push origin --delete`, removing
+   the worktree, and deleting the local branch with `git branch -d`), and fast-forward your local
+   default branch when the main worktree is clean and on it.
+
+The team never commits, merges or pushes on `main`, and force-push is never allowed, under any
+setting. Opening and merging pull requests needs a git remote and the GitHub CLI (`gh`), logged
+in. Inspect the live policy at any time with `jg-team-dev git-policy`: it prints the four
+switches, the branch pattern and the "never" line.
+
+Older configs migrate on load: `auto_merge = true` becomes `auto_open_pr = true` (which now talks
+to GitHub) unless `auto_open_pr` is already set, and the old main-branch switch is read and dropped; the
+next save writes only the new keys. On the Board, cards that were in the old To merge column (committed,
+not merged) move to To push. Cards that were already in To push had been merged into your local
+`main`: the team no longer pushes `main`, so push it yourself and move them to Done.
 
 An Antigravity worker cannot ask for permission: a headless `agy` run denies every tool call
 that needs it (shell commands included), and `--mode auto` is not available on every account.
