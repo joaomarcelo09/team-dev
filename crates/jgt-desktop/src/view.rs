@@ -859,6 +859,26 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
 
         list = list.push(board_btn);
 
+        // IDE row
+        let ide_selected = app.module == Module::Ide;
+        let ide_row = row![
+            icons::icon(icons::Icon::Folder, style::fs(16)),
+            text("IDE")
+                .size(style::fs(13))
+                .font(if ide_selected { bold() } else { style::ui_font() }),
+            space::horizontal(),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let ide_btn = button(ide_row)
+            .on_press(Msg::SelectModule(Module::Ide))
+            .style(style::session_item(ide_selected))
+            .width(Fill)
+            .padding([7, 10]);
+
+        list = list.push(ide_btn);
+
         // 2. Coordinator row
         let coord_selected = app.module == Module::Coordinator;
         let mut coord_right = row![].spacing(6).align_y(Alignment::Center);
@@ -1159,6 +1179,9 @@ fn main<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
         } else {
             return container(muted("No workspace selected.")).center(Fill).into();
         }
+    }
+    if app.module == Module::Ide {
+        return crate::ide_view::ide(app);
     }
     let Some(session) = app.selected_session() else { return welcome(app) };
     let thread = app.threads.get(&session.id);
@@ -2366,6 +2389,11 @@ mod tests {
         // 3. Board module selected
         app.module = Module::Board;
         let _ = sidebar(&app, &theme);
+
+        // 3b. Ide module selected
+        app.module = Module::Ide;
+        let _ = sidebar(&app, &theme);
+        let _ = main(&app, &theme);
 
         // 4. Worker module selected
         app.module = Module::Worker("w1".to_string());

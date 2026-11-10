@@ -77,6 +77,7 @@ pub struct Toast {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Module {
     Board,
+    Ide,
     #[default]
     Coordinator,
     Worker(String),
@@ -142,6 +143,102 @@ impl ThemeStyle {
             Self::Default => "default",
             Self::TokyoNight => "tokyo-night",
             Self::Dracula => "dracula",
+        }
+    }
+}
+
+/// What the IDE tab viewer shows.
+#[derive(Debug)]
+pub enum Viewer {
+    Loading,
+    Text(text_editor::Content, String),
+    Diff(Vec<crate::ide::DiffLine>),
+    Notice(String),
+}
+
+impl Default for Viewer {
+    fn default() -> Self {
+        Self::Notice("Select a file to view".to_string())
+    }
+}
+
+/// A file listing with its tree and entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listing {
+    pub entries: Vec<crate::ide::FileEntry>,
+    pub tree: Vec<crate::ide::TreeNode>,
+    pub truncated: bool,
+    pub total_count: usize,
+}
+
+impl Listing {
+    pub fn new(entries: Vec<crate::ide::FileEntry>, truncated: bool, total_count: usize) -> Self {
+        let tree = crate::ide::build_tree(&entries);
+        Self {
+            entries,
+            tree,
+            truncated,
+            total_count,
+        }
+    }
+}
+
+/// Result of loading a file's content or diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdeFileResult {
+    Text(String),
+    Diff(Vec<crate::ide::DiffLine>),
+    Notice(String),
+}
+
+impl From<crate::ide::FileContent> for IdeFileResult {
+    fn from(c: crate::ide::FileContent) -> Self {
+        match c {
+            crate::ide::FileContent::Text(t) => Self::Text(t),
+            crate::ide::FileContent::Notice(n) => Self::Notice(n),
+        }
+    }
+}
+
+impl From<crate::ide::DiffContent> for IdeFileResult {
+    fn from(d: crate::ide::DiffContent) -> Self {
+        match d {
+            crate::ide::DiffContent::Lines(l) => Self::Diff(l),
+            crate::ide::DiffContent::Notice(n) => Self::Notice(n),
+        }
+    }
+}
+
+/// IDE tab state.
+#[derive(Debug)]
+pub struct IdeState {
+    pub sources: Vec<crate::ide::Source>,
+    pub source: crate::ide::Source,
+    pub listing: Option<Listing>,
+    pub open_dirs: HashSet<String>,
+    pub changed_only: bool,
+    pub selected: Option<String>,
+    pub viewer: Viewer,
+    pub show_diff: bool,
+    pub error: Option<String>,
+}
+
+impl Default for IdeState {
+    fn default() -> Self {
+        Self {
+            sources: Vec::new(),
+            source: crate::ide::Source {
+                label: "Main".to_string(),
+                root: PathBuf::new(),
+                kind: crate::ide::SourceKind::Main,
+            },
+            listing: None,
+            open_dirs: HashSet::new(),
+            changed_only: false,
+            selected: None,
+            viewer: Viewer::default(),
+            show_diff: false,
+            error: None,
         }
     }
 }
@@ -236,6 +333,8 @@ pub struct App {
     pub offer_team: Option<String>,
     /// The card or message currently in text-selection mode.
     pub selecting_message: Option<i64>,
+    /// IDE tab state.
+    pub ide: IdeState,
     /// Highest message id seen, so only new messages mark the window urgent.
     last_message_id: i64,
     start_session: Option<String>,
@@ -370,6 +469,21 @@ pub enum Msg {
     DismissToast,
     Tick,
     Done(Result<(), String>),
+    IdeSourcesLoaded {
+        project: PathBuf,
+        result: Result<Vec<crate::ide::Source>, String>,
+    },
+    IdeSelectSource(crate::ide::Source),
+    IdeListingLoaded { root: PathBuf, result: Result<Listing, String> },
+    IdeToggleDir(String),
+    IdeOpenFile(String),
+    IdeFileLoaded { root: PathBuf, path: String, diff: bool, result: Result<IdeFileResult, String> },
+    IdeChangedOnly(bool),
+    IdeShowDiff(bool),
+    IdeViewer(text_editor::Action),
+    IdeRefresh,
+    OpenInIde(String),
+    IdeSourcesLoadedForTask { sources: Vec<crate::ide::Source>, key: String },
 }
 
 /// What to do with the chat scroll position when messages are loaded.
@@ -470,6 +584,7 @@ impl App {
             drag: None,
             offer_team: None,
             selecting_message: None,
+            ide: IdeState::default(),
             last_message_id: 0,
             start_session,
         };
@@ -637,7 +752,17 @@ impl App {
 
     fn load_board(&self, workspace: String) -> Task<Msg> {
         let w = workspace.clone();
-        Task::perform(hub::tasks(workspace), move |result| Msg::BoardLoaded { workspace: w.clone(), result })
+        let project = PathBuf::from(jgt_core::team::project_folder(&workspace));
+        let board_task = Task::perform(hub::tasks(workspace), move |result| Msg::BoardLoaded { workspace: w.clone(), result });
+        let p_sources = project.clone();
+        let sources_task = Task::perform(
+            async move { crate::ide_git::list_sources(&p_sources).await },
+            move |result| Msg::IdeSourcesLoaded {
+                project: project.clone(),
+                result,
+            },
+        );
+        Task::batch([board_task, sources_task])
     }
 
     /// Loads the workspace Board when the Board module is showing.
@@ -648,6 +773,123 @@ impl App {
             return self.load_board(ws);
         }
         Task::none()
+    }
+
+    /// Loads sources and file listing for the IDE tab.
+    pub fn load_ide(&mut self) -> Task<Msg> {
+        let Some(ws) = self.workspace.clone().or_else(|| self.selected_session().and_then(crate::board::workspace)) else {
+            return Task::none();
+        };
+        let project = PathBuf::from(jgt_core::team::project_folder(&ws));
+        if self.ide.source.kind == crate::ide::SourceKind::Main
+            && (self.ide.source.root.as_os_str().is_empty() || self.ide.source.root != project)
+        {
+            self.ide.source = crate::ide::Source {
+                label: "Main".to_string(),
+                root: project.clone(),
+                kind: crate::ide::SourceKind::Main,
+            };
+        }
+
+        let p_sources = project.clone();
+        let p_for_msg = project.clone();
+        let sources_task = Task::perform(
+            async move { crate::ide_git::list_sources(&p_sources).await },
+            move |result| Msg::IdeSourcesLoaded {
+                project: p_for_msg.clone(),
+                result,
+            },
+        );
+
+        let source = self.ide.source.clone();
+        let root = source.root.clone();
+        let listing_task = if root.as_os_str().is_empty() {
+            Task::none()
+        } else {
+            Task::perform(
+                async move {
+                    let file_list = crate::ide_git::list_files(&source).await?;
+                    let changes = crate::ide_git::changes(&source).await.unwrap_or_default();
+                    let entries = file_list
+                        .files
+                        .into_iter()
+                        .map(|path| {
+                            let status = changes.get(&path).copied();
+                            crate::ide::FileEntry::new(path, status)
+                        })
+                        .collect();
+                    Ok(Listing::new(
+                        entries,
+                        file_list.truncated,
+                        file_list.total_count,
+                    ))
+                },
+                move |result| Msg::IdeListingLoaded { root, result },
+            )
+        };
+
+        let file_task = if let Some(path) = self.ide.selected.clone() {
+            let source = self.ide.source.clone();
+            let root = source.root.clone();
+            let diff = self.ide.show_diff;
+            let path_clone = path.clone();
+            if root.as_os_str().is_empty() {
+                Task::none()
+            } else {
+                Task::perform(
+                    async move {
+                        if diff {
+                            let content = crate::ide_git::file_diff(&source, &path_clone).await?;
+                            Ok(IdeFileResult::from(content))
+                        } else {
+                            let content = crate::ide_git::read_file(&source, &path_clone).await?;
+                            Ok(IdeFileResult::from(content))
+                        }
+                    },
+                    move |result| Msg::IdeFileLoaded { root, path, diff, result },
+                )
+            }
+        } else {
+            Task::none()
+        };
+
+        Task::batch([sources_task, listing_task, file_task])
+    }
+
+    /// Selects a source in the IDE tab, resetting file selection and loading its listing.
+    pub fn select_ide_source(&mut self, source: crate::ide::Source) -> Task<Msg> {
+        self.ide.source = source.clone();
+        self.ide.selected = None;
+        self.ide.viewer = Viewer::default();
+        self.ide.show_diff = false;
+        self.ide.error = None;
+        self.ide.open_dirs.clear();
+        self.ide.listing = None;
+        if matches!(source.kind, crate::ide::SourceKind::Main) {
+            self.ide.changed_only = false;
+        }
+        let source_clone = source.clone();
+        let root = source.root.clone();
+        Task::perform(
+            async move {
+                let file_list = crate::ide_git::list_files(&source_clone).await?;
+                let changes = crate::ide_git::changes(&source_clone).await.unwrap_or_default();
+                let entries = file_list
+                    .files
+                    .into_iter()
+                    .map(|path| {
+                        let status = changes.get(&path).copied();
+                        crate::ide::FileEntry::new(path, status)
+                    })
+                    .collect();
+                Ok(Listing::new(
+                    entries,
+                    file_list.truncated,
+                    file_list.total_count,
+                ))
+            },
+            move |result| Msg::IdeListingLoaded { root, result },
+        )
     }
 
     fn load_task_events(&self, task: String) -> Task<Msg> {
@@ -768,8 +1010,12 @@ impl App {
             Msg::SelectWorkspace(ws) => {
                 let ws_norm = jgt_core::team::project_folder(&ws).to_string();
                 self.confirm_delete_team = false;
+                let project_changed = self.workspace.as_ref().map(|w| jgt_core::team::project_folder(w)) != Some(&ws_norm);
                 self.workspace = Some(ws_norm.clone());
                 self.module = Module::Coordinator;
+                if project_changed {
+                    self.ide = IdeState::default();
+                }
                 if let Some(coord) = coordinator_for(&self.sessions, &ws_norm) {
                     let id = coord.id.clone();
                     self.select(id)
@@ -799,6 +1045,17 @@ impl App {
                         } else {
                             Task::none()
                         }
+                    }
+                    Module::Ide => {
+                        if self.workspace.is_none()
+                            && let Some(s) = self.selected_session()
+                        {
+                            self.workspace = session_workspace(s, &self.sessions);
+                        }
+                        if let Some(id) = &self.selected {
+                            self.drafts.insert(id.clone(), self.composer.text());
+                        }
+                        self.load_ide()
                     }
                     Module::Coordinator => {
                         if let Some(ws) = &self.workspace
@@ -1004,7 +1261,24 @@ impl App {
                 self.open_task = Some(id.clone());
                 self.confirm_delete_task = false;
                 self.refresh_open(None, &task);
-                self.load_task_events(id)
+                let events_task = self.load_task_events(id);
+                if self.ide.sources.is_empty()
+                    && let Some(ws) = self.workspace.clone().or_else(|| self.selected_session().and_then(crate::board::workspace))
+                {
+                    let project = PathBuf::from(jgt_core::team::project_folder(&ws));
+                    let p_sources = project.clone();
+                    let p_for_msg = project.clone();
+                    let sources_task = Task::perform(
+                        async move { crate::ide_git::list_sources(&p_sources).await },
+                        move |result| Msg::IdeSourcesLoaded {
+                            project: p_for_msg.clone(),
+                            result,
+                        },
+                    );
+                    Task::batch([events_task, sources_task])
+                } else {
+                    events_task
+                }
             }
             Msg::CloseTask => {
                 self.close_task();
@@ -1567,6 +1841,200 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::IdeSourcesLoaded { project, result } => {
+                let current_project = self
+                    .workspace
+                    .as_ref()
+                    .map(|w| PathBuf::from(jgt_core::team::project_folder(w)));
+                if current_project.as_ref() != Some(&project) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(sources) => {
+                        self.ide.sources = sources;
+                        if self.ide.source.root.as_os_str().is_empty()
+                            && let Some(first) = self.ide.sources.first()
+                        {
+                            self.ide.source = first.clone();
+                        }
+                    }
+                    Err(err) => {
+                        if self.module == Module::Ide {
+                            self.ide.error = Some(err);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Msg::IdeSelectSource(source) => self.select_ide_source(source),
+            Msg::OpenInIde(key) => {
+                let prev_board = self.module == Module::Board;
+                self.module = Module::Ide;
+                if prev_board {
+                    self.close_task();
+                    self.new_task = None;
+                }
+                if self.workspace.is_none()
+                    && let Some(s) = self.selected_session()
+                {
+                    self.workspace = session_workspace(s, &self.sessions);
+                }
+                if let Some(id) = &self.selected {
+                    self.drafts.insert(id.clone(), self.composer.text());
+                }
+
+                if let Some(source) = crate::ide::source_for_task(&self.ide.sources, &key).cloned() {
+                    self.select_ide_source(source)
+                } else {
+                    let Some(ws) = self.workspace.clone().or_else(|| self.selected_session().and_then(crate::board::workspace)) else {
+                        return Task::none();
+                    };
+                    let project = PathBuf::from(jgt_core::team::project_folder(&ws));
+                    let p_clone = project.clone();
+                    let task_key = key.clone();
+                    Task::perform(
+                        async move {
+                            let sources = crate::ide_git::list_sources(&p_clone).await?;
+                            Ok((sources, task_key))
+                        },
+                        move |result: Result<(Vec<crate::ide::Source>, String), String>| match result {
+                            Ok((sources, key)) => Msg::IdeSourcesLoadedForTask { sources, key },
+                            Err(err) => Msg::IdeSourcesLoaded {
+                                project: project.clone(),
+                                result: Err(err),
+                            },
+                        },
+                    )
+                }
+            }
+            Msg::IdeSourcesLoadedForTask { sources, key } => {
+                self.ide.sources = sources;
+                if let Some(source) = crate::ide::source_for_task(&self.ide.sources, &key).cloned() {
+                    self.select_ide_source(source)
+                } else {
+                    if self.ide.source.root.as_os_str().is_empty()
+                        && let Some(first) = self.ide.sources.first()
+                    {
+                        self.ide.source = first.clone();
+                    }
+                    Task::none()
+                }
+            }
+            Msg::IdeListingLoaded { root, result } => {
+                if self.ide.source.root != root {
+                    return Task::none();
+                }
+                match result {
+                    Ok(listing) => {
+                        self.ide.listing = Some(listing);
+                        self.ide.error = None;
+                    }
+                    Err(err) => {
+                        self.ide.error = Some(err);
+                    }
+                }
+                Task::none()
+            }
+            Msg::IdeToggleDir(path) => {
+                if self.ide.open_dirs.contains(&path) {
+                    self.ide.open_dirs.remove(&path);
+                } else {
+                    self.ide.open_dirs.insert(path);
+                }
+                Task::none()
+            }
+            Msg::IdeOpenFile(path) => {
+                self.ide.selected = Some(path.clone());
+                self.ide.viewer = Viewer::Loading;
+                let is_deleted = self.ide.listing.as_ref().is_some_and(|l| {
+                    l.entries
+                        .iter()
+                        .any(|e| e.path == path && e.status == Some(crate::ide::ChangeStatus::Deleted))
+                });
+                if is_deleted {
+                    self.ide.show_diff = true;
+                }
+                let source = self.ide.source.clone();
+                let root = source.root.clone();
+                let diff = self.ide.show_diff;
+                let path_clone = path.clone();
+                Task::perform(
+                    async move {
+                        if diff {
+                            let content = crate::ide_git::file_diff(&source, &path_clone).await?;
+                            Ok(IdeFileResult::from(content))
+                        } else {
+                            let content = crate::ide_git::read_file(&source, &path_clone).await?;
+                            Ok(IdeFileResult::from(content))
+                        }
+                    },
+                    move |result| Msg::IdeFileLoaded { root, path, diff, result },
+                )
+            }
+            Msg::IdeFileLoaded { root, path, diff, result } => {
+                if self.ide.source.root != root
+                    || self.ide.selected.as_deref() != Some(&path)
+                    || self.ide.show_diff != diff
+                {
+                    return Task::none();
+                }
+                match result {
+                    Ok(IdeFileResult::Text(text)) => {
+                        let ext = std::path::Path::new(&path)
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .unwrap_or("")
+                            .to_string();
+                        self.ide.viewer = Viewer::Text(text_editor::Content::with_text(&text), ext);
+                    }
+                    Ok(IdeFileResult::Diff(lines)) => {
+                        self.ide.viewer = Viewer::Diff(lines);
+                    }
+                    Ok(IdeFileResult::Notice(msg)) => {
+                        self.ide.viewer = Viewer::Notice(msg);
+                    }
+                    Err(err) => {
+                        self.ide.viewer = Viewer::Notice(err);
+                    }
+                }
+                Task::none()
+            }
+            Msg::IdeChangedOnly(val) => {
+                self.ide.changed_only = val;
+                Task::none()
+            }
+            Msg::IdeShowDiff(diff) => {
+                self.ide.show_diff = diff;
+                if let Some(path) = self.ide.selected.clone() {
+                    self.ide.viewer = Viewer::Loading;
+                    let source = self.ide.source.clone();
+                    let root = source.root.clone();
+                    let path_clone = path.clone();
+                    Task::perform(
+                        async move {
+                            if diff {
+                                let content = crate::ide_git::file_diff(&source, &path_clone).await?;
+                                Ok(IdeFileResult::from(content))
+                            } else {
+                                let content = crate::ide_git::read_file(&source, &path_clone).await?;
+                                Ok(IdeFileResult::from(content))
+                            }
+                        },
+                        move |result| Msg::IdeFileLoaded { root, path, diff, result },
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Msg::IdeViewer(action) => {
+                if !action.is_edit()
+                    && let Viewer::Text(content, _) = &mut self.ide.viewer
+                {
+                    content.perform(action);
+                }
+                Task::none()
+            }
+            Msg::IdeRefresh => self.load_ide(),
         }
     }
 
@@ -2828,5 +3296,405 @@ effort = "low"
             None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
         }
         let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[test]
+    fn test_select_module_ide() {
+        let (mut app, _) = App::new(None);
+        let c1 = make_session(
+            "c1",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some("/team1"),
+            SessionStatus::Active,
+            false,
+        );
+        app.sessions = vec![c1];
+        let _ = app.update(Msg::SelectWorkspace("/team1".to_string()));
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+        assert_eq!(app.module, Module::Coordinator);
+
+        let _ = app.update(Msg::SelectModule(Module::Ide));
+        assert_eq!(app.module, Module::Ide);
+        assert_eq!(app.workspace.as_deref(), Some("/team1"));
+    }
+
+    #[test]
+    fn test_ide_stale_file_loaded_ignored() {
+        let (mut app, _) = App::new(None);
+        let root = PathBuf::from("/repo");
+        app.ide.source = crate::ide::Source {
+            label: "Main".to_string(),
+            root: root.clone(),
+            kind: crate::ide::SourceKind::Main,
+        };
+        app.ide.selected = Some("src/main.rs".to_string());
+        app.ide.show_diff = false;
+        app.ide.viewer = Viewer::Text(
+            text_editor::Content::with_text("correct content"),
+            "rs".to_string(),
+        );
+
+        // 1. Stale path: loaded file for a different path is ignored
+        let _ = app.update(Msg::IdeFileLoaded {
+            root: root.clone(),
+            path: "src/other.rs".to_string(),
+            diff: false,
+            result: Ok(IdeFileResult::Text("stale other path".to_string())),
+        });
+        if let Viewer::Text(content, _) = &app.ide.viewer {
+            assert_eq!(content.text(), "correct content");
+        } else {
+            panic!("viewer should still be Text with original content");
+        }
+
+        // 2. Stale root: loaded file for a different root is ignored
+        let _ = app.update(Msg::IdeFileLoaded {
+            root: PathBuf::from("/different/repo"),
+            path: "src/main.rs".to_string(),
+            diff: false,
+            result: Ok(IdeFileResult::Text("stale different root".to_string())),
+        });
+        if let Viewer::Text(content, _) = &app.ide.viewer {
+            assert_eq!(content.text(), "correct content");
+        } else {
+            panic!("viewer should still be Text with original content");
+        }
+
+        // 3. Stale diff mode: diff result while show_diff is false is ignored
+        let _ = app.update(Msg::IdeFileLoaded {
+            root: root.clone(),
+            path: "src/main.rs".to_string(),
+            diff: true,
+            result: Ok(IdeFileResult::Diff(vec![])),
+        });
+        if let Viewer::Text(content, _) = &app.ide.viewer {
+            assert_eq!(content.text(), "correct content");
+        } else {
+            panic!("viewer should still be Text with original content");
+        }
+
+        // 4. Matching IdeFileLoaded updates viewer
+        let _ = app.update(Msg::IdeFileLoaded {
+            root: root.clone(),
+            path: "src/main.rs".to_string(),
+            diff: false,
+            result: Ok(IdeFileResult::Text("updated content".to_string())),
+        });
+        if let Viewer::Text(content, _) = &app.ide.viewer {
+            assert_eq!(content.text(), "updated content");
+        } else {
+            panic!("viewer should be updated to new content");
+        }
+    }
+
+    #[test]
+    fn test_ide_viewer_drops_edit_actions() {
+        let (mut app, _) = App::new(None);
+        app.ide.viewer = Viewer::Text(
+            text_editor::Content::with_text("read-only line"),
+            "rs".to_string(),
+        );
+
+        // Send an edit action: insert character 'x'
+        let _ = app.update(Msg::IdeViewer(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+
+        if let Viewer::Text(content, _) = &app.ide.viewer {
+            assert_eq!(content.text(), "read-only line");
+        } else {
+            panic!("viewer should still be Text");
+        }
+
+        // Non-edit action (like SelectLine) is performed
+        let _ = app.update(Msg::IdeViewer(text_editor::Action::SelectLine));
+        if let Viewer::Text(content, _) = &app.ide.viewer {
+            assert_eq!(content.text(), "read-only line");
+        } else {
+            panic!("viewer should still be Text");
+        }
+    }
+
+    #[test]
+    fn test_ide_switching_source_resets_selection_and_viewer() {
+        let (mut app, _) = App::new(None);
+        app.ide.source = crate::ide::Source {
+            label: "Main".to_string(),
+            root: PathBuf::from("/project"),
+            kind: crate::ide::SourceKind::Main,
+        };
+        app.ide.selected = Some("src/lib.rs".to_string());
+        app.ide.viewer = Viewer::Text(
+            text_editor::Content::with_text("fn hello() {}"),
+            "rs".to_string(),
+        );
+        app.ide.show_diff = true;
+        app.ide.open_dirs.insert("src".to_string());
+
+        let new_source = crate::ide::Source {
+            label: "jgt-34".to_string(),
+            root: PathBuf::from("/project/.team/worktrees/jgt-34"),
+            kind: crate::ide::SourceKind::Worktree {
+                branch: "jgt/jgt-34".to_string(),
+            },
+        };
+
+        let _ = app.update(Msg::IdeSelectSource(new_source.clone()));
+
+        assert_eq!(app.ide.source, new_source);
+        assert_eq!(app.ide.selected, None, "switching source must reset selected");
+        assert!(!app.ide.show_diff, "switching source must reset show_diff");
+        assert!(
+            matches!(app.ide.viewer, Viewer::Notice(_)),
+            "switching source must reset viewer"
+        );
+        assert!(app.ide.open_dirs.is_empty(), "switching source clears open dirs");
+        assert!(app.ide.listing.is_none(), "switching source clears listing");
+
+        // Toggle dir
+        let _ = app.update(Msg::IdeToggleDir("src".to_string()));
+        assert!(app.ide.open_dirs.contains("src"));
+        let _ = app.update(Msg::IdeToggleDir("src".to_string()));
+        assert!(!app.ide.open_dirs.contains("src"));
+
+        // Changed only
+        let _ = app.update(Msg::IdeChangedOnly(true));
+        assert!(app.ide.changed_only);
+
+        // Show diff
+        let _ = app.update(Msg::IdeShowDiff(true));
+        assert!(app.ide.show_diff);
+
+        // Open file sets selected and viewer to Loading
+        let _ = app.update(Msg::IdeOpenFile("src/lib.rs".to_string()));
+        assert_eq!(app.ide.selected.as_deref(), Some("src/lib.rs"));
+        assert!(matches!(app.ide.viewer, Viewer::Loading));
+
+        // Listing loaded for matching root sets listing
+        let listing = Listing::new(vec![crate::ide::FileEntry::new("src/lib.rs", None)], false, 1);
+        let _ = app.update(Msg::IdeListingLoaded {
+            root: new_source.root.clone(),
+            result: Ok(listing),
+        });
+        assert!(app.ide.listing.is_some());
+
+        // Stale listing loaded is ignored
+        let _ = app.update(Msg::IdeListingLoaded {
+            root: PathBuf::from("/other/root"),
+            result: Err("error".to_string()),
+        });
+        assert!(app.ide.error.is_none());
+
+        // Refresh triggers load_ide
+        let _ = app.update(Msg::IdeRefresh);
+    }
+
+    #[test]
+    fn test_ide_select_main_resets_changed_only() {
+        let (mut app, _) = App::new(None);
+        app.ide.source = crate::ide::Source {
+            label: "jgt-34".to_string(),
+            root: PathBuf::from("/project/.team/worktrees/jgt-34"),
+            kind: crate::ide::SourceKind::Worktree {
+                branch: "jgt/jgt-34".to_string(),
+            },
+        };
+        let main_source = crate::ide::Source {
+            label: "Main".to_string(),
+            root: PathBuf::from("/project"),
+            kind: crate::ide::SourceKind::Main,
+        };
+        let _ = app.update(Msg::IdeChangedOnly(true));
+        assert!(app.ide.changed_only);
+        let _ = app.update(Msg::IdeSelectSource(main_source));
+        assert!(!app.ide.changed_only, "selecting Main must reset changed_only");
+    }
+
+    #[test]
+    fn test_ide_open_deleted_file_sets_show_diff() {
+        let (mut app, _) = App::new(None);
+        app.ide.source = crate::ide::Source {
+            label: "jgt-34".to_string(),
+            root: PathBuf::from("/project/.team/worktrees/jgt-34"),
+            kind: crate::ide::SourceKind::Worktree {
+                branch: "jgt/jgt-34".to_string(),
+            },
+        };
+        let deleted_entry = crate::ide::FileEntry::new("deleted.txt", Some(crate::ide::ChangeStatus::Deleted));
+        let normal_entry = crate::ide::FileEntry::new("normal.txt", None);
+        app.ide.listing = Some(Listing::new(vec![deleted_entry, normal_entry], false, 2));
+        app.ide.show_diff = false;
+
+        // Opening deleted file forces show_diff to true
+        let _ = app.update(Msg::IdeOpenFile("deleted.txt".to_string()));
+        assert_eq!(app.ide.selected.as_deref(), Some("deleted.txt"));
+        assert!(app.ide.show_diff, "opening deleted file must set show_diff to true");
+
+        // Opening normal file does not force show_diff if it was false
+        app.ide.show_diff = false;
+        let _ = app.update(Msg::IdeOpenFile("normal.txt".to_string()));
+        assert!(!app.ide.show_diff, "opening normal file keeps show_diff false");
+    }
+
+    #[test]
+    fn test_ide_sources_loaded_project_guard_and_workspace_switch_reset() {
+        let (mut app, _) = App::new(None);
+        app.workspace = Some("/project-a".to_string());
+
+        let sources_a = vec![
+            crate::ide::Source {
+                label: "Main".to_string(),
+                root: PathBuf::from("/project-a"),
+                kind: crate::ide::SourceKind::Main,
+            },
+            crate::ide::Source {
+                label: "jgt-10".to_string(),
+                root: PathBuf::from("/project-a/.team/worktrees/jgt-10"),
+                kind: crate::ide::SourceKind::Worktree { branch: "jgt/jgt-10".to_string() },
+            },
+        ];
+
+        let sources_b = vec![
+            crate::ide::Source {
+                label: "Main".to_string(),
+                root: PathBuf::from("/project-b"),
+                kind: crate::ide::SourceKind::Main,
+            },
+            crate::ide::Source {
+                label: "jgt-20".to_string(),
+                root: PathBuf::from("/project-b/.team/worktrees/jgt-20"),
+                kind: crate::ide::SourceKind::Worktree { branch: "jgt/jgt-20".to_string() },
+            },
+        ];
+
+        // 1. Sources from project-b arriving while current workspace is project-a are ignored
+        let _ = app.update(Msg::IdeSourcesLoaded {
+            project: PathBuf::from("/project-b"),
+            result: Ok(sources_b.clone()),
+        });
+        assert!(app.ide.sources.is_empty(), "sources for other project must be ignored");
+
+        // 2. Sources from project-a are accepted
+        let _ = app.update(Msg::IdeSourcesLoaded {
+            project: PathBuf::from("/project-a"),
+            result: Ok(sources_a.clone()),
+        });
+        assert_eq!(app.ide.sources, sources_a);
+        assert_eq!(app.ide.source, sources_a[0]);
+
+        // Select a worktree and file
+        app.ide.source = sources_a[1].clone();
+        app.ide.selected = Some("file.txt".to_string());
+        app.ide.listing = Some(Listing::new(vec![crate::ide::FileEntry::new("file.txt", None)], false, 1));
+        app.ide.viewer = Viewer::Notice("viewing file".to_string());
+
+        // 3. Switching workspace to /project-b resets IdeState
+        let _ = app.update(Msg::SelectWorkspace("/project-b".to_string()));
+        assert_eq!(app.workspace.as_deref(), Some("/project-b"));
+        assert!(app.ide.sources.is_empty(), "workspace switch must reset sources");
+        assert_eq!(app.ide.source.kind, crate::ide::SourceKind::Main, "workspace switch must reset source to Main");
+        assert!(app.ide.selected.is_none(), "workspace switch must reset selected");
+        assert!(app.ide.listing.is_none(), "workspace switch must reset listing");
+        assert!(matches!(app.ide.viewer, Viewer::Notice(ref msg) if msg == "Select a file to view"), "workspace switch must reset viewer");
+    }
+
+    #[test]
+    fn test_open_in_ide_with_existing_sources() {
+        let (mut app, _) = App::new(None);
+        app.module = Module::Board;
+        app.open_task = Some("t34".to_string());
+        app.new_task = Some((jgt_core::TaskStatus::Backlog, "draft".to_string()));
+
+        let wt_source = crate::ide::Source {
+            label: "jgt-34".to_string(),
+            root: PathBuf::from("/project/.team/worktrees/jgt-34"),
+            kind: crate::ide::SourceKind::Worktree {
+                branch: "jgt/jgt-34".to_string(),
+            },
+        };
+        app.ide.sources = vec![
+            crate::ide::Source {
+                label: "Main".to_string(),
+                root: PathBuf::from("/project"),
+                kind: crate::ide::SourceKind::Main,
+            },
+            wt_source.clone(),
+        ];
+
+        // Send OpenInIde with uppercase key JGT-34
+        let _ = app.update(Msg::OpenInIde("JGT-34".to_string()));
+
+        // Module switched to Ide
+        assert_eq!(app.module, Module::Ide);
+        // Leaving Board closes open task and clears new task
+        assert!(app.open_task.is_none());
+        assert!(app.new_task.is_none());
+        // Source selected is the matching worktree
+        assert_eq!(app.ide.source, wt_source);
+        assert_eq!(app.ide.selected, None);
+        assert!(!app.ide.show_diff);
+    }
+
+    #[test]
+    fn test_open_in_ide_loads_sources_first_if_not_loaded() {
+        let (mut app, _) = App::new(None);
+        app.module = Module::Board;
+        app.workspace = Some("/project".to_string());
+        app.ide.sources = Vec::new();
+
+        let wt_source = crate::ide::Source {
+            label: "jgt-34".to_string(),
+            root: PathBuf::from("/project/.team/worktrees/jgt-34"),
+            kind: crate::ide::SourceKind::Worktree {
+                branch: "jgt/jgt-34".to_string(),
+            },
+        };
+
+        // OpenInIde when sources not loaded yet
+        let _ = app.update(Msg::OpenInIde("JGT-34".to_string()));
+        assert_eq!(app.module, Module::Ide);
+
+        // Sources finish loading
+        let loaded_sources = vec![
+            crate::ide::Source {
+                label: "Main".to_string(),
+                root: PathBuf::from("/project"),
+                kind: crate::ide::SourceKind::Main,
+            },
+            wt_source.clone(),
+        ];
+        let _ = app.update(Msg::IdeSourcesLoadedForTask {
+            sources: loaded_sources.clone(),
+            key: "JGT-34".to_string(),
+        });
+
+        assert_eq!(app.ide.sources, loaded_sources);
+        assert_eq!(app.ide.source, wt_source);
+    }
+
+    #[test]
+    fn test_open_in_ide_no_matching_source_fallback() {
+        let (mut app, _) = App::new(None);
+        app.module = Module::Board;
+        app.workspace = Some("/project".to_string());
+        app.ide.sources = Vec::new();
+
+        let main_source = crate::ide::Source {
+            label: "Main".to_string(),
+            root: PathBuf::from("/project"),
+            kind: crate::ide::SourceKind::Main,
+        };
+
+        let _ = app.update(Msg::OpenInIde("JGT-99".to_string()));
+        assert_eq!(app.module, Module::Ide);
+
+        // Sources loaded without matching task worktree
+        let _ = app.update(Msg::IdeSourcesLoadedForTask {
+            sources: vec![main_source.clone()],
+            key: "JGT-99".to_string(),
+        });
+
+        assert_eq!(app.ide.source, main_source);
     }
 }
