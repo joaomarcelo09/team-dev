@@ -238,8 +238,7 @@ field by field, the most specific first. A bad setting (unknown harness or effor
 Coordinator off Claude Code) is replaced and shown as a warning in **Settings**; an effort the
 harness lacks maps to the nearest lower one, and a harness with no effort setting (OpenCode)
 runs without one. `jg-team-dev worker … --model <m> --effort <e>` overrides one worker.
-Settings apply when a team starts (saved in `.team/agents.json` when the Coordinator starts);
-editing `config.toml` afterwards does not change a running team.
+Settings save to `.team/agents.json` when a team starts. To change them live, edit them in **Settings** and click **Apply to this team**, or run `jg-team-dev agents set <role> [--harness h] [--model m] [--effort e]`; new workers use the changes immediately (the Coordinator row applies after a reset).
 
 ## IDE tab
 

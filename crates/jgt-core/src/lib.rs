@@ -12,7 +12,7 @@ pub mod paths;
 pub mod procs;
 pub mod team;
 
-pub use agents::{AgentSetting, AgentSettings, TeamAgents};
+pub use agents::{AgentSetting, AgentSettings, TeamAgents, agents_path};
 pub use client::{ClientError, HubClient};
 pub use model::*;
 

@@ -72,11 +72,98 @@ impl TeamAgents {
             .ok()
     }
 
-    /// Atomically writes `<folder>/.team/agents.json`.
+    /// Atomically writes `<folder>/.team/agents.json`, dropping any stale roles not in `config::roles()`.
     pub fn write(&self, folder: &Path) -> std::io::Result<()> {
+        let mut pruned = self.clone();
+        pruned.prune();
         let path = folder.join(".team").join("agents.json");
-        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
+        let text = serde_json::to_string_pretty(&pruned).map_err(std::io::Error::other)?;
         crate::board::write_atomic(&path, &text)
+    }
+
+    /// Removes any roles not in `config::roles()`, such as stale `planner` entries.
+    pub fn prune(&mut self) {
+        let valid: std::collections::HashSet<&'static str> = config::roles().collect();
+        self.roles.retain(|role, _| valid.contains(role.as_str()));
+    }
+
+    /// Updates the settings for `role`, validating harness, model, and effort.
+    ///
+    /// - `role` must be one of `config::roles()`.
+    /// - The Coordinator runs on Claude Code only.
+    /// - Harness `Custom` is not a valid agent harness.
+    /// - Model cannot be empty.
+    /// - Effort must be one of `harness::effort_levels(harness)` when that list is non-empty
+    ///   (for harnesses with no levels, the effort is kept/ignored).
+    pub fn set_role(
+        &mut self,
+        role: &str,
+        harness: Option<Harness>,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<(), String> {
+        let valid_roles: Vec<&'static str> = config::roles().collect();
+        if !valid_roles.contains(&role) {
+            return Err(format!(
+                "unknown role `{role}` (use {})",
+                valid_roles.join(", ")
+            ));
+        }
+
+        let current = self.roles.get(role);
+        let default_settings = config::role_defaults(role);
+
+        let new_harness = harness
+            .or_else(|| current.map(|c| c.harness))
+            .or_else(|| default_settings.harness.as_deref().and_then(|h| h.parse::<Harness>().ok()))
+            .unwrap_or(Harness::ClaudeCode);
+
+        if new_harness == Harness::Custom {
+            return Err(format!(
+                "unknown harness `{}` (use claude-code, opencode or antigravity)",
+                new_harness.as_str()
+            ));
+        }
+
+        if role == crate::model::COORDINATOR && new_harness != Harness::ClaudeCode {
+            return Err(format!(
+                "coordinator: the Coordinator runs on Claude Code only, not {}",
+                new_harness.label()
+            ));
+        }
+
+        let new_model = model
+            .or_else(|| current.map(|c| c.model.clone()))
+            .or(default_settings.model)
+            .unwrap_or_else(|| config::DEFAULT_MODEL.to_string());
+        let new_model = new_model.trim().to_string();
+        if new_model.is_empty() {
+            return Err("model cannot be empty".to_string());
+        }
+
+        let levels = crate::harness::effort_levels(new_harness);
+        let new_effort = effort
+            .or_else(|| current.map(|c| c.effort.clone()))
+            .or(default_settings.effort)
+            .unwrap_or_else(|| config::DEFAULT_EFFORT.to_string());
+        let new_effort = new_effort.trim().to_string();
+
+        if !levels.is_empty() && !levels.contains(&new_effort.as_str()) {
+            return Err(format!(
+                "unknown effort `{new_effort}` (use {})",
+                levels.join(", ")
+            ));
+        }
+
+        self.roles.insert(
+            role.to_string(),
+            AgentSetting {
+                harness: new_harness,
+                model: new_model,
+                effort: new_effort,
+            },
+        );
+        Ok(())
     }
 
     /// Formats the agents as `coordinator · Claude Code · opus · medium, coder · …`.
@@ -100,5 +187,136 @@ impl TeamAgents {
     /// Formats as `Agents: coordinator · Claude Code · opus · medium, coder · …`.
     pub fn describe(&self) -> String {
         format!("Agents: {}", self.summary())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_role_valid_updates() {
+        let mut agents = TeamAgents::default();
+        agents
+            .set_role(
+                "coder",
+                Some(Harness::Antigravity),
+                Some("gemini-1.5-pro".into()),
+                Some("high".into()),
+            )
+            .unwrap();
+        let coder = agents.roles.get("coder").unwrap();
+        assert_eq!(coder.harness, Harness::Antigravity);
+        assert_eq!(coder.model, "gemini-1.5-pro");
+        assert_eq!(coder.effort, "high");
+
+        // Partial update: change only model
+        agents
+            .set_role("coder", None, Some("gemini-2.5-pro".into()), None)
+            .unwrap();
+        let coder = agents.roles.get("coder").unwrap();
+        assert_eq!(coder.harness, Harness::Antigravity);
+        assert_eq!(coder.model, "gemini-2.5-pro");
+        assert_eq!(coder.effort, "high");
+    }
+
+    #[test]
+    fn test_set_role_unknown_role_rejected() {
+        let mut agents = TeamAgents::default();
+        let err = agents
+            .set_role("planner", Some(Harness::ClaudeCode), Some("opus".into()), None)
+            .unwrap_err();
+        assert!(err.contains("unknown role `planner`"), "{err}");
+    }
+
+    #[test]
+    fn test_set_role_coordinator_only_claude_code() {
+        let mut agents = TeamAgents::default();
+        let err = agents
+            .set_role(
+                crate::model::COORDINATOR,
+                Some(Harness::Opencode),
+                Some("opus".into()),
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            err.contains("the Coordinator runs on Claude Code only"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn test_set_role_empty_model_rejected() {
+        let mut agents = TeamAgents::default();
+        let err = agents
+            .set_role("coder", Some(Harness::ClaudeCode), Some("  ".into()), None)
+            .unwrap_err();
+        assert!(err.contains("model cannot be empty"), "{err}");
+    }
+
+    #[test]
+    fn test_set_role_effort_validation() {
+        let mut agents = TeamAgents::default();
+        // Invalid effort on ClaudeCode
+        let err = agents
+            .set_role(
+                "coder",
+                Some(Harness::ClaudeCode),
+                Some("opus".into()),
+                Some("turbo".into()),
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown effort `turbo`"), "{err}");
+
+        // Opencode has no effort levels, so arbitrary effort is allowed
+        agents
+            .set_role(
+                "coder",
+                Some(Harness::Opencode),
+                Some("qwen".into()),
+                Some("any-effort".into()),
+            )
+            .unwrap();
+        assert_eq!(agents.roles.get("coder").unwrap().effort, "any-effort");
+    }
+
+    #[test]
+    fn test_prune_and_write_drops_stale_roles() {
+        let dir = std::env::temp_dir().join(format!("jgt-agents-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut agents = TeamAgents::default();
+        agents.roles.insert(
+            "planner".into(),
+            AgentSetting {
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "medium".into(),
+            },
+        );
+        agents.roles.insert(
+            "coder".into(),
+            AgentSetting {
+                harness: Harness::ClaudeCode,
+                model: "sonnet".into(),
+                effort: "low".into(),
+            },
+        );
+
+        // write prunes automatically
+        agents.write(&dir).unwrap();
+
+        let loaded = TeamAgents::load(&dir).unwrap();
+        assert!(!loaded.roles.contains_key("planner"));
+        assert!(loaded.roles.contains_key("coder"));
+
+        // prune() directly
+        agents.prune();
+        assert!(!agents.roles.contains_key("planner"));
+        assert!(agents.roles.contains_key("coder"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

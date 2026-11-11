@@ -460,6 +460,7 @@ pub enum Msg {
     // used by M5
     #[allow(dead_code)]
     SaveAgents,
+    ApplyAgents,
     Zoom(Step),
     TextSize(Step),
     Key(keyboard::Event),
@@ -1786,6 +1787,31 @@ impl App {
                 self.toast("Applies to teams started from now on", false);
                 Task::perform(hub::reload_config(), Msg::Done)
             }
+            Msg::ApplyAgents => {
+                let Some(ws) = self.workspace.as_ref().map(PathBuf::from) else {
+                    return Task::none();
+                };
+                let mut agents = TeamAgents::load(&ws)
+                    .unwrap_or_else(|| TeamAgents::resolve(&Config::load().team, &ws));
+                for row in &self.agents {
+                    if let Err(e) = agents.set_role(
+                        &row.role,
+                        Some(row.harness),
+                        Some(row.model.clone()),
+                        Some(row.effort.clone()),
+                    ) {
+                        self.toast(&e, true);
+                        return Task::none();
+                    }
+                }
+                if let Err(e) = agents.write(&ws) {
+                    self.toast(format!("Failed to write agents: {e}"), true);
+                    return Task::none();
+                }
+                self.agents_locked = agents_locked_for(self);
+                self.toast("Applied: new workers use these settings", false);
+                Task::none()
+            }
             Msg::Zoom(step) => {
                 // 10% steps, rounded so repeated steps don't drift.
                 let percent = (self.zoom * 100.0).round() as i32;
@@ -3072,6 +3098,76 @@ allowed_tools = ["Bash"]
             Some(v) => unsafe { std::env::set_var("JGT_CONFIG_DIR", v) },
             None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_apply_agents_updates_running_team_and_agents_locked() {
+        let dir = std::env::temp_dir().join(format!("jgt-apply-agents-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut initial_agents = TeamAgents::default();
+        initial_agents.roles.insert(
+            "coder".into(),
+            jgt_core::AgentSetting {
+                harness: Harness::Antigravity,
+                model: "gemini-3.8-flash-high".into(),
+                effort: "high".into(),
+            },
+        );
+        initial_agents.roles.insert(
+            "coordinator".into(),
+            jgt_core::AgentSetting {
+                harness: Harness::ClaudeCode,
+                model: "opus".into(),
+                effort: "medium".into(),
+            },
+        );
+        initial_agents.write(&dir).unwrap();
+
+        let ws = dir.display().to_string();
+        let (mut app, _) = App::new(None);
+        app.workspace = Some(ws.clone());
+        app.sessions = vec![make_session(
+            "c1",
+            Some(jgt_core::COORDINATOR),
+            None,
+            Some(&ws),
+            SessionStatus::Active,
+            false,
+        )];
+
+        // Open settings: agents_locked is Some
+        let _ = app.update(Msg::ToggleSettings);
+        assert!(app.agents_locked.is_some());
+
+        // Modify coder model in app.agents
+        let _ = app.update(Msg::SetAgentModel("coder".into(), "gemini-1.5-pro".into()));
+
+        // Apply
+        let _ = app.update(Msg::ApplyAgents);
+
+        assert_eq!(
+            app.toast.as_ref().map(|t| (t.text.as_str(), t.error)),
+            Some(("Applied: new workers use these settings", false))
+        );
+
+        // Verify disk agents.json updated
+        let loaded = TeamAgents::load(&dir).unwrap();
+        assert_eq!(loaded.roles["coder"].model, "gemini-1.5-pro");
+
+        // Verify app.agents_locked refreshed
+        assert_eq!(
+            app.agents_locked.as_ref().unwrap().roles["coder"].model,
+            "gemini-1.5-pro"
+        );
+
+        // Test validation failure with invalid effort
+        let _ = app.update(Msg::SetAgentEffort("coder".into(), "invalid_effort".into()));
+        let _ = app.update(Msg::ApplyAgents);
+        assert_eq!(app.toast.as_ref().map(|t| t.error), Some(true));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
