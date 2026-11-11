@@ -20,3 +20,5 @@ iced.workspace = true
 chrono.workspace = true
 rfd.workspace = true
 pulldown-cmark = "0.12"
+# Same version/features as iced_highlighter, so syntect is compiled once.
+two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
