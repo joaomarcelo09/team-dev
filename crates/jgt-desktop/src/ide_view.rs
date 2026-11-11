@@ -1,6 +1,7 @@
 //! IDE tab view: read-only file browser with git changes (P5).
 
 use crate::app::{App, Msg, Viewer};
+use crate::file_icons;
 use crate::icons;
 use crate::ide::{ChangeStatus, DiffLine};
 use crate::style;
@@ -176,9 +177,14 @@ fn picker_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
                         .style(|t: &Theme| text::Style {
                             color: Some(style::muted(t)),
                         });
+                    let folder_icon = file_icons::view(
+                        file_icons::icon_for_folder(&row.name, row.is_open),
+                        style::fs(15),
+                    );
                     let folder_content = row![
                         indent_space,
                         chevron,
+                        folder_icon,
                         text(row.name)
                             .size(style::fs(13))
                             .wrapping(text::Wrapping::None),
@@ -194,9 +200,12 @@ fn picker_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
                     picker_col = picker_col.push(folder_btn);
                 } else {
                     let is_selected = app.ide.selected.as_deref() == Some(&row.path);
+                    let file_icon =
+                        file_icons::view(file_icons::icon_for_file(&row.name), style::fs(15));
                     let mut file_content = row![
                         indent_space,
                         space().width(14.0),
+                        file_icon,
                         text(row.name)
                             .size(style::fs(13))
                             .wrapping(text::Wrapping::None),
@@ -289,6 +298,7 @@ fn tab_bar<'a>(app: &'a App) -> Option<Element<'a, Msg>> {
             .padding([0, 2])
             .on_press(Msg::IdeTabClose(i));
         let content = row![
+            file_icons::view(file_icons::icon_for_file(tab.name()), style::fs(14)),
             text(tab.name())
                 .size(style::fs(13))
                 .wrapping(text::Wrapping::None),
@@ -655,6 +665,34 @@ mod tests {
         let _ = ide(&app);
         assert!(app.ide.open_dirs.contains("src"));
         app.right_collapsed = false;
+        let _ = ide(&app);
+    }
+
+    #[test]
+    fn test_picker_and_tab_bar_render_with_file_icons() {
+        let (mut app, _) = App::new(None);
+        let names = [
+            "Cargo.lock", "Dockerfile", ".gitignore", "LICENSE", "README.md", "Makefile",
+            "src/main.rs", "src/a.toml", "src/a.json", "src/a.sh", "src/a.yml", "src/a.js",
+            "src/a.ts", "src/a.py", "src/a.html", "src/a.css", "src/a.PNG", "src/a.txt",
+            "src/noext", "src/.env", "src/deep/x.unknown",
+        ];
+        let entries: Vec<FileEntry> = names.iter().map(|n| FileEntry::new(*n, None)).collect();
+        let len = entries.len();
+        app.ide.listing = Some(Listing::new(entries, false, len));
+        let theme = style::dark();
+
+        // Folders closed, then open (src open, src/deep closed).
+        let _ = picker_pane(&app, &theme);
+        app.ide.open_dirs.insert("src".to_string());
+        let _ = picker_pane(&app, &theme);
+
+        assert!(tab_bar(&app).is_none());
+        let source = app.ide.source.clone();
+        for n in names {
+            app.ide.tabs.open(crate::ide_tabs::IdeTab::new(source.clone(), n, false));
+        }
+        assert!(tab_bar(&app).is_some());
         let _ = ide(&app);
     }
 
