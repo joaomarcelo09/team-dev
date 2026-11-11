@@ -473,8 +473,8 @@ impl Hub {
         let Some(review) = &task.review_result else {
             return Err(format!("{} needs a review of this pass (K6)", to.label()));
         };
-        if review.decision == ReviewDecision::Changes && task.fix_round_left() {
-            return Err("the fix round is still left: move it to Working".into());
+        if review.decision == ReviewDecision::Changes {
+            return Err("the reviewer requested changes: the card stays in Review until the user decides".into());
         }
         Ok(())
     }
@@ -487,8 +487,8 @@ impl Hub {
 
     /// The team's transition table (plan §1.4). `Err` names the gate that refuses the move.
     ///
-    /// The flow: coder → first verification → Done when clean; otherwise one automatic fix round
-    /// (Review or Testing → Working) → second verification → Done.
+    /// The flow: coder → one verification → Done when approved; if changes are requested or
+    /// tests fail, the card stays and the user decides (no automatic fix round).
     fn check_team_move(
         &self,
         b: &Board,
@@ -539,11 +539,7 @@ impl Hub {
                     return refused("back to Working needs a red test of this pass".into());
                 }
                 if !task.fix_round_left() {
-                    return refused(format!(
-                        "verification {} of {} is done: no further automatic fix; report it to the user, who moves the card",
-                        task.round().0,
-                        task.round_limit
-                    ));
+                    return refused("no automatic fix round: the card stays where it is and the user decides".into());
                 }
             }
             (Testing, Review) => {
@@ -552,14 +548,11 @@ impl Hub {
                 }
             }
             (Review, Working) => {
-                let Some(review) = task.review_result.as_ref().filter(|r| r.decision == ReviewDecision::Changes) else {
+                let Some(_review) = task.review_result.as_ref().filter(|r| r.decision == ReviewDecision::Changes) else {
                     return refused("back to Working needs a review of this pass that requests changes".into());
                 };
                 if !task.fix_round_left() {
-                    return refused(format!(
-                        "verification {} of {} is done: no further automatic fix; report it to the user, who moves the card",
-                        review.round, task.round_limit
-                    ));
+                    return refused("no automatic fix round: the card stays where it is and the user decides".into());
                 }
             }
             (Review, to) if to.is_git_stage() || to == Done => {
@@ -1136,9 +1129,14 @@ impl Hub {
         let stalled: Vec<(Task, i64)> = tasks
             .into_iter()
             .filter(|(t, last_activity)| {
+                let waiting_for_user = t.status == TaskStatus::Review
+                    && t.review_result
+                        .as_ref()
+                        .is_some_and(|r| r.decision == ReviewDecision::Changes);
                 t.current_worker.is_none()
                     && t.waiting.is_none()
                     && !t.archived
+                    && !waiting_for_user
                     && *last_activity + stalled_after_ms <= now
             })
             .collect();

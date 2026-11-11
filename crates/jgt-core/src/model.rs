@@ -500,9 +500,8 @@ string_enum! {
     }
 }
 
-/// Verifications a task gets before moving to Done: the first one, and the one after
-/// the single automatic fix round.
-pub const ROUND_LIMIT: i64 = 2;
+/// Verifications a task gets before moving to Done: one verification, no automatic fix round.
+pub const ROUND_LIMIT: i64 = 1;
 
 /// Prefix of every task key (`JGT-12`).
 pub const TASK_KEY_PREFIX: &str = "JGT-";
@@ -582,9 +581,9 @@ impl Task {
         (self.review_rounds + 1, self.round_limit)
     }
 
-    /// Whether the round is worth showing: the team has the task, or a review already sent it back.
+    /// Whether the round is worth showing: only when a user sent it back.
     pub fn shows_round(&self) -> bool {
-        self.review_rounds > 0 || self.status.in_progress()
+        self.review_rounds > 0
     }
 
     /// Whether the team may still start a fix round: the current verification is not
@@ -878,6 +877,25 @@ mod tests {
         let a = Actor::Coordinator { session: "s1".into() };
         assert_eq!(serde_json::to_string(&a).unwrap(), r#"{"kind":"coordinator","session":"s1"}"#);
         assert_eq!(serde_json::to_string(&Actor::User).unwrap(), r#"{"kind":"user"}"#);
+    }
+
+    #[test]
+    fn single_round_shows_only_when_sent_back() {
+        let mut t = Task::new("/w", 1, "task", TaskStatus::Working);
+        assert_eq!(t.round_limit, 1);
+        assert_eq!(t.review_rounds, 0);
+        assert!(!t.shows_round());
+        assert!(!t.fix_round_left());
+        assert_eq!(t.round(), (1, 1));
+
+        t.status = TaskStatus::Review;
+        assert!(!t.shows_round());
+
+        // Sent back by user
+        t.review_rounds = 1;
+        assert!(t.shows_round());
+        assert_eq!(t.round(), (2, 1));
+        assert!(!t.fix_round_left());
     }
 
     #[test]

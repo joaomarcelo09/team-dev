@@ -1,14 +1,14 @@
 # jg-team-dev
 
 A desktop chat with a **Coordinator**: a Claude Code session that listens to you and runs a team
-of worker sessions (planner, coder, reviewer, git-coder). Each worker starts with a
+of worker sessions (coder, reviewer, git-coder). Each worker starts with a
 clean context and one skill, reports progress in its own chat box, and exits when its task is done.
 
 ## In short
 
 jg-team-dev is a desktop app for running a small team of AI coding agents on your own projects.
 You chat with a Coordinator, which breaks the work into tasks on a Kanban board.
-A planner, coder, reviewer and git worker take each task in turn, each in its own chat.
+The Coordinator writes the brief into the task, then coder, reviewer and git-coder take each task in turn, each in its own chat.
 Every task gets its own branch and worktree; the coder runs the tests and the reviewer checks the full diff.
 You approve each git step (commit, push, pull request, merge) unless you switch it to automatic.
 The app, its hub and its data run on your machine; the agents use Claude Code or Antigravity.
@@ -27,7 +27,7 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   wakes it with its context intact.
 
 - **Workers and skills**: the Coordinator runs `jg-team-dev worker <skill> --task … --brief-file …`
-  (planner, coder, reviewer, git-coder; there are no separate verifier or tester workers: the coder
+  (coder, reviewer, git-coder; there are no separate verifier or tester workers: the coder
   runs the build and tests, and the reviewer is the only gate). It returns at once; a detached process runs
   `claude -p "/jg-team-dev:<skill> <brief>"` (or Antigravity / OpenCode as configured) and relays
   the result JSON to the Coordinator through the hub, waking it if needed. Workers get their own
@@ -75,23 +75,20 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   result and comment goes to the task's activity log with who made it. The hub enforces the gates:
   workers only read the Board; agents never edit the title, description or priority; the Coordinator
   creates tasks in Backlog and queues only subtasks of a task you queued; at most `wip_limit` tasks
-  are in progress. The flow is coder (stays in Working until tests are green; no rounds used) →
-  reviewer (full diff) → one fix round if blocking/high findings (fresh coder fixes them and re-runs
-  tests) → reviewer (fix diff only) → routing along the git line to Done. Review → Done is accepted
-  for an approved review at any round, and for a review with changes only when no fix round is left.
-  The hub then files the leftover findings as ONE follow-up in Backlog (parent = the task) and sets
-  its priority itself = highest severity (blocking/high → high; medium or unlabelled → normal; only
-  low → low; no findings → normal). The task never waits for the user (a red test at the last round
-  needs a user move). You may move any task anywhere; a move that skips a gate is logged as "moved
-  by you". Reopening a task from a git column or Done (moving to On Queue) resets its rounds.
+  are in progress. The flow is: Coordinator writes the brief, plan and acceptance criteria into the task Details →
+  coder implements and tests (stays in Working until tests are green) → one reviewer pass checks only critical things
+  across the full diff. If clean, the card moves to Done and the hub routes it along the git line. If changes are requested,
+  the card stays in Review for the user; when the user moves it back to Working (or asks for a fix), a fresh coder fixes
+  the findings, runs tests, and a new full review runs. Medium and low findings no longer exist. You may move any task anywhere;
+  a move that skips a gate is logged as "moved by you".
   `jg-team-dev task` (`list`, `show`, `create`, `edit`, `details`, `move`, `result`, `comment`,
   `delete`, `log`, `export`) drives it from a terminal or a session.
 
 - **Board view**: a Coordinator's chat header has two tabs, **Chat** (the default) and **Board**.
   The Board shows the workspace's ten columns with their counts, scrolling sideways in a narrow
   window; Done shows the 20 newest tasks, with "Show all". "+" in Backlog and On Queue adds a task
-  (a title is enough). A card shows its key, title, priority, the worker on it (`↳ reviewer`), the
-  review (`round 1/2`) and *Waiting for you* or *Waiting: usage limit*; move it with ← → or
+  (a title is enough). A card shows its key, title, priority, the worker on it (`↳ reviewer`),
+  the review decision and *Waiting for you* or *Waiting: usage limit*; move it with ← → or
   "Move to…". Click a card for its panel: edit the title, description and priority; read the
   Coordinator's Details, the test and review results (critical findings first) and the activity
   log; open the run folder or a worker's chat; delete it. Changes from the team or a terminal show
@@ -103,13 +100,12 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   results; the hub never starts agents). With no Coordinator running, the task's log says so and
   the app offers "Start team". The Coordinator works the task with the MCP tools `task_list`,
   `task_get`, `task_update`, `task_move`, `task_create` and `task_log`, following the "Board"
-  section of its skill: it moves the card before announcing each step and keeps the one-fix-round
+  section of its skill: it moves the card before announcing each step and follows the one-review-pass
   rule. Workers only read (`task_get`). `jg-team-dev run start --task-id JGT-n` names the run after
   the key and links it to the task; `jg-team-dev worker … --task-id JGT-n` works in
   `.team/worktrees/jgt-n` (branch `jgt/jgt-n`) in the task's run, and the card shows the worker
-  on it. The reviewer tags each finding by severity (`blocking`, `high`, `medium`, `low`), with a
-  category (security, secret, performance, patterns, docs, behavior); only blocking and high
-  findings start a fix round.
+  on it. The reviewer checks only critical findings (severity `blocking` or `high`, category `behavior`,
+  `security`, `secret`, or `patterns`).
 
 - **Board interactions and export**: drag a card to another column or position (Esc cancels; ← →
   and "Move to…" stay). Comment on a task from its panel or `jg-team-dev task comment`: the
@@ -122,16 +118,12 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
 
 - **Team efficiency and review gate**: the coder runs the build and tests itself and reports them
   (`tests` field); while tests fail (or work is incomplete), the task stays in Working and the
-  Coordinator starts a fresh coder to make them green, recording no test result and using no fix
-  round. Once tests are green, the Coordinator records it as the task's test result (`pass`) and
-  moves the card to Review. The **reviewer** is the only gate: it does not re-run tests, it reviews
-  architecture, code, test results and how the change affects the app and the integration between
-  services. One reviewer per task: a big task (frontend + backend) may have several coders sharing
-  one worktree, but a single reviewer reviews the whole task at the end. The FIRST review always
-  covers the full worktree diff (`git diff`, all coders); fix rounds (consumed only by review
-  findings) check only the new diff: `jg-team-dev snapshot --task JGT-n` saves what a review checked
-  as a git tree under `refs/jgt/<key>/checked-<round>` (no commit, the branch and index stay untouched),
-  and the second review uses `jg-team-dev snapshot --task JGT-n --diff` to review the diff since then.
+  Coordinator starts a fresh coder to make them green, recording no test result. Once tests are green,
+  the Coordinator records it as the task's test result (`pass`) and moves the card to Review. The
+  **reviewer** is the only gate: it does not re-run tests, it checks only critical things (`behavior`,
+  `security`, `secret`, `patterns` when documented). One review pass per task, reviewing the full
+  worktree diff (`git diff`, all coders). If the reviewer requests changes, the card stays in Review
+  waiting for the user.
   A finished worker's result reaches the Coordinator as a short digest (at most 10 lines: status,
   finding counts, notes) with the path of the full result in the run, which also shows in the
   worker's chat. A worker stopped by the usage limit sets *Waiting: usage limit* on its task with the
@@ -159,10 +151,6 @@ permission_mode = "auto"   # only prompts auto mode can't settle reach the app
 wip_limit = 1              # Board tasks in progress at once (1..=3)
 
 [team.skills.coordinator]  # Claude Code only
-model = "opus"
-effort = "medium"
-
-[team.skills.planner]
 model = "opus"
 effort = "medium"
 

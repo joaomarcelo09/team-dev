@@ -22,7 +22,7 @@ pub const SESSION_ENV: &str = "JGT_SESSION";
 pub const TASK_ENV: &str = "JGT_TASK";
 
 /// Worker skills a Coordinator can start (`jg-team-dev worker <skill>`).
-pub const WORKER_SKILLS: &[&str] = &["planner", "coder", "reviewer", "git-coder"];
+pub const WORKER_SKILLS: &[&str] = &["coder", "reviewer", "git-coder"];
 
 /// Where `settings.json`, `mcp.json` and `plugin/` for team sessions are written.
 pub fn files_dir() -> PathBuf {

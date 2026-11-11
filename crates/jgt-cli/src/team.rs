@@ -70,7 +70,6 @@ fn write_atomic(path: &Path, content: &str) -> Result<()> {
 /// Skills bundled into the binary and written to the plugin folder at start.
 const SKILLS: &[(&str, &str)] = &[
     ("coordinator", include_str!("../../../skills/coordinator/SKILL.md")),
-    ("planner", include_str!("../../../skills/planner/SKILL.md")),
     ("coder", include_str!("../../../skills/coder/SKILL.md")),
     ("reviewer", include_str!("../../../skills/reviewer/SKILL.md")),
     ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),

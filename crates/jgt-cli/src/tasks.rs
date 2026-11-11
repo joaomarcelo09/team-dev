@@ -509,10 +509,10 @@ mod tests {
         let mut t = Task::new("/w", 1, "one", TaskStatus::Backlog);
         assert!(!show(&t).contains("round"));
         t.status = TaskStatus::Review;
-        assert!(show(&t).contains("round      1/2"));
+        assert!(!show(&t).contains("round"));
         t.status = TaskStatus::Backlog;
         t.review_rounds = 1;
-        assert!(show(&t).contains("round      2/2"));
+        assert!(show(&t).contains("round      2/1"));
     }
 
     #[test]
