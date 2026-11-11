@@ -178,7 +178,7 @@ impl Target {
 }
 
 /// The move a drop on `target` makes: the column and the `position` the hub expects (the index
-/// among the column's other cards). `None` when the card would land where it is (a click).
+/// among the column's other cards). `None` when the card would land where it is.
 /// Done is ordered by date, so a drop there goes to its end.
 pub fn drop_move(board: &Board, id: &str, target: Target) -> Option<(TaskStatus, Option<i64>)> {
     let task = board.get(id)?;
@@ -522,12 +522,22 @@ fn lane<'a>(app: &'a App, board: &'a Board, status: TaskStatus, theme: &Theme) -
 fn card<'a>(app: &'a App, task: &'a Task, index: usize, len: usize, at: Target, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
     let open = app.open_task.as_deref() == Some(task.id.as_str());
+    let mut handle_area = mouse_area(container(muted("⋮⋮").size(style::fs(11))).padding([0, 2]))
+        .interaction(if app.drag.is_some() { mouse::Interaction::Grabbing } else { mouse::Interaction::Grab });
+    if app.drag.is_none() {
+        handle_area = handle_area.on_press(Msg::DragStart(task.id.clone()));
+    } else {
+        handle_area = handle_area.on_enter(Msg::DragOver(at)).on_release(Msg::Drop);
+    }
+    let handle = tip(handle_area, "Drag to move");
     let mut info = column![
         row![
+            handle,
             muted(task.key.as_str()).size(style::fs(11)).font(bold()),
             space::horizontal(),
             tip(dot(style::priority_color(theme, task.priority), 8.0), priority_tip(task.priority)),
         ]
+        .spacing(4)
         .align_y(Alignment::Center),
         text(task.title.as_str()).size(style::fs(13)),
     ]
@@ -580,14 +590,18 @@ fn card<'a>(app: &'a App, task: &'a Task, index: usize, len: usize, at: Target, 
         .padding([8, 10])
         .width(Fill)
         .style(style::task_card(open || dragged, task.waiting.is_some()));
-    // A press starts a drag; a release where it started is a click that opens the task. The
-    // buttons and the menu take their own presses.
-    let mut area = mouse_area(card)
-        .on_press(Msg::DragStart(task.id.clone()))
-        .on_release(Msg::Drop)
-        .interaction(if app.drag.is_some() { mouse::Interaction::Grabbing } else { mouse::Interaction::Pointer });
+    // Clicking the card body opens details; dragging is only initiated by the grip handle.
+    // The buttons and the menu take their own presses.
+    let mut area = mouse_area(card);
     if app.drag.is_some() {
-        area = area.on_enter(Msg::DragOver(at));
+        area = area
+            .on_enter(Msg::DragOver(at))
+            .on_release(Msg::Drop)
+            .interaction(mouse::Interaction::Grabbing);
+    } else {
+        area = area
+            .on_press(Msg::OpenTask(task.id.clone()))
+            .interaction(mouse::Interaction::Pointer);
     }
     area.into()
 }
@@ -1226,9 +1240,12 @@ mod tests {
     fn a_drag_ends_on_every_path() {
         let (mut app, _) = App::new(None);
         app.boards.insert("/w".into(), Board::new(vec![task(1, TaskStatus::Backlog, 0), task(2, TaskStatus::Backlog, 1)]));
-        // Press and release on the same card: it opens.
+        // Drop on the same place does nothing (no move, no open).
         let _ = app.update(Msg::DragStart("t1".into()));
         let _ = app.update(Msg::Drop);
+        assert_eq!((app.drag.as_ref(), app.open_task.as_deref()), (None, None));
+        // A click on the card body opens the task; no drag is started.
+        let _ = app.update(Msg::OpenTask("t1".into()));
         assert_eq!((app.drag.as_ref(), app.open_task.as_deref()), (None, Some("t1")));
         // Released outside any target, or Esc: nothing moves.
         let _ = app.update(Msg::DragStart("t2".into()));
@@ -1254,6 +1271,85 @@ mod tests {
         let _ = app.update(Msg::DragOver(Target::Before(TaskStatus::Backlog, 0)));
         let _ = app.update(Msg::Drop);
         assert!(app.drag.is_none());
+    }
+
+    #[test]
+    fn body_click_opens_task_without_starting_drag() {
+        let (mut app, _) = App::new(None);
+        app.boards.insert("/w".into(), Board::new(vec![task(1, TaskStatus::Backlog, 0)]));
+        assert!(app.open_task.is_none());
+        assert!(app.drag.is_none());
+
+        // Clicking the card body sends OpenTask
+        let _ = app.update(Msg::OpenTask("t1".into()));
+        assert_eq!(app.open_task.as_deref(), Some("t1"));
+        assert!(app.drag.is_none(), "body click must never start a drag");
+
+        // Verify card element can be constructed
+        let b = app.boards.get("/w").unwrap();
+        let _ = card(&app, b.get("t1").unwrap(), 0, 1, Target::Before(TaskStatus::Backlog, 0), &Theme::Dark);
+    }
+
+    #[test]
+    fn handle_drag_start_and_drop_on_another_column_moves() {
+        let (mut app, _) = App::new(None);
+        app.boards.insert(
+            "/w".into(),
+            Board::new(vec![
+                task(1, TaskStatus::Backlog, 0),
+                task(2, TaskStatus::Working, 0),
+            ]),
+        );
+
+        // Grip handle initiates drag
+        let _ = app.update(Msg::DragStart("t1".into()));
+        assert_eq!(app.drag.as_ref().map(|d| d.id.as_str()), Some("t1"));
+        assert!(app.drag.as_ref().unwrap().over.is_none());
+
+        // Hover over Working column
+        let target = Target::End(TaskStatus::Working);
+        let _ = app.update(Msg::DragOver(target));
+        assert_eq!(app.drag.as_ref().and_then(|d| d.over), Some(target));
+
+        // Dropping moves the task to the new column
+        let b = app.boards.get("/w").unwrap();
+        assert_eq!(drop_move(b, "t1", target), Some((TaskStatus::Working, None)));
+
+        let _ = app.update(Msg::Drop);
+        assert!(app.drag.is_none(), "drop must clear drag state");
+    }
+
+    #[test]
+    fn drop_on_own_place_does_not_move() {
+        let (mut app, _) = App::new(None);
+        app.boards.insert(
+            "/w".into(),
+            Board::new(vec![
+                task(1, TaskStatus::Backlog, 0),
+                task(2, TaskStatus::Backlog, 1),
+            ]),
+        );
+
+        // Case 1: DragStart followed immediately by Drop without moving anywhere
+        let _ = app.update(Msg::DragStart("t1".into()));
+        assert!(app.drag.is_some());
+        let _ = app.update(Msg::Drop);
+        assert!(app.drag.is_none());
+        assert!(app.open_task.is_none(), "drop on own place must not open task");
+
+        // Case 2: DragStart and DragOver its own position, then Drop
+        let _ = app.update(Msg::DragStart("t1".into()));
+        let _ = app.update(Msg::DragOver(Target::Before(TaskStatus::Backlog, 0)));
+        let b = app.boards.get("/w").unwrap();
+        assert_eq!(drop_move(b, "t1", Target::Before(TaskStatus::Backlog, 0)), None);
+        let _ = app.update(Msg::Drop);
+        assert!(app.drag.is_none());
+        assert!(app.open_task.is_none(), "drop on own place must not open task");
+
+        // Verify tasks remain in their original positions
+        let b = app.boards.get("/w").unwrap();
+        let backlog_tasks: Vec<_> = b.column(TaskStatus::Backlog).iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(backlog_tasks, vec!["t1", "t2"]);
     }
 
     #[test]
