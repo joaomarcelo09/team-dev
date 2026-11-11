@@ -5,8 +5,8 @@ use crate::icons;
 use crate::ide::{ChangeStatus, DiffLine};
 use crate::style;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, rule, scrollable, space, text,
-    text_editor,
+    button, checkbox, column, container, mouse_area, pick_list, row, rule, scrollable, space,
+    text, text_editor, tooltip,
 };
 use iced::{Alignment, Border, Color, Element, Font, Length::Fill, Length, Theme};
 
@@ -264,6 +264,53 @@ fn picker_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
         .into()
 }
 
+/// Builds the tab bar of open files above the viewer, or `None` when no tab is open.
+fn tab_bar<'a>(app: &'a App) -> Option<Element<'a, Msg>> {
+    if app.ide.tabs.tabs.is_empty() {
+        return None;
+    }
+    let mut tabs_row = row![].spacing(2).align_y(Alignment::Center);
+    for (i, tab) in app.ide.tabs.tabs.iter().enumerate() {
+        let active = app.ide.tabs.active == Some(i);
+        let close_btn = button(icons::icon(icons::Icon::Close, style::fs(12)))
+            .style(style::ghost)
+            .padding([0, 2])
+            .on_press(Msg::IdeTabClose(i));
+        let content = row![
+            text(tab.name())
+                .size(style::fs(13))
+                .wrapping(text::Wrapping::None),
+            close_btn,
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+        let tab_btn = button(content)
+            .style(style::tab(active))
+            .padding([3, 4])
+            .on_press(Msg::IdeTabFocus(i));
+        let tip_label = if tab.source.root == app.ide.source.root {
+            tab.path.clone()
+        } else {
+            format!("{} ({})", tab.path, tab.source.label)
+        };
+        let with_tip = tooltip(
+            mouse_area(tab_btn).on_middle_press(Msg::IdeTabClose(i)),
+            container(text(tip_label).size(style::fs(12)))
+                .padding([6, 10])
+                .style(container::rounded_box),
+            tooltip::Position::Bottom,
+        )
+        .gap(4);
+        tabs_row = tabs_row.push(with_tip);
+    }
+    let bar = scrollable(container(tabs_row).padding([4, 8]))
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(4).scroller_width(4),
+        ))
+        .width(Fill);
+    Some(column![bar, rule::horizontal(1).style(rule::weak)].into())
+}
+
 /// Builds the viewer area (left pane).
 fn viewer_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     let selected_status = app.ide.selected.as_ref().and_then(|sel_path| {
@@ -432,6 +479,9 @@ fn viewer_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     };
 
     let mut viewer_layout = column![].width(Fill).height(Fill);
+    if let Some(bar) = tab_bar(app) {
+        viewer_layout = viewer_layout.push(bar);
+    }
     if let Some(header) = header_bar {
         viewer_layout = viewer_layout.push(header);
     }
@@ -576,6 +626,16 @@ mod tests {
 
         // 7. Changed only filter
         app.ide.changed_only = true;
+        let _ = ide(&app);
+
+        // 8. Tab bar with a tab of the current source and one of another source
+        let main = Source {
+            label: "Main".to_string(),
+            root: PathBuf::from("/project"),
+            kind: SourceKind::Main,
+        };
+        app.ide.tabs.open(crate::ide_tabs::IdeTab::new(main, "README.md", false));
+        app.ide.tabs.open(crate::ide_tabs::IdeTab::new(app.ide.source.clone(), "src/main.rs", true));
         let _ = ide(&app);
     }
 }

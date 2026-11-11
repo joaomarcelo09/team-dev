@@ -593,8 +593,7 @@ pub fn segment_button(active: bool) -> impl Fn(&Theme, button::Status) -> button
 
 // ── board ───────────────────────────────────────────────────────────────────
 
-/// The Chat | Board tabs in a Coordinator's header.
-#[allow(dead_code)]
+/// The Chat | Board tabs in a Coordinator's header, and the IDE file tabs.
 pub fn tab(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |theme, status| {
         let p = ext(theme);
