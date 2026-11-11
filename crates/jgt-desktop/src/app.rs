@@ -1325,8 +1325,8 @@ impl App {
                 let to = self.boards.get(&task.workspace).zip(drag.over).and_then(|(b, t)| crate::board::drop_move(b, &drag.id, t));
                 match to {
                     Some((to, position)) => self.update(Msg::MoveTask { id: drag.id, to, position }),
-                    // Released where it was picked up: a click.
-                    None => self.update(Msg::OpenTask(drag.id)),
+                    // Dropped on the card's own place: does nothing.
+                    None => Task::none(),
                 }
             }
             Msg::DragEnd => {
