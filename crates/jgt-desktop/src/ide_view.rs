@@ -414,14 +414,13 @@ fn viewer_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
                     }
                 });
 
-            let hl_theme = if theme.extended_palette().is_dark {
-                iced::highlighter::Theme::Base16Mocha
-            } else {
-                iced::highlighter::Theme::InspiredGitHub
+            let settings = crate::syntax::Settings {
+                palette: crate::syntax::palette_for(app.theme_style, theme.extended_palette().is_dark),
+                token: ext.clone(),
             };
 
             let editor: Element<'a, Msg> = text_editor(content)
-                .highlight(ext, hl_theme)
+                .highlight_with::<crate::syntax::Highlighter>(settings, crate::syntax::Highlight::to_format)
                 .on_action(Msg::IdeViewer)
                 .padding([8, 10])
                 .size(style::fs(13))
@@ -657,5 +656,26 @@ mod tests {
         assert!(app.ide.open_dirs.contains("src"));
         app.right_collapsed = false;
         let _ = ide(&app);
+    }
+
+    #[test]
+    fn test_ide_text_viewer_renders_in_every_theme() {
+        use crate::app::{ThemePref, ThemeStyle};
+        let (mut app, _) = App::new(None);
+        app.ide.selected = Some("src/main.rs".to_string());
+        for (ext, src) in [
+            ("rs", "// c\nfn main() { let s = \"x\"; }\n"),
+            ("toml", "[a]\nb = 1\n"),
+            ("", "plain text\n"),
+        ] {
+            app.ide.viewer = Viewer::Text(text_editor::Content::with_text(src), ext.to_string());
+            for style in [ThemeStyle::Violet, ThemeStyle::Default, ThemeStyle::TokyoNight, ThemeStyle::Dracula] {
+                app.theme_style = style;
+                for pref in [ThemePref::Dark, ThemePref::Light] {
+                    app.theme_pref = pref;
+                    let _ = ide(&app);
+                }
+            }
+        }
     }
 }

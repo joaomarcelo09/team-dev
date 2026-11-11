@@ -245,6 +245,7 @@ Settings save to `.team/agents.json` when a team starts. To change them live, ed
 The desktop app includes an **IDE** module (in the sidebar below Board, or opened via the **Open in IDE** button on a task panel) for viewing project files and worktree changes:
 
 - **Read-only viewer**: displays highlighted file contents with line numbers. There is no editing, saving, or code execution.
+- **Syntax highlighting**: code colors follow the app theme: Dracula colors under the Dracula theme (pink keywords, yellow strings, green functions, purple numbers, grey-blue comments, cyan italic types), Tokyo Night colors under Tokyo Night, Base16 Mocha under the other dark themes and InspiredGitHub under light; the language is detected from the file extension (unknown extensions show plain text).
 - **Source selector**: choose between `main` (the committed `main` branch from git, reflecting committed state) and any task worktree under `.team/worktrees/` (showing working tree files, including uncommitted coder changes).
 - **Picker on the right**: directory tree on the right side of the view, sorted folders-first and lazily expanded.
 - **M/A/D marks and "Changed only"**: worktree files display badges for Modified (`M`), Added (`A`), Deleted (`D`), and Renamed (`R`) changes relative to the merge base with `main`. A **Changed only** checkbox filters the tree to only show files with changes.

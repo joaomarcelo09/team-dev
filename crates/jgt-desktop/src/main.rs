@@ -9,6 +9,7 @@ mod ide_git;
 mod ide_tabs;
 mod ide_view;
 mod style;
+mod syntax;
 mod view;
 
 use jgt_core::{HubClient, api::HealthResponse};
