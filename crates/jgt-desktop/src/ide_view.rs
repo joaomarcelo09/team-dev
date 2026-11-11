@@ -258,7 +258,19 @@ fn picker_pane<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
         .height(Fill)
         .width(Fill);
 
-    container(picker_scroll)
+    let header = row![
+        crate::view::bar_toggle(crate::view::Side::Right, false),
+        text("Files")
+            .size(style::fs(12))
+            .style(|t: &Theme| text::Style {
+                color: Some(style::muted(t)),
+            }),
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .padding([4, 6]);
+
+    container(column![header, picker_scroll].height(Fill))
         .width(Length::Fixed(320.0))
         .height(Fill)
         .into()
@@ -497,7 +509,8 @@ pub fn ide<'a>(app: &'a App) -> Element<'a, Msg> {
     let body = row![
         viewer_pane(app, &theme),
         rule::vertical(1).style(rule::weak),
-        picker_pane(app, &theme),
+        crate::view::bar_strip(crate::view::Side::Right, app.right_collapsed),
+        crate::view::keep_mounted(picker_pane(app, &theme), !app.right_collapsed),
     ]
     .width(Fill)
     .height(Fill);
@@ -636,6 +649,13 @@ mod tests {
         };
         app.ide.tabs.open(crate::ide_tabs::IdeTab::new(main, "README.md", false));
         app.ide.tabs.open(crate::ide_tabs::IdeTab::new(app.ide.source.clone(), "src/main.rs", true));
+        let _ = ide(&app);
+
+        // 9. Collapsed file picker: only a strip with the expand chevron; tree state is kept
+        app.right_collapsed = true;
+        let _ = ide(&app);
+        assert!(app.ide.open_dirs.contains("src"));
+        app.right_collapsed = false;
         let _ = ide(&app);
     }
 }

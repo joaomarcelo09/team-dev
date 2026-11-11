@@ -259,6 +259,7 @@ The desktop app includes an **IDE** module (in the sidebar below Board, or opene
   - Symlinks are not followed (`Symlink: not followed`), and path traversal (`..` components or paths escaping the root) is rejected.
 - **Tabs**: each file you open from the picker gets a tab above the viewer (clicking an open file focuses its tab). A tab remembers its source and File/Diff state; focusing a tab from another source switches the source selector. Close a tab with its **x** button or a middle-click; closing the active tab activates a neighbour. Up to 20 tabs (opening more closes the oldest inactive one); tabs of removed worktrees are dropped on refresh, and tabs are kept while the app runs (not across restarts).
 - **Refresh button**: reloads sources and file listings manually on demand; there is no auto-refresh or background file watching.
+- **Collapsible side bars**: the chevron (`‹`/`›`) next to the sidebar search collapses the left side bar (sessions and workspaces) to a thin strip, and the one at the top of the picker collapses the file picker; the chevron left in the strip expands it again. **Ctrl+B** toggles the left bar and **Ctrl+Alt+B** the picker. Collapsing keeps the selection, open folders and scroll positions, and the state is saved with the other view settings (`left_bar_collapsed` and `right_bar_collapsed` under `[desktop]` in `config.toml`).
 
 ## Installation
 

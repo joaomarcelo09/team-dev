@@ -452,6 +452,10 @@ pub struct Desktop {
     pub text_size: u16,
     /// Show the jg-team-dev icon in the system tray (StatusNotifierItem), with a dot for unread messages.
     pub tray: bool,
+    /// The left side bar (sessions, workspaces) is collapsed to a thin strip.
+    pub left_bar_collapsed: bool,
+    /// The right side bar (the IDE file picker) is collapsed to a thin strip.
+    pub right_bar_collapsed: bool,
 }
 
 impl Desktop {
@@ -469,6 +473,8 @@ impl Default for Desktop {
             zoom: 1.0,
             text_size: Self::DEFAULT_TEXT_SIZE,
             tray: true,
+            left_bar_collapsed: false,
+            right_bar_collapsed: false,
         }
     }
 }
