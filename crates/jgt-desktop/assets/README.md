@@ -88,3 +88,12 @@ assert len(cmap) == 33
 | Warning | `U+F083` | `warning` |
 | Folder | `U+E2C7` | `folder` |
 | Folder Open | `U+E2C8` | `folder_open` |
+
+# File-type icons (`file-icons/`)
+
+The colored 16x16 SVGs in `file-icons/` (file types and open/closed folders, used by the IDE
+file picker and tabs) were drawn for this project and are our own work, under the project's
+license; no third-party icons or license apply. Their style is inspired by, not copied from,
+the VS Code Material Icon Theme. They are embedded with `include_bytes!` and rasterized once
+with resvg (`src/file_icons.rs`); keep them free of `<text>` elements (resvg is built
+without text support).

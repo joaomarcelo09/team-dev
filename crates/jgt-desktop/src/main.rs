@@ -2,6 +2,7 @@
 
 mod app;
 mod board;
+mod file_icons;
 mod hub;
 mod icons;
 mod ide;

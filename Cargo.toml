@@ -35,7 +35,7 @@ ksni = "0.3"
 resvg = { version = "0.48", default-features = false }
 rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 schemars = "1"
-iced = { version = "0.14", features = ["tokio", "markdown", "advanced", "highlighter"] }
+iced = { version = "0.14", features = ["tokio", "markdown", "advanced", "highlighter", "image-without-codecs"] }
 chrono = "0.4"
 # Native folder picker through the desktop portal (no GTK).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
