@@ -6,6 +6,7 @@ mod hub;
 mod icons;
 mod ide;
 mod ide_git;
+mod ide_tabs;
 mod ide_view;
 mod style;
 mod view;

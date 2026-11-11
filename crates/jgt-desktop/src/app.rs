@@ -221,6 +221,8 @@ pub struct IdeState {
     pub viewer: Viewer,
     pub show_diff: bool,
     pub error: Option<String>,
+    /// The files the user opened, kept while the app runs.
+    pub tabs: crate::ide_tabs::IdeTabs,
 }
 
 impl Default for IdeState {
@@ -239,6 +241,7 @@ impl Default for IdeState {
             viewer: Viewer::default(),
             show_diff: false,
             error: None,
+            tabs: crate::ide_tabs::IdeTabs::default(),
         }
     }
 }
@@ -481,6 +484,8 @@ pub enum Msg {
     IdeFileLoaded { root: PathBuf, path: String, diff: bool, result: Result<IdeFileResult, String> },
     IdeChangedOnly(bool),
     IdeShowDiff(bool),
+    IdeTabFocus(usize),
+    IdeTabClose(usize),
     IdeViewer(text_editor::Action),
     IdeRefresh,
     OpenInIde(String),
@@ -858,11 +863,19 @@ impl App {
     }
 
     /// Selects a source in the IDE tab, resetting file selection and loading its listing.
+    /// The open tabs are kept; none is active until the user opens or focuses one.
     pub fn select_ide_source(&mut self, source: crate::ide::Source) -> Task<Msg> {
-        self.ide.source = source.clone();
         self.ide.selected = None;
         self.ide.viewer = Viewer::default();
         self.ide.show_diff = false;
+        self.ide.tabs.active = None;
+        self.switch_ide_source(source)
+    }
+
+    /// Makes `source` the current IDE source (clearing its listing state) and loads its
+    /// listing, without touching the selected file or the tabs.
+    fn switch_ide_source(&mut self, source: crate::ide::Source) -> Task<Msg> {
+        self.ide.source = source.clone();
         self.ide.error = None;
         self.ide.open_dirs.clear();
         self.ide.listing = None;
@@ -891,6 +904,64 @@ impl App {
             },
             move |result| Msg::IdeListingLoaded { root, result },
         )
+    }
+
+    /// Loads the selected IDE file (File or Diff, per `show_diff`) from the current source.
+    fn load_ide_file(&self) -> Task<Msg> {
+        let Some(path) = self.ide.selected.clone() else {
+            return Task::none();
+        };
+        let source = self.ide.source.clone();
+        let root = source.root.clone();
+        let diff = self.ide.show_diff;
+        let path_clone = path.clone();
+        Task::perform(
+            async move {
+                if diff {
+                    let content = crate::ide_git::file_diff(&source, &path_clone).await?;
+                    Ok(IdeFileResult::from(content))
+                } else {
+                    let content = crate::ide_git::read_file(&source, &path_clone).await?;
+                    Ok(IdeFileResult::from(content))
+                }
+            },
+            move |result| Msg::IdeFileLoaded { root, path, diff, result },
+        )
+    }
+
+    /// Shows the active IDE tab in the viewer: switches the source when the tab belongs to
+    /// another one, restores its File/Diff state and loads it. With no active tab the viewer
+    /// is emptied.
+    fn show_active_ide_tab(&mut self) -> Task<Msg> {
+        let Some(tab) = self.ide.tabs.active_tab().cloned() else {
+            self.ide.selected = None;
+            self.ide.viewer = Viewer::default();
+            self.ide.show_diff = false;
+            return Task::none();
+        };
+        let listing_task = if tab.source.root != self.ide.source.root {
+            self.switch_ide_source(tab.source.clone())
+        } else {
+            Task::none()
+        };
+        self.ide.selected = Some(tab.path);
+        self.ide.show_diff = tab.show_diff;
+        self.ide.viewer = Viewer::Loading;
+        Task::batch([listing_task, self.load_ide_file()])
+    }
+
+    /// Drops the tabs whose source no longer exists (Main tabs always stay).
+    fn retain_ide_tabs(&mut self) {
+        let mut roots: Vec<PathBuf> = self.ide.sources.iter().map(|s| s.root.clone()).collect();
+        roots.extend(
+            self.ide
+                .tabs
+                .tabs
+                .iter()
+                .filter(|t| t.source.kind == crate::ide::SourceKind::Main)
+                .map(|t| t.source.root.clone()),
+        );
+        self.ide.tabs.retain_roots(&roots);
     }
 
     fn load_task_events(&self, task: String) -> Task<Msg> {
@@ -1878,6 +1949,7 @@ impl App {
                 match result {
                     Ok(sources) => {
                         self.ide.sources = sources;
+                        self.retain_ide_tabs();
                         if self.ide.source.root.as_os_str().is_empty()
                             && let Some(first) = self.ide.sources.first()
                         {
@@ -1935,6 +2007,7 @@ impl App {
             }
             Msg::IdeSourcesLoadedForTask { sources, key } => {
                 self.ide.sources = sources;
+                self.retain_ide_tabs();
                 if let Some(source) = crate::ide::source_for_task(&self.ide.sources, &key).cloned() {
                     self.select_ide_source(source)
                 } else {
@@ -1970,32 +2043,19 @@ impl App {
                 Task::none()
             }
             Msg::IdeOpenFile(path) => {
-                self.ide.selected = Some(path.clone());
-                self.ide.viewer = Viewer::Loading;
                 let is_deleted = self.ide.listing.as_ref().is_some_and(|l| {
                     l.entries
                         .iter()
                         .any(|e| e.path == path && e.status == Some(crate::ide::ChangeStatus::Deleted))
                 });
-                if is_deleted {
-                    self.ide.show_diff = true;
-                }
-                let source = self.ide.source.clone();
-                let root = source.root.clone();
-                let diff = self.ide.show_diff;
-                let path_clone = path.clone();
-                Task::perform(
-                    async move {
-                        if diff {
-                            let content = crate::ide_git::file_diff(&source, &path_clone).await?;
-                            Ok(IdeFileResult::from(content))
-                        } else {
-                            let content = crate::ide_git::read_file(&source, &path_clone).await?;
-                            Ok(IdeFileResult::from(content))
-                        }
-                    },
-                    move |result| Msg::IdeFileLoaded { root, path, diff, result },
-                )
+                let existing = self.ide.tabs.find(&self.ide.source.root, &path).map(|i| self.ide.tabs.tabs[i].show_diff);
+                let diff = existing.unwrap_or(self.ide.show_diff) || is_deleted;
+                self.ide.tabs.open(crate::ide_tabs::IdeTab::new(self.ide.source.clone(), path.clone(), diff));
+                self.ide.tabs.set_diff(diff);
+                self.ide.selected = Some(path);
+                self.ide.show_diff = diff;
+                self.ide.viewer = Viewer::Loading;
+                self.load_ide_file()
             }
             Msg::IdeFileLoaded { root, path, diff, result } => {
                 if self.ide.source.root != root
@@ -2031,23 +2091,24 @@ impl App {
             }
             Msg::IdeShowDiff(diff) => {
                 self.ide.show_diff = diff;
-                if let Some(path) = self.ide.selected.clone() {
+                self.ide.tabs.set_diff(diff);
+                if self.ide.selected.is_some() {
                     self.ide.viewer = Viewer::Loading;
-                    let source = self.ide.source.clone();
-                    let root = source.root.clone();
-                    let path_clone = path.clone();
-                    Task::perform(
-                        async move {
-                            if diff {
-                                let content = crate::ide_git::file_diff(&source, &path_clone).await?;
-                                Ok(IdeFileResult::from(content))
-                            } else {
-                                let content = crate::ide_git::read_file(&source, &path_clone).await?;
-                                Ok(IdeFileResult::from(content))
-                            }
-                        },
-                        move |result| Msg::IdeFileLoaded { root, path, diff, result },
-                    )
+                }
+                self.load_ide_file()
+            }
+            Msg::IdeTabFocus(index) => {
+                if self.ide.tabs.focus(index) {
+                    self.show_active_ide_tab()
+                } else {
+                    Task::none()
+                }
+            }
+            Msg::IdeTabClose(index) => {
+                let was_active = self.ide.tabs.active == Some(index);
+                self.ide.tabs.close(index);
+                if was_active {
+                    self.show_active_ide_tab()
                 } else {
                     Task::none()
                 }
@@ -3792,5 +3853,116 @@ effort = "low"
         });
 
         assert_eq!(app.ide.source, main_source);
+    }
+
+    fn ide_test_sources() -> (crate::ide::Source, crate::ide::Source) {
+        let main = crate::ide::Source {
+            label: "Main".to_string(),
+            root: PathBuf::from("/project"),
+            kind: crate::ide::SourceKind::Main,
+        };
+        let wt = crate::ide::Source {
+            label: "jgt-34".to_string(),
+            root: PathBuf::from("/project/.team/worktrees/jgt-34"),
+            kind: crate::ide::SourceKind::Worktree {
+                branch: "jgt/jgt-34".to_string(),
+            },
+        };
+        (main, wt)
+    }
+
+    #[test]
+    fn test_ide_open_file_opens_or_focuses_a_tab() {
+        let (mut app, _) = App::new(None);
+        let (main, _) = ide_test_sources();
+        app.ide.source = main.clone();
+
+        let _ = app.update(Msg::IdeOpenFile("a.rs".to_string()));
+        let _ = app.update(Msg::IdeOpenFile("b.rs".to_string()));
+        assert_eq!(app.ide.tabs.tabs.len(), 2);
+        assert_eq!(app.ide.tabs.active, Some(1));
+        assert_eq!(app.ide.tabs.tabs[0].source, main);
+
+        // Clicking an open file focuses its tab instead of adding one.
+        let _ = app.update(Msg::IdeOpenFile("a.rs".to_string()));
+        assert_eq!(app.ide.tabs.tabs.len(), 2);
+        assert_eq!(app.ide.tabs.active, Some(0));
+        assert_eq!(app.ide.selected.as_deref(), Some("a.rs"));
+
+        // File/Diff goes to the active tab.
+        let _ = app.update(Msg::IdeShowDiff(true));
+        assert!(app.ide.tabs.tabs[0].show_diff);
+        assert!(!app.ide.tabs.tabs[1].show_diff);
+    }
+
+    #[test]
+    fn test_ide_close_active_tab_activates_neighbour_and_viewer_follows() {
+        let (mut app, _) = App::new(None);
+        let (main, _) = ide_test_sources();
+        app.ide.source = main;
+        for p in ["a.rs", "b.rs", "c.rs"] {
+            let _ = app.update(Msg::IdeOpenFile(p.to_string()));
+        }
+        let _ = app.update(Msg::IdeTabFocus(1));
+        assert_eq!(app.ide.selected.as_deref(), Some("b.rs"));
+
+        let _ = app.update(Msg::IdeTabClose(1));
+        assert_eq!(app.ide.tabs.tabs.len(), 2);
+        assert_eq!(app.ide.selected.as_deref(), Some("c.rs"));
+        assert!(matches!(app.ide.viewer, Viewer::Loading));
+
+        // Closing an inactive tab leaves the viewer alone.
+        let _ = app.update(Msg::IdeTabClose(0));
+        assert_eq!(app.ide.selected.as_deref(), Some("c.rs"));
+        assert_eq!(app.ide.tabs.active, Some(0));
+
+        // Closing the last tab empties the viewer.
+        let _ = app.update(Msg::IdeTabClose(0));
+        assert!(app.ide.tabs.tabs.is_empty());
+        assert_eq!(app.ide.selected, None);
+        assert!(matches!(app.ide.viewer, Viewer::Notice(_)));
+    }
+
+    #[test]
+    fn test_ide_focus_tab_of_other_source_switches_source_and_restores_diff() {
+        let (mut app, _) = App::new(None);
+        let (main, wt) = ide_test_sources();
+        app.ide.sources = vec![main.clone(), wt.clone()];
+        app.ide.source = wt.clone();
+        let _ = app.update(Msg::IdeOpenFile("src/lib.rs".to_string()));
+        let _ = app.update(Msg::IdeShowDiff(true));
+
+        // Changing the source selector keeps the tabs.
+        let _ = app.update(Msg::IdeSelectSource(main.clone()));
+        assert_eq!(app.ide.tabs.tabs.len(), 1);
+        assert_eq!(app.ide.tabs.active, None);
+        let _ = app.update(Msg::IdeOpenFile("README.md".to_string()));
+        assert!(!app.ide.show_diff);
+        assert_eq!(app.ide.tabs.tabs.len(), 2);
+
+        // Focusing the worktree tab switches the source back and restores Diff.
+        let _ = app.update(Msg::IdeTabFocus(0));
+        assert_eq!(app.ide.source, wt);
+        assert_eq!(app.ide.selected.as_deref(), Some("src/lib.rs"));
+        assert!(app.ide.show_diff);
+        assert!(app.ide.listing.is_none(), "the new source's listing is reloaded");
+        assert_eq!(app.ide.tabs.tabs.len(), 2);
+    }
+
+    #[test]
+    fn test_ide_sources_loaded_drops_tabs_of_missing_worktrees() {
+        let (mut app, _) = App::new(None);
+        app.workspace = Some("/project".to_string());
+        let (main, wt) = ide_test_sources();
+        app.ide.source = main.clone();
+        let _ = app.update(Msg::IdeOpenFile("README.md".to_string()));
+        app.ide.source = wt.clone();
+        let _ = app.update(Msg::IdeOpenFile("src/lib.rs".to_string()));
+        assert_eq!(app.ide.tabs.tabs.len(), 2);
+
+        let project = PathBuf::from(jgt_core::team::project_folder("/project"));
+        let _ = app.update(Msg::IdeSourcesLoaded { project, result: Ok(vec![main.clone()]) });
+        assert_eq!(app.ide.tabs.tabs.len(), 1);
+        assert_eq!(app.ide.tabs.tabs[0].source, main);
     }
 }

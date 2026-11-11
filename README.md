@@ -257,6 +257,7 @@ The desktop app includes an **IDE** module (in the sidebar below Board, or opene
   - Automatically skipped folders: `.git`, `target`, `node_modules`, `.team`.
   - Secret files (`.env`, `.env.*` except `.env.example`, `.env.sample`, `.env.template`; `*.pem`, `*.key`, `id_rsa*`, `credentials*`, `*.p12`, `.npmrc`, `.pypirc`) are listed with a lock icon, and their contents and diffs are never read or shown (`Secret file: not shown`).
   - Symlinks are not followed (`Symlink: not followed`), and path traversal (`..` components or paths escaping the root) is rejected.
+- **Tabs**: each file you open from the picker gets a tab above the viewer (clicking an open file focuses its tab). A tab remembers its source and File/Diff state; focusing a tab from another source switches the source selector. Close a tab with its **x** button or a middle-click; closing the active tab activates a neighbour. Up to 20 tabs (opening more closes the oldest inactive one); tabs of removed worktrees are dropped on refresh, and tabs are kept while the app runs (not across restarts).
 - **Refresh button**: reloads sources and file listings manually on demand; there is no auto-refresh or background file watching.
 
 ## Installation
