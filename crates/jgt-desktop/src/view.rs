@@ -525,61 +525,18 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
     let effort_width = style::fs(14) * 5.5;
     let suggestions_width = style::fs(14) * 8.5;
 
+    let is_locked = app.agents_locked.is_some();
+    let header_desc = if is_locked {
+        "Changes apply to new workers on this team."
+    } else {
+        "Applies to teams started from now on."
+    };
+
     let mut section = column![
         text("Agents").size(style::fs(16)).font(bold()),
+        muted(header_desc).size(style::fs(12)),
     ]
     .spacing(10);
-
-    if let Some(locked) = &app.agents_locked {
-        // M6: Locked mode
-        section = section.push(
-            muted("Locked: this team started with these settings. Changes apply when a team starts.")
-                .size(style::fs(12)),
-        );
-
-        let col_header = row![
-            muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
-            muted("HARNESS").size(style::fs(11)).font(bold()).width(harness_width),
-            muted("MODEL").size(style::fs(11)).font(bold()),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-        section = section.push(col_header);
-
-        for &role in AGENT_ROLES {
-            let (harness_label, model_text) = if let Some(setting) = locked.roles.get(role) {
-                (setting.harness.label(), setting.model.as_str())
-            } else if let Some(agent) = app.agents.iter().find(|a| a.role == role) {
-                (agent.harness.label(), agent.model.as_str())
-            } else {
-                ("Claude Code", "opus")
-            };
-
-            let r = row![
-                text(role).size(style::fs(13)).font(bold()).width(role_width),
-                container(text(harness_label).size(style::fs(13))).width(harness_width).align_y(Alignment::Center),
-                text(model_text).size(style::fs(13)),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center);
-
-            section = section.push(r);
-
-            if role == jgt_core::COORDINATOR {
-                section = section.push(
-                    muted("The Coordinator always runs on Claude Code (only Claude can be the coordinator).")
-                        .size(style::fs(12)),
-                );
-            }
-        }
-
-        return section.into();
-    }
-
-    // M5: Editable mode
-    section = section.push(
-        muted("Applies to teams started from now on.").size(style::fs(12)),
-    );
 
     let col_header = row![
         muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
@@ -597,6 +554,24 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
         let default_row;
         let agent = if let Some(a) = app.agents.iter().find(|a| a.role == role) {
             a
+        } else if let Some(locked) = &app.agents_locked {
+            if let Some(setting) = locked.roles.get(role) {
+                default_row = AgentRow {
+                    role: role.to_string(),
+                    harness: setting.harness,
+                    model: setting.model.clone(),
+                    effort: setting.effort.clone(),
+                };
+                &default_row
+            } else {
+                default_row = AgentRow {
+                    role: role.to_string(),
+                    harness: Harness::ClaudeCode,
+                    model: "opus".to_string(),
+                    effort: "medium".to_string(),
+                };
+                &default_row
+            }
         } else {
             default_row = AgentRow {
                 role: role.to_string(),
@@ -705,25 +680,39 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
         section = section.push(r);
 
         if is_coordinator {
-            section = section.push(
-                muted("The Coordinator always runs on Claude Code (only Claude can be the coordinator).")
-                    .size(style::fs(12)),
-            );
+            let note = if is_locked {
+                "The Coordinator always runs on Claude Code (only Claude can be the coordinator). Applies after a reset."
+            } else {
+                "The Coordinator always runs on Claude Code (only Claude can be the coordinator)."
+            };
+            section = section.push(muted(note).size(style::fs(12)));
         }
     }
 
-    // Save button
-    let save_row = row![
-        button(text("Save").size(style::fs(13)))
-            .on_press(Msg::SaveAgents)
-            .style(style::primary_button)
-            .padding([5, 18]),
-        muted("Applies to teams started from now on.").size(style::fs(12)),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center);
+    // Action button
+    let action_row = if is_locked {
+        row![
+            button(text("Apply to this team").size(style::fs(13)))
+                .on_press(Msg::ApplyAgents)
+                .style(style::primary_button)
+                .padding([5, 18]),
+            muted("New workers use these settings.").size(style::fs(12)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+    } else {
+        row![
+            button(text("Save").size(style::fs(13)))
+                .on_press(Msg::SaveAgents)
+                .style(style::primary_button)
+                .padding([5, 18]),
+            muted("Applies to teams started from now on.").size(style::fs(12)),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center)
+    };
 
-    section = section.push(save_row);
+    section = section.push(action_row);
 
     section.into()
 }

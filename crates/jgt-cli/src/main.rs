@@ -1,6 +1,7 @@
 //! `jg-team-dev`: the command line side of jg-team-dev — MCP server and hooks for agents,
 //! connectors for harnesses, and a few terminal helpers.
 
+mod agents;
 mod commands;
 mod hooks;
 mod mcp;
@@ -100,6 +101,8 @@ enum Command {
         #[arg(long, value_parser = parse_harness, default_value = "claude-code")]
         harness: Harness,
     },
+    /// View or change the team's agent settings.
+    Agents(agents::AgentsArgs),
     /// Claim the Coordinator role for this Claude Code session.
     ClaimCoordinator,
     /// Claude Code hook (started by Claude Code).
@@ -111,8 +114,13 @@ enum Command {
     },
 }
 
-fn parse_harness(s: &str) -> Result<Harness, String> {
-    s.parse()
+pub(crate) fn parse_harness(s: &str) -> Result<Harness, String> {
+    match s.parse::<Harness>() {
+        Ok(Harness::Custom) | Err(_) => {
+            Err(format!("unknown harness `{s}` (use claude-code, opencode or antigravity)"))
+        }
+        Ok(h) => Ok(h),
+    }
 }
 
 #[tokio::main]
@@ -124,6 +132,7 @@ async fn main() {
     }
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Agents(args) => agents::run(args).await,
         Command::Mcp { harness } => mcp::run(harness).await,
         Command::ClaimCoordinator => team::claim_coordinator().await,
         Command::Hook { role, event } => hooks::run(event, role).await,
