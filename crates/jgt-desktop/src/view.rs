@@ -286,7 +286,13 @@ pub fn app_header<'a>(app: &'a App) -> Element<'a, Msg> {
 
 pub fn view(app: &App) -> Element<'_, Msg> {
     let theme = app.theme();
-    let body = row![sidebar(app, &theme), rule::vertical(1).style(rule::weak), main(app, &theme)].height(Fill);
+    let body = row![
+        bar_strip(Side::Left, app.left_collapsed),
+        keep_mounted(sidebar(app, &theme), !app.left_collapsed),
+        rule::vertical(1).style(rule::weak),
+        main(app, &theme)
+    ]
+    .height(Fill);
     let layout = column![app_header(app), rule::horizontal(1).style(rule::weak), body]
         .width(Fill)
         .height(Fill);
@@ -749,14 +755,77 @@ pub fn sidebar_workspace_model<'a>(
     }
 }
 
+/// Which side bar a toggle belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// The sidebar's text inputs, unfocused when the bar collapses so keys do not go to a hidden field.
+pub const SIDEBAR_SEARCH_ID: &str = "sidebar-search";
+pub const NEW_TEAM_FOLDER_ID: &str = "new-team-folder";
+
+/// Width of a collapsed side bar: a strip holding only the expand chevron.
+pub const COLLAPSED_BAR_WIDTH: f32 = 28.0;
+
+/// The chevron button that collapses (`collapsed == false`) or expands a side bar. The chevron
+/// points the way the bar moves: a left bar collapses leftwards, a right bar rightwards.
+pub fn bar_toggle<'a>(side: Side, collapsed: bool) -> Element<'a, Msg> {
+    let points_left = (side == Side::Left) != collapsed;
+    let (msg, label) = match (side, collapsed) {
+        (Side::Left, false) => (Msg::ToggleLeftBar, "Collapse side bar (Ctrl+B)"),
+        (Side::Left, true) => (Msg::ToggleLeftBar, "Expand side bar (Ctrl+B)"),
+        (Side::Right, false) => (Msg::ToggleRightBar, "Collapse file picker (Ctrl+Alt+B)"),
+        (Side::Right, true) => (Msg::ToggleRightBar, "Expand file picker (Ctrl+Alt+B)"),
+    };
+    tip(
+        button(text(if points_left { "‹" } else { "›" }).size(style::fs(16)))
+            .on_press(msg)
+            .style(style::ghost)
+            .padding([0, 6]),
+        label,
+    )
+}
+
+/// The strip shown in place of a collapsed side bar, or nothing while the bar is expanded.
+/// It sits next to the bar (see [`keep_mounted`]) so the row's children never change.
+pub fn bar_strip<'a>(side: Side, collapsed: bool) -> Element<'a, Msg> {
+    if collapsed { collapsed_bar(side) } else { Space::new().width(0).height(0).into() }
+}
+
+/// Keeps a side bar in the widget tree while it is collapsed, at zero width, so its widget
+/// state (scroll positions above all) is still there when it is expanded again.
+pub fn keep_mounted<'a>(bar: Element<'a, Msg>, visible: bool) -> Element<'a, Msg> {
+    let wrapper = container(bar).height(Fill).clip(true);
+    if visible { wrapper.into() } else { wrapper.width(0).into() }
+}
+
+/// A collapsed side bar: a thin strip with only the expand chevron.
+/// The strip keeps its bar's look: the left one the sidebar background, the right one (the
+/// IDE picker) the plain view background.
+pub fn collapsed_bar<'a>(side: Side) -> Element<'a, Msg> {
+    let strip = container(bar_toggle(side, true))
+        .width(COLLAPSED_BAR_WIDTH)
+        .height(Fill)
+        .padding([8, 0])
+        .align_x(Alignment::Center);
+    match side {
+        Side::Left => strip.style(style::sidebar).into(),
+        Side::Right => strip.into(),
+    }
+}
+
 fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     let p = theme.extended_palette();
 
     let search = text_input("Search chats", &app.search)
+        .id(SIDEBAR_SEARCH_ID)
         .on_input(Msg::Search)
         .padding([7, 10])
         .size(style::fs(13))
         .style(style::input);
+    let search = row![search, bar_toggle(Side::Left, false)].spacing(4).align_y(Alignment::Center);
 
     let query = app.search.trim().to_lowercase();
     let searching = !query.is_empty();
@@ -1008,6 +1077,7 @@ fn sidebar<'a>(app: &'a App, theme: &Theme) -> Element<'a, Msg> {
     let mut sidebar_col = column![].spacing(8);
     if let Some(folder) = &app.new_team {
         let input = text_input("Project folder", folder)
+            .id(NEW_TEAM_FOLDER_ID)
             .padding([7, 10])
             .size(style::fs(13))
             .style(style::input);
@@ -1935,6 +2005,9 @@ fn composer<'a>(app: &'a App, s: &'a Session) -> Element<'a, Msg> {
             if let Some(step) = crate::app::zoom_shortcut(&press.key, press.modifiers) {
                 return Some(text_editor::Binding::Custom(Msg::Zoom(step)));
             }
+            if let Some(msg) = crate::app::bar_shortcut(&press.key, press.modifiers) {
+                return Some(text_editor::Binding::Custom(msg));
+            }
             if matches!(press.key, Key::Named(Named::Enter)) && !press.modifiers.shift()
                 && let text_editor::Status::Focused { .. } = press.status {
                     return Some(text_editor::Binding::Custom(Msg::Send));
@@ -2353,6 +2426,34 @@ mod tests {
         let _ = main(&app, &theme);
         let _ = view(&app);
         let _ = sidebar(&app, &theme);
+    }
+
+    #[test]
+    fn test_collapsed_side_bars_render() {
+        let (mut app, _) = App::new(None);
+        let c1 = test_session_full("c1", Some(jgt_core::COORDINATOR), None, Some("/team1"), SessionStatus::Active, false, None);
+        app.sessions = vec![c1];
+        app.workspace = Some("/team1".to_string());
+        app.selected = Some("c1".to_string());
+        app.search = "c".to_string();
+
+        for module in [Module::Coordinator, Module::Board, Module::Ide] {
+            app.module = module;
+            for (left, right) in [(true, false), (false, true), (true, true), (false, false)] {
+                app.left_collapsed = left;
+                app.right_collapsed = right;
+                let _ = view(&app);
+            }
+        }
+        // Collapsing only changes what is rendered.
+        assert_eq!(app.selected.as_deref(), Some("c1"));
+        assert_eq!(app.search, "c");
+
+        for side in [Side::Left, Side::Right] {
+            let _ = collapsed_bar(side);
+            let _ = bar_toggle(side, false);
+            let _ = bar_toggle(side, true);
+        }
     }
 
     #[test]

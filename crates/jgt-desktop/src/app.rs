@@ -264,6 +264,12 @@ pub struct App {
     pub collapsed_coordinators: HashSet<String>,
     /// Whether the Worker section in the sidebar is collapsed.
     pub workers_collapsed: bool,
+    /// The left side bar (sessions, workspaces) is collapsed to a thin strip. Only rendering
+    /// changes: selection, search and scroll state are kept.
+    pub left_collapsed: bool,
+    /// The right side bar (the IDE file picker) is collapsed to a thin strip; the tree's open
+    /// folders and selection are kept.
+    pub right_collapsed: bool,
     pub rename: Option<String>,
     pub confirm_delete: bool,
     pub confirm_delete_team: bool,
@@ -389,6 +395,10 @@ pub enum Msg {
     NewTeamCancel,
     TeamStarted(Result<String, String>),
     ToggleWorkers,
+    /// Collapses or expands the left side bar (Ctrl+B).
+    ToggleLeftBar,
+    /// Collapses or expands the right side bar, the IDE file picker (Ctrl+Alt+B).
+    ToggleRightBar,
     BoardLoaded { workspace: String, result: Result<Vec<BoardTask>, String> },
     TaskEventsLoaded { task: String, result: Result<Vec<TaskEvent>, String> },
     OpenTask(String),
@@ -548,6 +558,8 @@ impl App {
             show_archived: false,
             collapsed_coordinators: HashSet::new(),
             workers_collapsed: false,
+            left_collapsed: desktop.left_bar_collapsed,
+            right_collapsed: desktop.right_bar_collapsed,
             rename: None,
             confirm_delete: false,
             confirm_delete_team: false,
@@ -1302,6 +1314,29 @@ impl App {
                 self.workers_collapsed = !self.workers_collapsed;
                 Task::none()
             }
+            Msg::ToggleLeftBar => {
+                self.left_collapsed = !self.left_collapsed;
+                self.save_view_settings();
+                if !self.left_collapsed {
+                    return Task::none();
+                }
+                // The collapsed bar stays mounted at zero width: do not leave its inputs focused.
+                let unfocus_if = |id: &'static str| {
+                    operation::is_focused(id).then(|focused| {
+                        if focused {
+                            iced::advanced::widget::operate(iced::advanced::widget::operation::focusable::unfocus())
+                        } else {
+                            Task::none()
+                        }
+                    })
+                };
+                Task::batch([unfocus_if(crate::view::SIDEBAR_SEARCH_ID), unfocus_if(crate::view::NEW_TEAM_FOLDER_ID)])
+            }
+            Msg::ToggleRightBar => {
+                self.right_collapsed = !self.right_collapsed;
+                self.save_view_settings();
+                Task::none()
+            }
             Msg::BoardLoaded { workspace, result } => {
                 match result {
                     Ok(tasks) => {
@@ -1906,6 +1941,9 @@ impl App {
                 Task::none()
             }
             Msg::Key(event) => match event {
+                keyboard::Event::KeyPressed { key, modifiers, .. } if bar_shortcut(&key, modifiers).is_some() => {
+                    bar_shortcut(&key, modifiers).map_or_else(Task::none, |msg| self.update(msg))
+                }
                 keyboard::Event::KeyPressed { key, modifiers, .. } => match zoom_shortcut(&key, modifiers) {
                     Some(step) => self.update(Msg::Zoom(step)),
                     None if self.show_settings && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {
@@ -2215,6 +2253,18 @@ pub fn zoom_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Opt
     }
 }
 
+/// Ctrl+B toggles the left side bar, Ctrl+Alt+B the right one (the IDE file picker).
+pub fn bar_shortcut(key: &keyboard::Key, modifiers: keyboard::Modifiers) -> Option<Msg> {
+    if !modifiers.command() || modifiers.shift() {
+        return None;
+    }
+    match key.as_ref() {
+        keyboard::Key::Character("b" | "B") if modifiers.alt() => Some(Msg::ToggleRightBar),
+        keyboard::Key::Character("b" | "B") => Some(Msg::ToggleLeftBar),
+        _ => None,
+    }
+}
+
 impl App {
     /// Marks the window urgent for a new agent message while it is not focused, like Teams or
     /// Discord: i3 (X11 urgency hint) and Hyprland (xdg-activation) highlight the window and its
@@ -2237,7 +2287,8 @@ impl App {
         }
     }
 
-    /// Saves theme, style, zoom and text size to config.toml (other settings there are kept).
+    /// Saves theme, style, zoom, text size and the side bars' collapsed state to config.toml
+    /// (other settings there are kept).
     fn save_view_settings(&self) {
         let mut config = Config::load();
         config.desktop.theme = match self.theme_pref {
@@ -2249,6 +2300,8 @@ impl App {
         config.desktop.style = self.theme_style.as_str().into();
         config.desktop.zoom = self.zoom;
         config.desktop.text_size = self.text_size;
+        config.desktop.left_bar_collapsed = self.left_collapsed;
+        config.desktop.right_bar_collapsed = self.right_collapsed;
         let _ = config.save();
     }
 }
@@ -3079,6 +3132,81 @@ mod tests {
     }
 
     static CONFIG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn key_b(modifiers: keyboard::Modifiers) -> keyboard::Event {
+        keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("b".into()),
+            modified_key: keyboard::Key::Character("b".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyB),
+            location: keyboard::Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn test_bar_shortcut_mapping() {
+        use keyboard::Modifiers as M;
+        let b = keyboard::Key::Character("b".into());
+        assert!(matches!(bar_shortcut(&b, M::CTRL), Some(Msg::ToggleLeftBar)));
+        assert!(matches!(bar_shortcut(&b, M::CTRL | M::ALT), Some(Msg::ToggleRightBar)));
+        assert!(bar_shortcut(&b, M::empty()).is_none(), "plain b is text");
+        assert!(bar_shortcut(&b, M::ALT).is_none());
+        assert!(bar_shortcut(&b, M::CTRL | M::SHIFT).is_none());
+        let other = keyboard::Key::Character("n".into());
+        assert!(bar_shortcut(&other, M::CTRL).is_none());
+        // Zoom keys are not side bar keys (and the other way round).
+        assert!(bar_shortcut(&keyboard::Key::Character("0".into()), M::CTRL).is_none());
+        assert!(zoom_shortcut(&b, M::CTRL).is_none());
+    }
+
+    #[test]
+    fn test_toggle_side_bars_flip_state_and_persist() {
+        let _guard = CONFIG_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("jgt-side-bars-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "[desktop]\nzoom = 1.2\n").unwrap();
+        let prev = std::env::var_os("JGT_CONFIG_DIR");
+        unsafe {
+            std::env::set_var("JGT_CONFIG_DIR", &dir);
+        }
+
+        let (mut app, _) = App::new(None);
+        assert!(!app.left_collapsed && !app.right_collapsed, "both bars start expanded");
+        app.selected = Some("s1".into());
+        app.ide.open_dirs.insert("src".into());
+
+        let _ = app.update(Msg::ToggleLeftBar);
+        assert!(app.left_collapsed && !app.right_collapsed);
+        let _ = app.update(Msg::ToggleRightBar);
+        assert!(app.left_collapsed && app.right_collapsed);
+        // Collapsing keeps the state behind the bars.
+        assert_eq!(app.selected.as_deref(), Some("s1"));
+        assert!(app.ide.open_dirs.contains("src"));
+
+        // Saved with the other view settings, and restored on the next start.
+        let saved = Config::load();
+        assert!(saved.desktop.left_bar_collapsed && saved.desktop.right_bar_collapsed);
+        assert_eq!(saved.desktop.zoom, 1.2);
+        let (restored, _) = App::new(None);
+        assert!(restored.left_collapsed && restored.right_collapsed);
+
+        // The shortcuts go through the same messages.
+        let _ = app.update(Msg::Key(key_b(keyboard::Modifiers::CTRL)));
+        assert!(!app.left_collapsed && app.right_collapsed, "Ctrl+B expands the left bar");
+        let _ = app.update(Msg::Key(key_b(keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT)));
+        assert!(!app.left_collapsed && !app.right_collapsed, "Ctrl+Alt+B expands the right bar");
+        let _ = app.update(Msg::Key(key_b(keyboard::Modifiers::empty())));
+        assert!(!app.left_collapsed && !app.right_collapsed, "plain b changes nothing");
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("JGT_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("JGT_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_save_agents_keeps_other_config() {
