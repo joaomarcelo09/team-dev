@@ -1253,21 +1253,22 @@ mod board {
     }
 
     #[test]
-    fn a_red_test_is_the_fix_round() {
+    fn a_red_test_has_no_automatic_fix_round() {
         let t = team();
         let task = t.working("x");
         t.mv(&task, Testing).unwrap();
         t.test(&task, TestStatus::Fail).unwrap();
         conflict(t.mv(&task, Review));
         conflict(t.mv(&task, Done));
-        let back = t.mv(&task, Working).unwrap();
-        assert_eq!(back.review_rounds, 1, "a red test starts the one automatic fix round");
+        assert!(conflict(t.mv(&task, Working)).contains("no automatic fix round"));
+        let back = t.user_move(&task, Working);
+        assert_eq!(back.review_rounds, 1, "user move starts fix round");
         assert_eq!(back.test_result.map(|r| r.status), Some(TestStatus::Fail), "the coder sees the failures");
         let task = t.mv(&task, Testing).unwrap();
         assert_eq!(task.test_result, None, "a new pass starts without a test");
-        // Red again on the second verification: no second fix, the user decides.
+        // Red again: still no automatic fix, the user decides.
         t.test(&task, TestStatus::Fail).unwrap();
-        assert!(conflict(t.mv(&task, Working)).contains("no further automatic fix"));
+        assert!(conflict(t.mv(&task, Working)).contains("no automatic fix round"));
         conflict(t.mv(&task, Review));
         conflict(t.mv(&task, Done));
     }
@@ -1285,8 +1286,9 @@ mod board {
         assert!(conflict(t.mv(&task, Done)).contains("K6"));
         // Changes requested in round 1.
         t.review(&task, ReviewDecision::Changes, vec![high()]).unwrap();
-        assert!(conflict(t.mv(&task, Done)).contains("the fix round is still left"));
-        let task = t.mv(&task, Working).unwrap();
+        assert!(conflict(t.mv(&task, Done)).contains("the reviewer requested changes"));
+        assert!(conflict(t.mv(&task, Working)).contains("no automatic fix round"));
+        let task = t.user_move(&task, Working);
         assert_eq!(task.review_rounds, 1);
         assert_eq!(task.test_result, None, "the green test of the old pass is gone");
         t.mv(&task, Testing).unwrap();
@@ -1332,7 +1334,7 @@ mod board {
         // columns it changes are written, so the move's rounds and cleared test survive.
         let mut stale = t.get(&task);
         stale.details = Some("plan".into());
-        let moved = t.mv(&task, Working).unwrap();
+        let moved = t.user_move(&task, Working);
         assert_eq!((moved.review_rounds, moved.test_result.is_none()), (1, true));
         t.hub.db.board::<_, rusqlite::Error>(|b| b.set_columns(&stale.id, &[("details", &stale.details)])).unwrap();
         let task = t.get(&task);
@@ -1345,7 +1347,7 @@ mod board {
         req.run_id = Some("run".into());
         let task = t.hub.patch_task(&task.id, None, &req).unwrap();
         assert_eq!((task.details.as_deref(), task.run_id.as_deref()), (Some("plan 2"), Some("run")));
-        assert_eq!((task.review_rounds, task.round_limit, task.test_result.is_none()), (1, 2, true));
+        assert_eq!((task.review_rounds, task.round_limit, task.test_result.is_none()), (1, 1, true));
         assert_eq!(task.review_result, moved.review_result);
     }
 
@@ -1392,7 +1394,7 @@ mod board {
             let (moved, patched) = std::thread::scope(|s| {
                 let mv = s.spawn(|| {
                     barrier.wait();
-                    t.mv(&task, Working)
+                    t.user_mv_full(&task, Working)
                 });
                 let patch = s.spawn(|| {
                     barrier.wait();
@@ -1403,10 +1405,10 @@ mod board {
                 });
                 (mv.join().unwrap(), patch.join().unwrap())
             });
-            let moved = moved.unwrap();
+            let moved = moved.unwrap().task;
             patched.unwrap();
             let task = t.get(&task);
-            assert_eq!((task.status, task.review_rounds, task.round_limit), (Working, 1, 2));
+            assert_eq!((task.status, task.review_rounds, task.round_limit), (Working, 1, 1));
             assert_eq!(task.test_result, None);
             assert_eq!(task.review_result, moved.review_result);
             assert_eq!(task.review_result.as_ref().map(|r| r.decision), Some(ReviewDecision::Changes));
@@ -1662,19 +1664,17 @@ mod board {
     }
 
     #[test]
-    fn round_2_review_with_critical_finding_moves_to_done_with_high_follow_up() {
+    fn changes_review_refused_for_team_done_user_move_creates_high_follow_up() {
         let t = team();
         let task = t.working("feature");
         let first = t.pass(&task, ReviewDecision::Changes, vec![critical(), minor()]);
-        assert!(first.fix_round_left());
-        t.mv(&task, Working).unwrap();
-        let second = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
-        assert_eq!(second.review_result.as_ref().map(|r| r.round), Some(2));
-        assert!(!second.fix_round_left());
+        assert!(!first.fix_round_left());
         // No further automatic fix round.
-        assert!(conflict(t.mv(&task, Working)).contains("no further automatic fix"));
-        // Accepted for Done in round 2 even with changes requested.
-        let done = t.mv(&task, Done).unwrap();
+        assert!(conflict(t.mv(&task, Working)).contains("no automatic fix round"));
+        // Team move to Done refused.
+        assert!(conflict(t.mv(&task, Done)).contains("the reviewer requested changes"));
+        // Accepted for Done by user move even with changes requested.
+        let done = t.user_move(&task, Done);
         assert_eq!(done.status, Done);
         assert!(done.done_at.is_some());
         let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
@@ -1689,10 +1689,6 @@ mod board {
     fn follow_up_priority_high_with_one_high_three_medium_one_low() {
         let t = team();
         let task = t.working("feature");
-        // Round 1: high finding requests changes
-        t.pass(&task, ReviewDecision::Changes, vec![high()]);
-        t.mv(&task, Working).unwrap();
-        // Round 2: 1 high + 3 medium + 1 low findings
         let findings = vec![
             high(),
             medium_finding(),
@@ -1701,7 +1697,7 @@ mod board {
             low_finding(),
         ];
         t.pass(&task, ReviewDecision::Changes, findings);
-        let done = t.mv(&task, Done).unwrap();
+        let done = t.user_move(&task, Done);
         assert_eq!(done.status, Done);
         let follow = t.hub.tasks(WS, false).unwrap().into_iter().find(|x| x.id != task.id).unwrap();
         assert_eq!(follow.priority, TaskPriority::High);
@@ -1757,9 +1753,9 @@ mod board {
         let t = team();
         let task = t.working("feature");
         let first = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
-        assert!(first.fix_round_left());
+        assert!(!first.fix_round_left());
         let err = conflict(t.mv(&task, Done));
-        assert!(err.contains("the fix round is still left"), "expected fix round left refusal, got {err}");
+        assert!(err.contains("the reviewer requested changes"), "expected requested changes refusal, got {err}");
     }
 
     #[test]
@@ -1767,7 +1763,8 @@ mod board {
         let t = team();
         let task = t.working("feature");
         t.pass(&task, ReviewDecision::Changes, vec![high()]);
-        t.mv(&task, Working).unwrap();
+        assert!(conflict(t.mv(&task, Working)).contains("no automatic fix round"));
+        let task = t.user_move(&task, Working);
         let second = t.pass(&task, ReviewDecision::Approved, vec![]);
         assert_eq!(second.review_result.as_ref().map(|r| r.round), Some(2));
         let done = t.mv(&task, Done).unwrap();
@@ -1799,17 +1796,14 @@ mod board {
     fn done_notification_mentions_follow_up() {
         let t = team();
         let task = t.working("feature");
-        t.pass(&task, ReviewDecision::Changes, vec![high()]);
-        t.mv(&task, Working).unwrap();
-        // Round 2 changes with critical finding -> follow-up priority High
-        t.pass(&task, ReviewDecision::Changes, vec![critical()]);
+        let task = t.pass(&task, ReviewDecision::Approved, vec![minor()]);
         let task = t.mv(&task, Done).unwrap();
 
         let n = notices(&t.hub, &t.coord);
         let note = n.iter().find(|m| m.meta_str("title") == Some("JGT-1 is Done")).expect("done notice");
         assert_eq!(note.meta_str("level"), Some("success"));
         assert!(
-            note.body.contains("A high-priority follow-up JGT-2 is in Backlog."),
+            note.body.contains("A normal-priority follow-up JGT-2 is in Backlog."),
             "body was: {}",
             note.body
         );
@@ -1821,7 +1815,7 @@ mod board {
         t.mv(&task, Done).unwrap();
 
         let n = notices(&t.hub, &t.coord);
-        let note = n.iter().filter(|m| m.meta_str("title") == Some("JGT-1 is Done")).last().expect("second done notice");
+        let note = n.iter().rfind(|m| m.meta_str("title") == Some("JGT-1 is Done")).expect("second done notice");
         assert!(!note.body.contains("follow-up"), "reopened done notice should not mention old follow-up: {}", note.body);
     }
 
@@ -1883,13 +1877,13 @@ mod board {
         let t = team();
         let task = t.working("feature");
         t.pass(&task, ReviewDecision::Changes, vec![high()]);
-        t.mv(&task, Working).unwrap();
+        let task = t.user_move(&task, Working);
         let task = t.pass(&task, ReviewDecision::Approved, vec![minor()]);
         let done = t.mv(&task, Done).unwrap();
         assert_eq!(done.review_rounds, 1);
         let reopened = t.user_move(&done, OnQueue);
         assert_eq!(reopened.status, OnQueue);
-        assert_eq!((reopened.review_rounds, reopened.round_limit), (0, 2));
+        assert_eq!((reopened.review_rounds, reopened.round_limit), (0, 1));
         assert_eq!((reopened.test_result, reopened.review_result, reopened.done_at), (None, None, None));
     }
 
@@ -1991,7 +1985,8 @@ mod board {
         // Round 1: a change request with one high finding.
         let after = t.pass(&task, ReviewDecision::Changes, vec![high()]);
         assert_eq!(after.review_result.as_ref().unwrap().round, 1);
-        let back = t.mv(&task, Working).unwrap();
+        assert!(conflict(t.mv(&task, Working)).contains("no automatic fix round"));
+        let back = t.user_move(&task, Working);
         assert_eq!(back.review_rounds, 1);
         // Round 2: approved; the coordinator moves it to Done.
         let approved = t.pass(&task, ReviewDecision::Approved, vec![]);
@@ -2014,7 +2009,7 @@ mod board {
             expect("working", &coordinator),
             expect("testing", &coordinator),
             expect("review", &coordinator),
-            expect("working", &coordinator),
+            expect("working", &Actor::User),
             expect("testing", &coordinator),
             expect("review", &coordinator),
             expect("done", &coordinator),
@@ -2591,6 +2586,99 @@ mod board {
         // Verify no NO_COORDINATOR note was logged.
         let events = t.hub.db.board(|b| b.events(&task.id)).unwrap();
         assert!(!events.iter().any(|e| e.body.contains("Coordinator")));
+    }
+
+    #[test]
+    fn stalled_card_ignores_review_waiting_for_user() {
+        use crate::state::board::STALLED_AFTER_MS;
+
+        let t = team();
+        let mut config = t.hub.config();
+        config.team.wip_limit = 5;
+        *t.hub.config.write().unwrap() = config;
+
+        // 1. A Review card with Changes review_result (waiting for user).
+        let card_changes = t.working("card changes");
+        let card_changes = t.pass(&card_changes, ReviewDecision::Changes, vec![high()]);
+        assert_eq!(card_changes.status, Review);
+        assert!(card_changes.current_worker.is_none());
+        assert_eq!(
+            card_changes.review_result.as_ref().map(|r| r.decision),
+            Some(ReviewDecision::Changes)
+        );
+
+        let t_changes = t
+            .events(&card_changes)
+            .iter()
+            .map(|e| e.created_at)
+            .max()
+            .unwrap_or(0)
+            .max(t.get(&card_changes).updated_at);
+        let before = inbox(&t.hub, &t.coord).len();
+
+        // Past the threshold, card_changes is NOT pinged.
+        let wake = t
+            .hub
+            .check_stalled_tasks_at(t_changes + STALLED_AFTER_MS, STALLED_AFTER_MS)
+            .unwrap();
+        assert!(wake.is_empty());
+        assert_eq!(inbox(&t.hub, &t.coord).len(), before);
+
+        // 2. A Review card with an Approved review_result (ready for Done/git).
+        let card_approved = t.working("card approved");
+        let card_approved = t.pass(&card_approved, ReviewDecision::Approved, vec![]);
+        assert_eq!(card_approved.status, Review);
+        assert!(card_approved.current_worker.is_none());
+        assert_eq!(
+            card_approved.review_result.as_ref().map(|r| r.decision),
+            Some(ReviewDecision::Approved)
+        );
+
+        // 3. A Review card with no review yet (waiting for reviewer).
+        let card_no_review = t.working("card no review");
+        t.mv(&card_no_review, Testing).unwrap();
+        t.test(&card_no_review, TestStatus::Pass).unwrap();
+        let card_no_review = t.mv(&card_no_review, Review).unwrap();
+        assert_eq!(card_no_review.status, Review);
+        assert!(card_no_review.current_worker.is_none());
+        assert!(card_no_review.review_result.is_none());
+
+        let t_max = [
+            &card_changes,
+            &card_approved,
+            &card_no_review,
+        ]
+        .into_iter()
+        .map(|c| {
+            t.events(c)
+                .iter()
+                .map(|e| e.created_at)
+                .max()
+                .unwrap_or(0)
+                .max(t.get(c).updated_at)
+        })
+        .max()
+        .unwrap_or(0);
+
+        let now = t_max + STALLED_AFTER_MS;
+        let before_stalled = inbox(&t.hub, &t.coord).len();
+        let wake = t.hub.check_stalled_tasks_at(now, STALLED_AFTER_MS).unwrap();
+
+        // The coordinator is woken for card_approved and card_no_review, but NOT for card_changes.
+        assert_eq!(wake.len(), 1);
+        assert_eq!(wake[0].id, t.coord.id);
+
+        let msgs = inbox(&t.hub, &t.coord);
+        assert_eq!(msgs.len(), before_stalled + 2);
+
+        let pinged_task_ids: Vec<&str> = msgs[before_stalled..]
+            .iter()
+            .map(|m| m.meta["task_id"].as_str().unwrap())
+            .collect();
+
+        assert!(!pinged_task_ids.contains(&card_changes.id.as_str()));
+        assert!(pinged_task_ids.contains(&card_approved.id.as_str()));
+        assert!(pinged_task_ids.contains(&card_no_review.id.as_str()));
     }
 
     #[test]
@@ -3172,7 +3260,7 @@ mod board {
         t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
         t.pass(&task, ReviewDecision::Changes, vec![high()]);
-        let task = t.mv(&task, Working).unwrap();
+        let task = t.user_move(&task, Working);
         assert_eq!(task.review_rounds, 1);
         let reviewed = t.pass(&task, ReviewDecision::Approved, vec![]);
         let in_commit = t.mv(&reviewed, Done).unwrap();
@@ -3206,10 +3294,8 @@ mod board {
         let t = team();
         t.set_git_switches(false, false, false, false);
         let task = t.working("feature");
-        t.pass(&task, ReviewDecision::Changes, vec![critical()]);
-        t.mv(&task, Working).unwrap();
-        t.pass(&task, ReviewDecision::Changes, vec![critical()]);
-        let in_commit = t.mv(&task, Done).unwrap();
+        let task = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
+        let in_commit = t.user_move(&task, ToCommit);
         assert_eq!(in_commit.status, ToCommit);
 
         let tasks_before = t.hub.tasks(WS, false).unwrap();

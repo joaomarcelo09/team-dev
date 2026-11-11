@@ -602,8 +602,8 @@ impl JgtMcp {
         the card stops in the column of the first git step that is OFF). The answer lists the git steps to run now \
         (commit, push, open_pr, merge_pr) and the task's branch. \
         The hub checks the gates; a refusal is final, so report it. \
-        Review->Done: Done is accepted for an approved review at any round, and for a review with changes \
-        only when no fix round is left; the hub files a follow-up in Backlog with a priority it sets itself.")]
+        Review->Done: Done is accepted only for an approved review; \
+        the hub files a follow-up in Backlog with a priority it sets itself.")]
     async fn task_move(&self, Parameters(args): Parameters<TaskMoveArgs>) -> Result<CallToolResult, McpError> {
         let (actor, workspace) = match self.coordinator_board(args.jgt_session.as_deref()).await {
             Ok(b) => b,
@@ -620,7 +620,7 @@ impl JgtMcp {
         }
     }
 
-    #[tool(description = "Coordinator only. Create a task in Backlog: a planner's subtask or a review \
+    #[tool(description = "Coordinator only. Create a task in Backlog: a subtask or a review \
         follow-up (parent = its task). queue = true queues a subtask of a task the user queued.")]
     async fn task_create(&self, Parameters(args): Parameters<TaskCreateArgs>) -> Result<CallToolResult, McpError> {
         let (actor, workspace) = match self.coordinator_board(args.jgt_session.as_deref()).await {
@@ -721,8 +721,8 @@ mod tests {
         a.priority = TaskPriority::High;
         a.review_rounds = 1;
         let b = Task::new("/w", 2, "later", TaskStatus::Backlog);
-        assert_eq!(render_tasks(&[a.clone(), b]), "- JGT-1 [Review] fix navbar (high) · round 2/2\n- JGT-2 [Backlog] later");
-        assert_eq!(render_change(&a), "JGT-1 is in Review, round 2/2.");
+        assert_eq!(render_tasks(&[a.clone(), b]), "- JGT-1 [Review] fix navbar (high) · round 2/1\n- JGT-2 [Backlog] later");
+        assert_eq!(render_change(&a), "JGT-1 is in Review, round 2/1.");
         assert_eq!(task_path("/w", " JGT-1 ", "/move"), "/v1/tasks/JGT-1/move?workspace=%2Fw");
     }
 

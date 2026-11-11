@@ -1142,11 +1142,11 @@ mod tests {
         let mut t = task(1, TaskStatus::Backlog, 0);
         assert_eq!(super::round_label(&t), None);
         t.status = TaskStatus::Review;
-        assert_eq!(super::round_label(&t).as_deref(), Some("round 1/2"));
+        assert_eq!(super::round_label(&t), None);
         // Sent back once: the second cycle, as `task list` shows it.
         t.status = TaskStatus::Working;
         t.review_rounds = 1;
-        assert_eq!(super::round_label(&t).as_deref(), Some("round 2/2"));
+        assert_eq!(super::round_label(&t).as_deref(), Some("round 2/1"));
         t.status = TaskStatus::Backlog;
         t.review_rounds = 2;
         t.round_limit = 3;

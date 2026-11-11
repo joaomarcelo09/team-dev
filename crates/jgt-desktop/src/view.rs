@@ -513,7 +513,6 @@ impl std::fmt::Display for HarnessChoice {
 
 pub const AGENT_ROLES: &[&str] = &[
     jgt_core::COORDINATOR,
-    "planner",
     "coder",
     "reviewer",
     "git-coder",
@@ -2500,7 +2499,7 @@ mod tests {
                 effort: "medium".into(),
             },
             AgentRow {
-                role: "planner".into(),
+                role: "reviewer".into(),
                 harness: Harness::Opencode,
                 model: "custom-model".into(),
                 effort: "low".into(),

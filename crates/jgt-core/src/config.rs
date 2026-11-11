@@ -146,7 +146,6 @@ pub fn role_defaults(role: &str) -> SkillSettings {
     };
     match role {
         crate::model::COORDINATOR => set(Some("claude-code"), "opus", "medium"),
-        "planner" => set(Some("claude-code"), "opus", "medium"),
         "coder" => SkillSettings {
             fallback: Some(FallbackSettings {
                 harness: Some("claude-code".into()),
@@ -873,7 +872,6 @@ mod tests {
         let fallback = coder.on_fallback().unwrap();
         assert_eq!(fallback.describe("coder"), "coder · Claude Code · sonnet · medium");
         assert_eq!(get(COORDINATOR).describe("c"), "c · Claude Code · opus · medium");
-        assert_eq!(get("planner").describe("p"), "p · Claude Code · opus · medium");
         assert_eq!(get("reviewer").describe("r"), "r · Claude Code · opus · medium");
         assert_eq!(get("git-coder").describe("g"), "g · Claude Code · sonnet · low");
         assert!(get("git-coder").on_fallback().is_none());
@@ -908,7 +906,7 @@ mod tests {
     fn invalid_settings_fall_back_with_a_warning() {
         let user: Config = toml::from_str(
             r#"
-            [team.skills.planner]
+            [team.skills.coder]
             effort = "hihg"
             [team.skills.coordinator]
             harness = "opencode"
@@ -921,9 +919,9 @@ mod tests {
         )
         .unwrap();
         let none = ProjectTeam::default();
-        let (planner, w) = user.team.resolve("planner", &none);
-        assert_eq!(planner.effort, "medium");
-        assert_eq!(w, ["planner: unknown effort `hihg` (use low, medium, high, xhigh, max); using medium"]);
+        let (coder, w) = user.team.resolve("coder", &none);
+        assert_eq!(coder.effort, "medium");
+        assert_eq!(w, ["coder: unknown effort `hihg` (use low, medium, high, xhigh, max); using medium"]);
         let (coordinator, w) = user.team.resolve(COORDINATOR, &none);
         assert_eq!(coordinator.harness, Harness::ClaudeCode);
         assert!(w.iter().any(|w| w.contains("Claude Code only")), "{w:?}");
@@ -979,7 +977,7 @@ mod tests {
         std::fs::write(root.join(".team/config.toml"), "[team.skills.coder]\nmodel = \"sonnet\"\n").unwrap();
         assert_eq!(project_config_path(&wt), Some(root.join(".team/config.toml")));
         assert_eq!(Config::default().team.for_skill("coder", &wt).model, "sonnet");
-        assert_eq!(Config::default().team.for_skill("planner", &wt).model, "opus");
+        assert_eq!(Config::default().team.for_skill("reviewer", &wt).model, "opus");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1132,12 +1130,12 @@ mod tests {
 
         let team = Config::default().team;
         let resolved = TeamAgents::resolve(&team, &root);
-        assert_eq!(resolved.roles.len(), 5);
+        assert_eq!(resolved.roles.len(), 4);
         assert_eq!(resolved.roles[COORDINATOR].harness, Harness::ClaudeCode);
         assert_eq!(resolved.roles["coder"].harness, Harness::Antigravity);
 
         let desc = resolved.describe();
-        assert!(desc.starts_with("Agents: coordinator · Claude Code · opus · medium, planner · "));
+        assert!(desc.starts_with("Agents: coordinator · Claude Code · opus · medium, coder · "));
         assert!(desc.contains("coder · Antigravity · gemini-3.8-flash-medium · medium"));
 
         resolved.write(&root).unwrap();
@@ -1145,6 +1143,20 @@ mod tests {
         assert_eq!(loaded, resolved);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_planner_config_loads_silently_without_warning() {
+        let user: Config = toml::from_str(
+            r#"
+            [team.skills.planner]
+            harness = "claude-code"
+            model = "opus"
+            effort = "medium"
+            "#,
+        )
+        .unwrap();
+        assert!(user.team.warnings(None).is_empty());
     }
 
     #[test]
