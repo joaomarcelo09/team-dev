@@ -104,9 +104,10 @@ pub fn prepare_files() -> Result<PathBuf> {
 fn prepare_files_in(files: &Path) -> Result<()> {
     let exe = std::env::current_exe().context("locating the jg-team-dev executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
+    let rtk = settings::find_rtk();
     std::fs::create_dir_all(files)?;
-    write_atomic(&files.join("settings.json"), &serde_json::to_string_pretty(&settings::claude_settings(&exe))?)?;
-    write_atomic(&files.join("settings-coordinator.json"), &serde_json::to_string_pretty(&settings::claude_settings_for_role(&exe, Some(jgt_core::model::COORDINATOR)))?)?;
+    write_atomic(&files.join("settings.json"), &serde_json::to_string_pretty(&settings::claude_settings_with_rtk(&exe, None, rtk.as_deref()))?)?;
+    write_atomic(&files.join("settings-coordinator.json"), &serde_json::to_string_pretty(&settings::claude_settings_with_rtk(&exe, Some(jgt_core::model::COORDINATOR), rtk.as_deref()))?)?;
     write_atomic(&files.join("mcp.json"), &serde_json::to_string_pretty(&settings::mcp_config(&exe))?)?;
     write_plugin(&files.join("plugin"))?;
     Ok(())

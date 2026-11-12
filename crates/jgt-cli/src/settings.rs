@@ -30,12 +30,25 @@ fn hook_timeout(event: HookEvent) -> u64 {
 }
 
 /// Hooks for every event, plus a rule that lets agents message the user without a prompt.
+#[allow(dead_code)] // launches use `claude_settings_with_rtk`
 pub fn claude_settings(exe: &Path) -> Value {
     claude_settings_for_role(exe, None)
 }
 
 /// Claude Code settings with an optional role passed to every hook invocation (`jg-team-dev hook --role <role> <event>`).
+#[allow(dead_code)] // launches use `claude_settings_with_rtk`
 pub fn claude_settings_for_role(exe: &Path, role: Option<&str>) -> Value {
+    claude_settings_with_rtk(exe, role, None)
+}
+
+/// The `rtk` program, from `[commands] rtk` or the usual places; `None` when it is not installed.
+pub fn find_rtk() -> Option<PathBuf> {
+    let config = jgt_core::config::Config::load();
+    jgt_core::launch::find_program("rtk", config.commands.rtk.as_deref()).ok()
+}
+
+/// `claude_settings_for_role`, plus rtk's Bash `PreToolUse` hook (`<rtk> hook claude`) when `rtk` is given.
+pub fn claude_settings_with_rtk(exe: &Path, role: Option<&str>, rtk: Option<&Path>) -> Value {
     let mut hooks = serde_json::Map::new();
     let role_flag = role.map(|r| format!(" --role {r}")).unwrap_or_default();
     for event in HookEvent::ALL {
@@ -47,6 +60,15 @@ pub fn claude_settings_for_role(exe: &Path, role: Option<&str>) -> Value {
                     "command": format!("{} hook{role_flag} {}", quote(exe), event.arg()),
                     "timeout": hook_timeout(event),
                 }]
+            }]),
+        );
+    }
+    if let Some(rtk) = rtk {
+        hooks.insert(
+            "PreToolUse".into(),
+            json!([{
+                "matcher": "Bash",
+                "hooks": [{ "type": "command", "command": format!("{} hook claude", quote(rtk)) }]
             }]),
         );
     }
@@ -71,7 +93,7 @@ pub fn mcp_config(exe: &Path) -> Value {
 
 pub fn print(mcp: bool) -> Result<()> {
     let exe = exe()?;
-    let value = if mcp { mcp_config(&exe) } else { claude_settings(&exe) };
+    let value = if mcp { mcp_config(&exe) } else { claude_settings_with_rtk(&exe, None, find_rtk().as_deref()) };
     println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }
@@ -105,6 +127,42 @@ mod tests {
         let s = claude_settings(Path::new("/opt/my tools/jg-team-dev"));
         let command = s["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
         assert_eq!(command, "'/opt/my tools/jg-team-dev' hook stop");
+    }
+
+    #[test]
+    fn rtk_adds_a_bash_pre_tool_use_hook() {
+        let exe = Path::new("/usr/bin/jg-team-dev");
+        for role in [None, Some("coordinator")] {
+            let s = claude_settings_with_rtk(exe, role, Some(Path::new("/path/rtk")));
+            let group = &s["hooks"]["PreToolUse"][0];
+            assert_eq!(group["matcher"], "Bash");
+            assert_eq!(group["hooks"][0]["type"], "command");
+            assert_eq!(group["hooks"][0]["command"], "/path/rtk hook claude");
+            assert!(group["hooks"][0].get("timeout").is_none());
+            assert_eq!(s["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+            let without = claude_settings_for_role(exe, role);
+            for event in HookEvent::ALL {
+                assert_eq!(s["hooks"][event.claude_name()], without["hooks"][event.claude_name()]);
+            }
+            assert_eq!(s["hooks"].as_object().unwrap().len(), HookEvent::ALL.len() + 1);
+            assert_eq!(s["permissions"], without["permissions"]);
+        }
+    }
+
+    #[test]
+    fn rtk_path_with_spaces_is_quoted() {
+        let s = claude_settings_with_rtk(Path::new("/usr/bin/jg-team-dev"), None, Some(Path::new("/opt/my tools/rtk")));
+        assert_eq!(s["hooks"]["PreToolUse"][0]["hooks"][0]["command"], "'/opt/my tools/rtk' hook claude");
+    }
+
+    #[test]
+    fn no_rtk_means_no_pre_tool_use() {
+        let exe = Path::new("/usr/bin/jg-team-dev");
+        for role in [None, Some("coordinator")] {
+            let s = claude_settings_with_rtk(exe, role, None);
+            assert!(s["hooks"].get("PreToolUse").is_none());
+            assert_eq!(s, claude_settings_for_role(exe, role));
+        }
     }
 
     #[test]
