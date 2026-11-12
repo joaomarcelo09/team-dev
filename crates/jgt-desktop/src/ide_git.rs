@@ -23,6 +23,58 @@ fn git_cmd(root: &Path) -> Command {
     cmd
 }
 
+/// Message shown in the IDE when the team folder holds no git repository.
+pub const NOT_A_REPO: &str =
+    "This folder is not a git repository. Start a team inside a repo, or in a folder that contains repos.";
+
+/// Folder names never scanned for child repositories (hidden folders are skipped too).
+const SKIP_CHILD_DIRS: &[&str] = &["node_modules", "target"];
+
+/// True when `dir` is inside a git work tree (itself a repo, or inside a bigger one).
+async fn is_inside_work_tree(dir: &Path) -> bool {
+    let mut cmd = git_cmd(dir);
+    cmd.args(["rev-parse", "--is-inside-work-tree"]);
+    match cmd.output().await {
+        Ok(out) => out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true",
+        Err(_) => false,
+    }
+}
+
+/// Finds the git repositories directly inside `project` (one level deep), as `Main`
+/// sources labelled with the folder name, sorted by name. Hidden folders (including
+/// `.team`), `node_modules`, `target` and symlinks are skipped; a child counts when it
+/// holds a `.git` entry (folder or file).
+pub fn find_child_repos(project: &Path) -> Vec<Source> {
+    let Ok(entries) = std::fs::read_dir(project) else {
+        return Vec::new();
+    };
+    let mut repos = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if name.starts_with('.') || SKIP_CHILD_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        // DirEntry::file_type does not follow symlinks: symlinked folders are skipped.
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() && !ft.is_symlink() => {}
+            _ => continue,
+        }
+        let root = project.join(&name);
+        if std::fs::symlink_metadata(root.join(".git")).is_err() {
+            continue;
+        }
+        repos.push(Source {
+            label: name,
+            root,
+            kind: SourceKind::Main,
+        });
+    }
+    repos.sort_by(|a, b| a.label.cmp(&b.label));
+    repos
+}
+
 /// Resolves the default main reference (`main`, falling back to `origin/HEAD`).
 pub async fn resolve_main_ref(root: &Path) -> Result<String, String> {
     for candidate in &["main", "origin/HEAD"] {
@@ -33,6 +85,9 @@ pub async fn resolve_main_ref(root: &Path) -> Result<String, String> {
         {
             return Ok((*candidate).to_string());
         }
+    }
+    if !is_inside_work_tree(root).await {
+        return Err(NOT_A_REPO.to_string());
     }
     Err("branch 'main' not found (and origin/HEAD not available)".to_string())
 }
@@ -53,7 +108,16 @@ async fn git_merge_base(root: &Path, base_ref: &str) -> Option<String> {
 
 /// Lists all available sources: `Main` (committed `main` ref) prepended, followed by
 /// worktrees under `<project>/.team/worktrees/`.
+///
+/// When `project` is not inside a git work tree but holds child repositories, returns
+/// one `Main` source per child repo instead (see [`find_child_repos`]).
 pub async fn list_sources(project: &Path) -> Result<Vec<Source>, String> {
+    if !is_inside_work_tree(project).await {
+        let repos = find_child_repos(project);
+        if !repos.is_empty() {
+            return Ok(repos);
+        }
+    }
     let mut sources = Vec::new();
     let main_source = Source {
         label: "Main".to_string(),
@@ -695,5 +759,116 @@ mod tests {
         assert!(!file_list.truncated);
         assert_eq!(file_list.total_count, file_list.files.len());
         assert!(file_list.files.contains(&"tracked.txt".to_string()));
+    }
+
+    fn temp_dir(name: &str) -> TestRepo {
+        let dir = std::env::temp_dir().join(format!(
+            "jgt-ide-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        TestRepo { dir }
+    }
+
+    /// Creates a repo with one commit on `branch` holding `file`.
+    fn init_repo(dir: &Path, branch: &str, file: &str, content: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        run_sync(dir, &["init", "-q", "-b", branch]);
+        run_sync(dir, &["config", "user.email", "test@example.com"]);
+        run_sync(dir, &["config", "user.name", "Tester"]);
+        std::fs::write(dir.join(file), content).unwrap();
+        run_sync(dir, &["add", "."]);
+        run_sync(dir, &["commit", "-q", "-m", "init"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_sources_detects_child_repos() {
+        let team = temp_dir("multi");
+        let p = &team.dir;
+        init_repo(&p.join("beta"), "main", "b.txt", "b\n");
+        init_repo(&p.join("alpha"), "main", "a.txt", "a\n");
+        std::fs::create_dir_all(p.join("plain")).unwrap();
+        for skipped in [".hidden", ".team", "target", "node_modules"] {
+            std::fs::create_dir_all(p.join(skipped).join(".git")).unwrap();
+        }
+        symlink(p.join("alpha"), p.join("link")).unwrap();
+        let outside = temp_dir("multi-outside");
+        init_repo(&outside.dir, "main", "o.txt", "o\n");
+        symlink(&outside.dir, p.join("outside-link")).unwrap();
+
+        let sources = list_sources(p).await.unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                Source { label: "alpha".to_string(), root: p.join("alpha"), kind: SourceKind::Main },
+                Source { label: "beta".to_string(), root: p.join("beta"), kind: SourceKind::Main },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_child_repo_source_lists_and_reads_files() {
+        let team = temp_dir("multi-read");
+        let p = &team.dir;
+        init_repo(&p.join("alpha"), "main", "a.txt", "hello\n");
+        std::fs::write(p.join("alpha").join(".env"), "SECRET=placeholder\n").unwrap();
+        run_sync(&p.join("alpha"), &["add", "."]);
+        run_sync(&p.join("alpha"), &["commit", "-q", "-m", "env"]);
+
+        let sources = list_sources(p).await.unwrap();
+        let alpha = &sources[0];
+        assert_eq!(alpha.label, "alpha");
+
+        let list = list_files(alpha).await.unwrap();
+        assert!(list.files.contains(&"a.txt".to_string()));
+        assert_eq!(read_file(alpha, "a.txt").await.unwrap(), FileContent::Text("hello\n".to_string()));
+        assert_eq!(read_file(alpha, ".env").await.unwrap().notice(), Some("Secret file: not shown"));
+        assert!(read_file(alpha, "../alpha/a.txt").await.is_err());
+        assert!(changes(alpha).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_not_a_repo_shows_message() {
+        let team = temp_dir("norepo");
+        std::fs::create_dir_all(team.dir.join("plain")).unwrap();
+        let sources = list_sources(&team.dir).await.unwrap();
+        assert_eq!(
+            sources,
+            vec![Source { label: "Main".to_string(), root: team.dir.clone(), kind: SourceKind::Main }]
+        );
+        assert_eq!(list_files(&sources[0]).await.unwrap_err(), NOT_A_REPO);
+    }
+
+    #[tokio::test]
+    async fn test_missing_main_names_branch() {
+        let team = temp_dir("nomain");
+        init_repo(&team.dir, "dev", "x.txt", "x\n");
+        let sources = list_sources(&team.dir).await.unwrap();
+        let err = list_files(&sources[0]).await.unwrap_err();
+        assert!(err.contains("branch 'main' not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_single_repo_sources_unchanged_with_nested_repo() {
+        let (repo, wt_dir) = setup_test_repo("single-nested");
+        // A nested repo folder inside the team repo must not change the sources.
+        init_repo(&repo.dir.join("nested"), "main", "n.txt", "n\n");
+        let sources = list_sources(&repo.dir).await.unwrap();
+        assert_eq!(
+            sources,
+            vec![
+                Source { label: "Main".to_string(), root: repo.dir.clone(), kind: SourceKind::Main },
+                Source {
+                    label: "jgt-wt1".to_string(),
+                    root: wt_dir,
+                    kind: SourceKind::Worktree { branch: "jgt/jgt-wt1".to_string() },
+                },
+            ]
+        );
     }
 }
