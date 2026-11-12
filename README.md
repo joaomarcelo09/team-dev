@@ -17,7 +17,7 @@ The app, its hub and its data run on your machine; the agents use Claude Code or
 you ⇄ jg-team-dev app ⇄ jg-team-dev-hub (SQLite, unix socket) ⇄ MCP + hooks ⇄ Coordinator ─ claude -p ─▶ workers
 ```
 
-The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an MCP server, session hooks, and an iced desktop application (`jg-team-dev-desktop`). The system operates with its own unix socket, SQLite database, and configuration, and passes its hooks to sessions with `--settings` instead of modifying `~/.claude/settings.json`.
+The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an MCP server, session hooks, and an iced desktop application (`jg-team-dev-desktop`). The system operates with its own unix socket, SQLite database, and configuration, and passes its hooks to sessions with `--settings` instead of modifying `~/.claude/settings.json`. If `rtk` is installed (`[commands] rtk`, `~/.local/bin`, … or `PATH`), its Bash hook (`rtk hook claude`) is added to the sessions' settings too.
 
 ## Features
 
@@ -186,6 +186,7 @@ auto_merge_pr = false      # merge the pull request once its checks pass (defaul
 [commands]
 # opencode = "/path/to/opencode"   # when it is not on PATH (e.g. an nvm install)
 # antigravity = "/path/to/agy"
+# rtk = "/path/to/rtk"             # its Bash hook is added to team sessions when found
 ```
 
 The `[git]` section configures git autonomy: the steps the team takes on its own once the

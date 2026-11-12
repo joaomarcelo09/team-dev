@@ -535,6 +535,9 @@ pub struct Commands {
     /// Absolute path to Antigravity's `agy`, for workers on the `antigravity` harness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub antigravity: Option<String>,
+    /// Absolute path to `rtk`; when found, its Bash hook is added to team sessions' settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rtk: Option<String>,
     /// Terminal used to reopen sessions. `{cwd}` is replaced by the session folder and the
     /// agent command is appended, e.g. `["kitty", "--directory", "{cwd}", "--"]`.
     pub terminal: Option<Vec<String>>,
