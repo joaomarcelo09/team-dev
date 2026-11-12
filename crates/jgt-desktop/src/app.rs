@@ -801,11 +801,16 @@ impl App {
         let project = PathBuf::from(jgt_core::team::project_folder(&ws));
         if self.ide.source.kind == crate::ide::SourceKind::Main
             && (self.ide.source.root.as_os_str().is_empty() || self.ide.source.root != project)
+            && !is_child_repo_source(&self.ide.sources, &self.ide.source.root, &project)
         {
-            self.ide.source = crate::ide::Source {
-                label: "Main".to_string(),
-                root: project.clone(),
-                kind: crate::ide::SourceKind::Main,
+            // A folder holding several repos lists them as child Main sources: keep to them.
+            self.ide.source = match self.ide.sources.first() {
+                Some(first) if is_child_repo_source(&self.ide.sources, &first.root, &project) => first.clone(),
+                _ => crate::ide::Source {
+                    label: "Main".to_string(),
+                    root: project.clone(),
+                    kind: crate::ide::SourceKind::Main,
+                },
             };
         }
 
@@ -960,6 +965,22 @@ impl App {
         self.ide.show_diff = tab.show_diff;
         self.ide.viewer = Viewer::Loading;
         Task::batch([listing_task, self.load_ide_file()])
+    }
+
+    /// When the current source is the team folder itself but the folder holds several
+    /// repos (the sources are its child repos), switches to the first child repo.
+    fn adopt_child_repo_source(&mut self) -> Task<Msg> {
+        let current = &self.ide.source;
+        if current.kind == crate::ide::SourceKind::Main
+            && !current.root.as_os_str().is_empty()
+            && !self.ide.sources.iter().any(|s| s.root == current.root)
+            && let Some(first) = self.ide.sources.first()
+            && is_child_repo_source(&self.ide.sources, &first.root, &current.root)
+        {
+            let first = first.clone();
+            return self.switch_ide_source(first);
+        }
+        Task::none()
     }
 
     /// Drops the tabs whose source no longer exists (Main tabs always stay).
@@ -1993,6 +2014,7 @@ impl App {
                         {
                             self.ide.source = first.clone();
                         }
+                        return self.adopt_child_repo_source();
                     }
                     Err(err) => {
                         if self.module == Module::Ide {
@@ -2054,7 +2076,7 @@ impl App {
                     {
                         self.ide.source = first.clone();
                     }
-                    Task::none()
+                    self.adopt_child_repo_source()
                 }
             }
             Msg::IdeListingLoaded { root, result } => {
@@ -2234,6 +2256,13 @@ impl App {
 }
 
 const TEXT_SIZE_RANGE: (u16, u16) = DesktopConfig::TEXT_SIZE_RANGE;
+
+/// True when `root` is a child-repo `Main` source of `project` (a folder holding several
+/// repos): one level below `project` and listed in `sources`.
+fn is_child_repo_source(sources: &[crate::ide::Source], root: &Path, project: &Path) -> bool {
+    root.parent() == Some(project)
+        && sources.iter().any(|s| s.kind == crate::ide::SourceKind::Main && s.root == root)
+}
 
 fn clamp_zoom(zoom: f32) -> f32 {
     let (min, max) = DesktopConfig::ZOOM_RANGE;
@@ -3820,6 +3849,36 @@ effort = "low"
         app.ide.show_diff = false;
         let _ = app.update(Msg::IdeOpenFile("normal.txt".to_string()));
         assert!(!app.ide.show_diff, "opening normal file keeps show_diff false");
+    }
+
+    #[test]
+    fn test_ide_multi_repo_folder_switches_to_first_child_repo() {
+        let (mut app, _) = App::new(None);
+        app.workspace = Some("/multi".to_string());
+        let project = PathBuf::from(jgt_core::team::project_folder("/multi"));
+        let child = |name: &str| crate::ide::Source {
+            label: name.to_string(),
+            root: project.join(name),
+            kind: crate::ide::SourceKind::Main,
+        };
+        let _ = app.load_ide();
+        assert_eq!(app.ide.source.root, project, "first load starts at the team folder");
+
+        let _ = app.update(Msg::IdeSourcesLoaded {
+            project: project.clone(),
+            result: Ok(vec![child("alpha"), child("beta")]),
+        });
+        assert_eq!(app.ide.source, child("alpha"), "team folder source is replaced by the first repo");
+
+        // Picking another repo sticks across reloads.
+        let _ = app.update(Msg::IdeSelectSource(child("beta")));
+        let _ = app.load_ide();
+        assert_eq!(app.ide.source, child("beta"));
+        let _ = app.update(Msg::IdeSourcesLoaded {
+            project: project.clone(),
+            result: Ok(vec![child("alpha"), child("beta")]),
+        });
+        assert_eq!(app.ide.source, child("beta"));
     }
 
     #[test]
