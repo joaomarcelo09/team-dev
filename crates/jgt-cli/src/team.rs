@@ -72,7 +72,6 @@ const SKILLS: &[(&str, &str)] = &[
     ("coordinator", include_str!("../../../skills/coordinator/SKILL.md")),
     ("coder", include_str!("../../../skills/coder/SKILL.md")),
     ("reviewer", include_str!("../../../skills/reviewer/SKILL.md")),
-    ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),
 ];
 
 /// Writes the plugin (manifest + skills) into `dir`, replacing what an older version wrote.
@@ -89,6 +88,13 @@ pub fn write_plugin(dir: &Path) -> Result<()> {
         let skill = dir.join("skills").join(name);
         std::fs::create_dir_all(&skill)?;
         write_atomic(&skill.join("SKILL.md"), text)?;
+    }
+    // A skill an older version wrote but this one no longer has (an old role) goes.
+    for entry in std::fs::read_dir(dir.join("skills"))?.flatten() {
+        let name = entry.file_name();
+        if entry.path().is_dir() && !SKILLS.iter().any(|(n, _)| name.to_str() == Some(*n)) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
     Ok(())
 }
@@ -625,6 +631,11 @@ mod tests {
         assert_eq!(meta["name"], PLUGIN_NAME);
         let skill = std::fs::read_to_string(dir.join("skills/coordinator/SKILL.md")).unwrap();
         assert!(skill.starts_with("---\nname: coordinator\n"));
+        // A skill an older version wrote is removed on the next write.
+        std::fs::create_dir_all(dir.join("skills/old-role")).unwrap();
+        write_plugin(&dir).unwrap();
+        assert!(!dir.join("skills/old-role").exists());
+        assert!(dir.join("skills/reviewer/SKILL.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

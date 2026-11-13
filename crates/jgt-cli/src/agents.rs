@@ -22,7 +22,7 @@ pub struct AgentsArgs {
 pub enum AgentsCommand {
     /// Change the harness, model or effort for a role.
     Set {
-        /// The role to change (coordinator, coder, reviewer, git-coder).
+        /// The role to change (coordinator, coder, reviewer).
         role: String,
         /// Harness (claude-code, opencode, antigravity).
         #[arg(long, value_parser = crate::parse_harness)]

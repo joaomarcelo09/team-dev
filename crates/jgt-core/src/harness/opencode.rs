@@ -54,15 +54,14 @@ fn agent(skill: &str) -> String {
 }
 
 /// What `OPENCODE_CONFIG_CONTENT` adds for a worker: our MCP server, told the worker's id, and
-/// deny rules for the git commands only the git-coder may run (PRD Q8: no routing, `--auto`).
-fn inline_config(exe: &Path, session_id: &str, skill: &str) -> Value {
+/// deny rules for the git commands no worker may run: the Coordinator does the git steps
+/// (PRD Q8: no routing, `--auto`).
+fn inline_config(exe: &Path, session_id: &str) -> Value {
     let mut bash = serde_json::Map::new();
-    if skill != "git-coder" {
-        // Checked with `opencode debug agent`: each becomes a `bash` rule with this glob pattern,
-        // after the `*` allow, so it wins.
-        for cmd in ["git commit*", "git push*", "git merge*", "git rebase*", "git reset --hard*"] {
-            bash.insert(cmd.into(), json!("deny"));
-        }
+    // Checked with `opencode debug agent`: each becomes a `bash` rule with this glob pattern,
+    // after the `*` allow, so it wins.
+    for cmd in ["git commit*", "git push*", "git merge*", "git rebase*", "git reset --hard*"] {
+        bash.insert(cmd.into(), json!("deny"));
     }
     // Everything else is approved by `--auto`, so no catch-all rule (whose place in the
     // matching order is unverified).
@@ -126,7 +125,7 @@ impl HarnessAdapter for Opencode {
         args.push(brief_prompt(w.brief, w.brief_file));
         let mut env = w.env.clone();
         env.push(("OPENCODE_CONFIG_DIR".into(), config_dir(w.files).to_string_lossy().into_owned()));
-        env.push(("OPENCODE_CONFIG_CONTENT".into(), inline_config(&w.exe, w.session_id, w.skill).to_string()));
+        env.push(("OPENCODE_CONFIG_CONTENT".into(), inline_config(&w.exe, w.session_id).to_string()));
         env.push((SESSION_ENV.into(), w.session_id.to_string()));
         Ok(LaunchPlan {
             program: w.program.clone(),

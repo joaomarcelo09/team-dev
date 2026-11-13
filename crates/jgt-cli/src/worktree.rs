@@ -1,5 +1,5 @@
 //! Git worktrees for coders: each coder works in `.team/worktrees/<name>` on branch `jgt/<name>`,
-//! so nothing reaches the main worktree until the user agrees and the git-coder merges it.
+//! so nothing reaches the main worktree until the user agrees and the Coordinator merges it.
 
 use anyhow::{Context, Result, bail};
 use std::{

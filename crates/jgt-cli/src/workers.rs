@@ -26,7 +26,7 @@ use std::{
 
 #[derive(clap::Args)]
 pub struct WorkerArgs {
-    /// coder, reviewer or git-coder.
+    /// coder or reviewer.
     pub skill: String,
     /// Short task title, shown as the worker's chat title (`<skill> · <task>`).
     #[arg(long)]

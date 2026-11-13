@@ -2268,7 +2268,7 @@ mod board {
         assert_eq!(msgs.len(), before + 1);
         let expected_msg = format!(
             "[jg-team-dev] Task {} \"stalled feature\" has sat in Working for 10 min with no worker running. \
-             Take the next step of the flow now (test_result → review → reviewer → review_result → Done → git-coder), \
+             Take the next step of the flow now (test_result → review → reviewer → review_result → Done → run the git steps yourself), \
              or tell the user what blocks it.",
             task.key
         );
@@ -3167,7 +3167,7 @@ mod board {
         let msgs = inbox(&t.hub, &t.coord);
         let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit")).expect("coordinator message");
         let expected = format!(
-            "[jg-team-dev] The user moved {} from Review to To push: their OK to commit. Branch: jgt/jgt-1. Run them with the git-coder now.",
+            "[jg-team-dev] The user moved {} from Review to To push: their OK to commit. Branch: jgt/jgt-1. Run them yourself now.",
             resp.task.key
         );
         assert_eq!(coord_msg.body, expected);
@@ -3184,7 +3184,7 @@ mod board {
         let msgs2 = inbox(&t.hub, &t.coord);
         let coord_msg2 = msgs2.iter().find(|m| m.body.contains("their OK to commit, push, open_pr, merge_pr")).expect("coordinator message");
         let expected2 = format!(
-            "[jg-team-dev] The user moved {} from Review to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-2. Run them with the git-coder now.",
+            "[jg-team-dev] The user moved {} from Review to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-2. Run them yourself now.",
             resp2.task.key
         );
         assert_eq!(coord_msg2.body, expected2);
@@ -3230,7 +3230,7 @@ mod board {
         let msgs = inbox(&t.hub, &t.coord);
         let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit, push, open_pr, merge_pr")).expect("coordinator message");
         let expected = format!(
-            "[jg-team-dev] The user moved {} from To commit to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-1. Run them with the git-coder now.",
+            "[jg-team-dev] The user moved {} from To commit to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-1. Run them yourself now.",
             resp.task.key
         );
         assert_eq!(coord_msg.body, expected);

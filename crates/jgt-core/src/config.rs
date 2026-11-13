@@ -155,7 +155,6 @@ pub fn role_defaults(role: &str) -> SkillSettings {
             ..set(Some("antigravity"), "gemini-3.8-flash-medium", "medium")
         },
         "reviewer" => set(Some("claude-code"), "opus", "medium"),
-        "git-coder" => set(Some("claude-code"), "sonnet", "low"),
         _ => SkillSettings::default(),
     }
 }
@@ -829,7 +828,7 @@ mod tests {
             [team.skills.coder]
             model = "sonnet"
             effort = "high"
-            [team.skills.git-coder]
+            [team.skills.reviewer]
             allowed_tools = ["Bash(cargo test:*)"]
             "#,
         )
@@ -848,11 +847,11 @@ mod tests {
         // below the role.
         assert_eq!((coder.harness, coder.model.as_str(), coder.effort.as_str()), (Harness::ClaudeCode, "haiku", "high"));
         // `allowed_tools` alone does not replace the role's built-in harness, model and effort.
-        let git_coder = user.team.resolve("git-coder", &ProjectTeam::default()).0;
-        assert_eq!((git_coder.model.as_str(), git_coder.effort.as_str()), ("sonnet", "low"));
-        assert_eq!(git_coder.allowed_tools, ["Bash(cargo test:*)"]);
-        assert_eq!(git_coder.permission_mode, "auto");
-        assert_eq!(git_coder.compact_window, None);
+        let reviewer = user.team.resolve("reviewer", &ProjectTeam::default()).0;
+        assert_eq!((reviewer.model.as_str(), reviewer.effort.as_str()), ("opus", "medium"));
+        assert_eq!(reviewer.allowed_tools, ["Bash(cargo test:*)"]);
+        assert_eq!(reviewer.permission_mode, "auto");
+        assert_eq!(reviewer.compact_window, None);
     }
 
     #[test]
@@ -879,8 +878,7 @@ mod tests {
         assert_eq!(fallback.describe("coder"), "coder · Claude Code · sonnet · medium");
         assert_eq!(get(COORDINATOR).describe("c"), "c · Claude Code · opus · medium");
         assert_eq!(get("reviewer").describe("r"), "r · Claude Code · opus · medium");
-        assert_eq!(get("git-coder").describe("g"), "g · Claude Code · sonnet · low");
-        assert!(get("git-coder").on_fallback().is_none());
+        assert!(get("reviewer").on_fallback().is_none());
         assert!(team.warnings(None).is_empty(), "{:?}", team.warnings(None));
     }
 
@@ -893,7 +891,7 @@ mod tests {
         assert_eq!(coder.describe("coder"), "coder · Antigravity · gemini-3.8-flash-medium · medium");
         // Without agy the role's fallback is taken whole, not mixed with `[team]`.
         assert_eq!(coder.on_fallback().unwrap().describe("coder"), "coder · Claude Code · sonnet · medium");
-        assert_eq!(user.team.resolve("git-coder", &none).0.describe("g"), "g · Claude Code · sonnet · low");
+        assert_eq!(user.team.resolve("reviewer", &none).0.describe("r"), "r · Claude Code · opus · medium");
         // A role model without a harness runs on claude-code, never on the default's Antigravity.
         let user: Config = toml::from_str("[team.skills.coder]\nmodel = \"x\"\n").unwrap();
         let coder = user.team.resolve("coder", &none).0;
@@ -915,8 +913,6 @@ mod tests {
             [team.skills.coder]
             effort = "hihg"
             [team.skills.coordinator]
-            harness = "opencode"
-            [team.skills.git-coder]
             harness = "codex"
             [team.skills.reviewer]
             harness = "opencode"
@@ -930,20 +926,17 @@ mod tests {
         assert_eq!(w, ["coder: unknown effort `hihg` (use low, medium, high, xhigh, max); using medium"]);
         let (coordinator, w) = user.team.resolve(COORDINATOR, &none);
         assert_eq!(coordinator.harness, Harness::ClaudeCode);
-        assert!(w.iter().any(|w| w.contains("Claude Code only")), "{w:?}");
-        let (git_coder, w) = user.team.resolve("git-coder", &none);
-        assert_eq!(git_coder.harness, Harness::ClaudeCode);
         assert!(w.iter().any(|w| w.contains("unknown harness `codex`")), "{w:?}");
         // OpenCode has no effort we can map: the level stays, the flag is dropped at launch.
         let (reviewer, w) = user.team.resolve("reviewer", &none);
         assert_eq!((reviewer.harness, reviewer.effort.as_str()), (Harness::Opencode, "max"));
         assert!(w.iter().all(|w| !w.starts_with("reviewer")), "{w:?}");
         let all = user.team.warnings(None);
-        assert!(all.iter().any(|w| w.starts_with("coordinator:")) && all.iter().any(|w| w.starts_with("git-coder:")));
+        assert!(all.iter().any(|w| w.starts_with("coordinator:")) && all.iter().any(|w| w.starts_with("coder:")));
     }
 
     #[test]
-    fn legacy_verifier_and_tester_skills_in_config_do_not_break_loading() {
+    fn legacy_verifier_tester_and_git_coder_skills_in_config_do_not_break_loading() {
         let toml_str = r#"
         [team]
         model = "opus"
@@ -951,10 +944,14 @@ mod tests {
         model = "haiku"
         [team.skills.tester]
         model = "haiku"
+        [team.skills.git-coder]
+        model = "sonnet"
+        effort = "low"
         "#;
         let user: Config = toml::from_str(toml_str).unwrap();
         assert!(user.team.skills.contains_key("verifier"));
         assert!(user.team.skills.contains_key("tester"));
+        assert!(user.team.skills.contains_key("git-coder"));
         let warnings = user.team.warnings(None);
         assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
     }
@@ -1136,7 +1133,7 @@ mod tests {
 
         let team = Config::default().team;
         let resolved = TeamAgents::resolve(&team, &root);
-        assert_eq!(resolved.roles.len(), 4);
+        assert_eq!(resolved.roles.len(), 3);
         assert_eq!(resolved.roles[COORDINATOR].harness, Harness::ClaudeCode);
         assert_eq!(resolved.roles["coder"].harness, Harness::Antigravity);
 

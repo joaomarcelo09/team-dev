@@ -3493,12 +3493,9 @@ allowed_tools = ["Bash"]
 
         let _ = app.update(Msg::ToggleSettings);
         assert!(app.show_settings);
-        assert_eq!(app.agents.len(), 4);
+        assert_eq!(app.agents.len(), 3);
         let roles: Vec<&str> = app.agents.iter().map(|a| a.role.as_str()).collect();
-        assert_eq!(
-            roles,
-            vec!["coordinator", "coder", "reviewer", "git-coder"]
-        );
+        assert_eq!(roles, vec!["coordinator", "coder", "reviewer"]);
         // Coordinator harness is always Claude Code
         assert_eq!(app.agents[0].harness, Harness::ClaudeCode);
 

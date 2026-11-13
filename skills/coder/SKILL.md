@@ -19,7 +19,7 @@ description: jg-team-dev coder worker. Implements exactly the scope in its brief
 - If the brief carries review findings (or the path of a result file with them): a coder started
   after the user sent the card back fixes exactly the findings the brief lists (they are all
   critical) and re-runs the tests.
-- Never commit, branch or push: the git-coder does that after the user agrees.
+- Never commit, branch or push: the Coordinator does that after the user agrees.
 - If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when you
   were started with `--task-id`); never move cards: the Coordinator does.
 
