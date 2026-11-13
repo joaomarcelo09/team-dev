@@ -49,23 +49,59 @@ pub fn check_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The direct child folders of `dir` that are git repositories, sorted by name (hidden folders
+/// and symlinks skipped).
+pub fn child_repos(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && !e.file_name().to_string_lossy().starts_with('.'))
+        .map(|e| e.path())
+        .filter(|p| p.join(".git").exists())
+        .collect();
+    repos.sort();
+    repos
+}
+
 /// `.team/worktrees/<name>` in the repository holding `dir`, created from HEAD on branch
 /// `jgt/<name>` when it does not exist yet. Returns its path.
+///
+/// When `dir` is not in a repository but holds repositories (a multi-repo team folder), each
+/// child repository `<repo>` gets its worktree at `dir/.team/worktrees/<name>/<repo>` and the
+/// folder holding them is returned.
 pub fn ensure(dir: &Path, name: &str) -> Result<PathBuf> {
     check_name(name)?;
-    let root = repo_root(dir).context("--worktree needs a git repository")?;
-    exclude_team_dir(&root)?;
-    let path = root.join(".team").join("worktrees").join(name);
+    let Some(root) = repo_root(dir) else {
+        let repos = child_repos(dir);
+        if repos.is_empty() {
+            bail!("--worktree needs a git repository (or a folder whose subfolders are git repositories)");
+        }
+        let base = dir.join(".team").join("worktrees").join(name);
+        for repo in &repos {
+            let repo_name = repo.file_name().context("repository folder name")?;
+            ensure_at(repo, name, &base.join(repo_name))?;
+        }
+        return Ok(base);
+    };
+    ensure_at(&root, name, &root.join(".team").join("worktrees").join(name))
+}
+
+/// The worktree of the repository `root` at `path`, on branch `jgt/<name>`.
+fn ensure_at(root: &Path, name: &str, path: &Path) -> Result<PathBuf> {
+    exclude_team_dir(root)?;
+    let path = path.to_path_buf();
     if path.join(".git").exists() {
         return Ok(path);
     }
     let branch = format!("{BRANCH_PREFIX}{name}");
     let path_str = path.to_string_lossy().into_owned();
-    let branch_exists = git(&root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
+    let branch_exists = git(root, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")]).is_ok();
     if branch_exists {
-        git(&root, &["worktree", "add", &path_str, &branch])?;
+        git(root, &["worktree", "add", &path_str, &branch])?;
     } else {
-        git(&root, &["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
+        git(root, &["worktree", "add", "-b", &branch, &path_str, "HEAD"])?;
     }
     Ok(path)
 }
@@ -75,7 +111,10 @@ mod tests {
     use super::*;
 
     fn repo(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("jgt-wt-{name}-{}", std::process::id()));
+        init_repo(std::env::temp_dir().join(format!("jgt-wt-{name}-{}", std::process::id())))
+    }
+
+    fn init_repo(dir: PathBuf) -> PathBuf {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for args in [
@@ -133,6 +172,30 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let err = ensure(&dir, "x").unwrap_err().to_string();
         assert!(err.contains("needs a git repository"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_folder_of_repositories_gets_one_worktree_per_repository() {
+        let dir = std::env::temp_dir().join(format!("jgt-wt-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("notes")).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let api = init_repo(dir.join("api"));
+        let web = init_repo(dir.join("web"));
+        let wt = ensure(&dir, "multi").unwrap();
+        assert_eq!(wt, dir.join(".team/worktrees/multi"));
+        for (repo, name) in [(&api, "api"), (&web, "web")] {
+            let sub = wt.join(name);
+            assert_eq!(std::fs::read_to_string(sub.join("a.txt")).unwrap(), "hello\n");
+            assert_eq!(git(&sub, &["branch", "--show-current"]).unwrap(), "jgt/multi");
+            assert_eq!(git(repo, &["branch", "--show-current"]).unwrap(), "main");
+            assert_eq!(git(repo, &["status", "--porcelain"]).unwrap(), "", "{name}: the live checkout stays clean");
+        }
+        assert!(!wt.join("notes").exists(), "only repositories get worktrees");
+        // A second call (say, for the reviewer) reuses them.
+        assert_eq!(ensure(&dir, "multi").unwrap(), wt);
+        assert_eq!(git(&api, &["worktree", "list", "--porcelain"]).unwrap().matches("worktree ").count(), 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

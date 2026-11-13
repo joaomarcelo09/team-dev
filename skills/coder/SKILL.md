@@ -9,6 +9,8 @@ description: jg-team-dev coder worker. Implements exactly the scope in its brief
   and acceptance criteria. Read the brief, task Details, and the files they name, and follow the
   project's conventions. Do not re-read documents the brief says it summarizes.
 - Make focused changes; no unrelated refactors unless the brief asks for them.
+- In a multi-repo worktree folder (`<repo>/` subfolders), edit only the repos the brief names and
+  list them in `filesChanged` with the repo prefix (`api/src/x.rs`).
 - Run self-checks that fit the change: type-check, lint, targeted tests, build.
 - The coder runs the tests. After implementing, run the build and the tests that cover your
   change (not only targeted ones if the change is wide) and report them in your result JSON with

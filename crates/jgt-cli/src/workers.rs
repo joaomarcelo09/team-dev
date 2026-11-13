@@ -209,6 +209,14 @@ fn read_brief(args: &WorkerArgs) -> Result<String> {
     Ok(brief)
 }
 
+/// The coder of `parent` still running, if any: only one coder codes at a time. A finished
+/// session, or one whose process is gone (`alive` says no), does not count.
+fn running_coder<'a>(sessions: &'a [Session], parent: &str, alive: impl Fn(&Session) -> bool) -> Option<&'a Session> {
+    sessions.iter().find(|s| {
+        s.parent_id.as_deref() == Some(parent) && s.role.as_deref() == Some("coder") && s.status.is_connected() && alive(s)
+    })
+}
+
 /// `jg-team-dev worker`: starts a worker in the background and returns at once.
 pub async fn start(args: WorkerArgs) -> Result<()> {
     if !WORKER_SKILLS.contains(&args.skill.as_str()) {
@@ -224,6 +232,16 @@ pub async fn start(args: WorkerArgs) -> Result<()> {
         Some(key) => Some(client.get(&task_path(&parent, key, "")?).await.with_context(|| format!("reading task {key}"))?),
         None => None,
     };
+    if args.skill == "coder" {
+        let all: SessionsResponse = client.get("/v1/sessions").await.context("listing the workers")?;
+        if let Some(s) = running_coder(&all.sessions, &parent.id, |s| s.pid.is_none_or(|p| procs::is_alive(p, s.pid_start))) {
+            bail!(
+                "a coder is already running ({} · {}): only one coder codes at a time; wait for it or stop it",
+                s.display_name(),
+                jgt_core::short_id(&s.external_id)
+            );
+        }
+    }
     let worktree_name = task_worktree(&args, task.as_ref());
     let cwd = match &args.cwd {
         Some(dir) => dir.clone(),
@@ -232,10 +250,15 @@ pub async fn start(args: WorkerArgs) -> Result<()> {
     let cwd = cwd.canonicalize().with_context(|| format!("{} does not exist", cwd.display()))?;
     let cwd = match &worktree_name {
         Some(name) => worktree::ensure(&cwd, name)?,
-        None if args.skill == "coder" && !args.main_worktree && worktree::repo_root(&cwd).is_some() => bail!(
-            "coders work in a git worktree: pass --worktree <name>. To write the main worktree \
-             directly, warn the user first, then pass --main-worktree."
-        ),
+        None if args.skill == "coder"
+            && !args.main_worktree
+            && (worktree::repo_root(&cwd).is_some() || !worktree::child_repos(&cwd).is_empty()) =>
+        {
+            bail!(
+                "coders work in a git worktree: pass --worktree <name>. To write the main worktree \
+                 directly, warn the user first, then pass --main-worktree."
+            )
+        }
         None => cwd,
     };
 
@@ -899,6 +922,28 @@ mod tests {
         .unwrap();
         let path = task_path(&parent, "JGT-12", "").unwrap();
         assert_eq!(path, "/v1/tasks/JGT-12?workspace=%2Fw");
+    }
+
+    #[test]
+    fn only_a_running_coder_of_this_coordinator_blocks_another() {
+        let session = |id: &str, parent: &str, role: &str, status: &str| -> Session {
+            serde_json::from_value(serde_json::json!({
+                "id": id, "harness": "claude-code", "external_id": format!("ext-{id}"), "status": status,
+                "listen": false, "mirror": false, "archived": false, "awaiting_reply": false,
+                "created_at": 0, "updated_at": 0, "last_seen_at": 0, "role": role, "parent_id": parent,
+            }))
+            .unwrap()
+        };
+        let mut all = vec![
+            session("r1", "c1", "reviewer", "active"),
+            session("d1", "c1", "coder", "disconnected"),
+            session("e1", "c1", "coder", "ended"),
+            session("o1", "c2", "coder", "active"),
+        ];
+        assert!(running_coder(&all, "c1", |_| true).is_none(), "reviewers, finished coders and other teams do not count");
+        all.push(session("k1", "c1", "coder", "idle"));
+        assert_eq!(running_coder(&all, "c1", |_| true).map(|s| s.id.as_str()), Some("k1"));
+        assert!(running_coder(&all, "c1", |_| false).is_none(), "a dead process does not count");
     }
 
     #[test]

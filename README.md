@@ -32,11 +32,11 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   `claude -p "/jg-team-dev:<skill> <brief>"` (or Antigravity / OpenCode as configured) and relays
   the result JSON to the Coordinator through the hub, waking it if needed. Workers get their own
   chats under their Coordinator; messaging a finished worker resumes it for one reply, and the
-  Coordinator gets a summary. `jg-team-dev workers` lists them (the Coordinator keeps at most 3 running).
+  Coordinator gets a summary. `jg-team-dev workers` lists them (the Coordinator keeps at most 3 running, and only one coder: a second coder is refused while one runs).
 
 - **Git flow**: coders work in `.team/worktrees/<name>` on branch `jgt/<name>`
   (`jg-team-dev worker coder --worktree <name>`; the reviewer points at the same worktree). In a
-  git repository a coder without a worktree is refused unless the Coordinator passes `--main-worktree`
+  git repository (or a folder of repos) a coder without a worktree is refused unless the Coordinator passes `--main-worktree`
   after warning you. `.team/` is kept out of `git status` through the repository's local exclude
   file. The Coordinator itself commits each task on its own branch, pushes it, opens a pull request
   and merges it, following `jg-team-dev git-policy` (using `gh pr merge <n> --merge` without
@@ -247,7 +247,7 @@ The desktop app includes an **IDE** module (in the sidebar below Board, or opene
 - **Read-only viewer**: displays highlighted file contents with line numbers. There is no editing, saving, or code execution.
 - **Syntax highlighting**: code colors follow the app theme: Dracula colors under the Dracula theme (pink keywords, yellow strings, green functions, purple numbers, grey-blue comments, cyan italic types), Tokyo Night colors under Tokyo Night, Base16 Mocha under the other dark themes and InspiredGitHub under light; the language is detected from the file extension (unknown extensions show plain text).
 - **Source selector**: choose between `main` (the committed `main` branch from git, reflecting committed state) and any task worktree under `.team/worktrees/` (showing working tree files, including uncommitted coder changes).
-- **Folder with several repos**: if the team folder is not a git repo itself but holds repos one level deep (hidden folders, `node_modules`, `target` and symlinks are skipped), the source selector lists each repo by folder name and shows its committed `main`; pick the repo there. A folder with no repo shows "This folder is not a git repository" in the picker. For real work across several repos, one team per repository is still the safest setup (workers, worktrees and git steps assume a single repo).
+- **Folder with several repos**: if the team folder is not a git repo itself but holds repos one level deep (hidden folders, `node_modules`, `target` and symlinks are skipped), the source selector lists each repo by folder name and shows its committed `main`; pick the repo there. A folder with no repo shows "This folder is not a git repository" in the picker. In such a folder `--worktree <name>` creates one worktree per repo under `.team/worktrees/<name>/<repo>` (branch `jgt/<name>` in each) and one coder handles them all; git steps then run once per repo.
 - **Picker on the right**: directory tree on the right side of the view, sorted folders-first and lazily expanded.
 - **M/A/D marks and "Changed only"**: worktree files display badges for Modified (`M`), Added (`A`), Deleted (`D`), and Renamed (`R`) changes relative to the merge base with `main`. A **Changed only** checkbox filters the tree to only show files with changes.
 - **File | Diff toggle**: for changed files, toggle between the full file text and the unified diff view with colored additions and deletions. Deleted files show the diff view directly.
