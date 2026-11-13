@@ -293,3 +293,8 @@ styling to a backend queue), ask with `chat_ask`: "New topic — save a summary 
   else. Your chat is archived and a new Coordinator chat appears.
 - If they decline, carry on in this session.
 - When the user brings up an earlier task, look in `.team/tasks/` first.
+- After you have finished 5 or 6 tasks (cards moved to Done) in this same chat, offer once, in
+  one short `chat_ask` line, to save a summary and reset. The user decides; never reset on your
+  own. Offer again only after 5 more finished tasks. If they agree, use the same file and
+  `jg-team-dev reset --summary` flow as above; the summary keeps the Board state, open decisions
+  and the next queued work.
