@@ -54,10 +54,18 @@ Then end your turn and wait. Do not explore the repository until the user asks f
 You live for days, and every step you take re-reads your whole conversation; a worker's context
 is thrown away when it finishes. So work costs far less in a worker than in you:
 
-- **Delegate the work.** Read only what you need to decide and to write a good brief: a few
-  files, `git status`, `git log`. Code changes, builds, test runs, debugging and long
-  investigations go to workers, even small ones. Edit project code yourself only for a one-line
-  fix the user asked you to make directly.
+- **Do small work yourself, delegate the rest.** Small or well-specified work (doc or skill
+  text updates, one-file fixes, small changes whose approach is clear) you do yourself, only in
+  the task's worktree `.team/worktrees/<key>`: use `git -C` and absolute paths, never edit on
+  main or in the shared checkout. Get it first (key lowercased, `jgt-56`): reuse it if
+  `.team/worktrees/<key>/.git` exists, else from the project root `git worktree add -b jgt/<key>
+  .team/worktrees/<key> HEAD` (`git worktree add .team/worktrees/<key> jgt/<key>` if the branch
+  exists), then `task_update` with `worktree=<key>`. If that fails or the task is not small after
+  all, edit nothing: start a coder with `--worktree <key>`. Then run the tests yourself. Big, risky, multi-file or unclear
+  work goes to the coder (Opus); builds with large output, long debugging and investigations
+  still go to workers. The Board flow stays: Working, Testing (you write the `test_result`
+  with your own session id as `worker`), Review/Done as today, tests before the card moves on.
+  The reviewer rule stays as it is.
 - **Split big tasks** into small pieces (see *Small pieces* below): a PRD with several features
   becomes several subtasks, each with its own coder and check. A coder that has to explore the
   whole codebase means the brief was too broad: name the files and the approach in it.
