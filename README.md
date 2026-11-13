@@ -125,7 +125,9 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   **reviewer** is the only gate: it does not re-run tests, it checks only critical things (`behavior`,
   `security`, `secret`, `patterns` when documented). One review pass per task, reviewing the full
   worktree diff (`git diff`, all coders). If the reviewer requests changes, the card stays in Review
-  waiting for the user.
+  waiting for the user. For a simple task (docs, small low-risk change, tests green) the Coordinator
+  may skip the reviewer: the hub then lets the card go from Testing past Review only with a green test
+  and a move reason `review skipped: <why>`, which the card log shows.
   A finished worker's result reaches the Coordinator as a short digest (at most 10 lines: status,
   finding counts, notes) with the path of the full result in the run, which also shows in the
   worker's chat. A worker stopped by the usage limit sets *Waiting: usage limit* on its task with the

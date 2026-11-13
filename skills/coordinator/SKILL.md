@@ -113,6 +113,12 @@ same `--task-id` and the same `--worktree` (one after another; in parallel only 
 files), never one card per coder piece (cards for subtasks only for follow-ups). The reviewer's brief
 lists every coder result file and, for multi-repo work, every worktree to review.
 
+**Skipping the reviewer (your judgment, explicit).** For a simple task (docs or skill text, a small
+low-risk change, tests green) you may skip the reviewer: after `test_result` pass, `task_move done`
+straight from Testing with `reason: "review skipped: <why>"` (the hub refuses it without that reason
+or a green test), and say so in your chat report. Complex, security-sensitive, large, multi-file or
+Rust-logic changes, and anything touching auth, secrets, git or the hub gate, still get a reviewer.
+
 Start one with Bash (if `jg-team-dev` is not on PATH, use the full path from your session's
 start note); the command returns at once:
 
@@ -196,6 +202,8 @@ gate: **a refusal (409 or 403) is final.** Report it to the user; never work aro
      all coders). Record `review_result` (`worker` = reviewer's hub id):
      `task_update review_result={"decision": "approved"|"changes", "worker": "<reviewer hub id>", "findings": [{"severity": "blocking"|"high", "critical": true, "category": "behavior"|"security"|"secret"|"patterns", "location", "problem", "impact", "required_action"}]}`
      (`changes_requested` is `changes`, `requiredAction` is `required_action`).
+     A simple task may skip the reviewer (see "Skipping the reviewer" above): `task_move done`
+     from Testing with `reason: "review skipped: <why>"`.
      - **Clean** (no finding): `task_move done` (the hub routes it; see step 7).
      - **Changes requested**: the card stays in Review. Tell the user with `chat_notify` what was
        found, do not start a coder, and wait.
@@ -269,7 +277,8 @@ Before any commit, push, pull request or merge, run `jg-team-dev git-policy` fir
 You run the git steps yourself with Bash, only when:
 
 1. the coder's tests passed, the reviewer approved the change, and the card is past Review (To commit /
-   To push / To open PR / To merge / Done); say so if a gate was skipped, and why,
+   To push / To open PR / To merge / Done); "review skipped: <why>" on the card meets the
+   "reviewer approved" gate (then say "reviewed: skipped (<why>)"); say so if a gate was skipped, and why,
 2. for an OFF step, you warned the user, for example: "⚠ This pushes `jgt/jgt-12` to `origin`
    and opens a pull request. Tests green, reviewed: yes. Go ahead?"; for an ON step, you
    announced in chat what is done and where, e.g. "⚠ Auto-pushing `jgt/jgt-12` and opening its

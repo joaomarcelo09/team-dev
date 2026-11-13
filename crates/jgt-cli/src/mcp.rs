@@ -540,6 +540,9 @@ impl JgtMcp {
         };
         let mut text = show(&task);
         if let Ok(r) = self.client.get::<TaskEventsResponse>(&task_path(&workspace, &task.id, "/events")).await {
+            if let Some(why) = review_skipped(&task, &r.events) {
+                text.push_str(&format!("\n## Review: skipped ({why})\n"));
+            }
             text.push_str("\n## Log\n");
             for e in r.events.iter().rev().take(20).rev() {
                 text.push_str(&format!("- {}: {}\n", e.actor.label(), describe_event(e)));
@@ -699,6 +702,19 @@ pub async fn run(harness: Harness) -> anyhow::Result<()> {
     let service = JgtMcp::new(harness).serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+/// Why the Coordinator skipped the reviewer, when the card went past Review on a skip move:
+/// the `review_skipped` of the move that took it there (whatever review the card still holds).
+fn review_skipped<'a>(task: &Task, events: &'a [jgt_core::TaskEvent]) -> Option<&'a str> {
+    if !task.status.is_past_review() {
+        return None;
+    }
+    let column = |e: &jgt_core::TaskEvent, k: &str| e.meta.get(k).and_then(|v| v.as_str()).and_then(|s| s.parse::<TaskStatus>().ok());
+    let entered = events.iter().rev().filter(|e| e.kind == jgt_core::TaskEventKind::Moved).find(|e| {
+        column(e, "to").is_some_and(|s| s.is_past_review()) && !column(e, "from").is_some_and(|s| s.is_past_review())
+    })?;
+    entered.meta.get("review_skipped").and_then(|v| v.as_str())
 }
 
 #[cfg(test)]

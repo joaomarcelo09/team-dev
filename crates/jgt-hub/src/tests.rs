@@ -3357,6 +3357,147 @@ mod board {
     }
 
     #[test]
+    fn the_coordinator_may_skip_the_review_with_a_logged_reason() {
+        let t = team();
+        t.set_git_switches(true, true, true, true);
+        let task = t.working("docs");
+        t.mv(&task, Testing).unwrap();
+        t.test(&task, TestStatus::Pass).unwrap();
+        let initial_count = notices(&t.hub, &t.coord).len();
+        let done = t.mv_with_reason(&task, Done, "Review Skipped: docs only, tests green").unwrap().task;
+        assert_eq!(done.status, Done);
+        assert!(done.review_result.is_none());
+
+        let events = t.events(&done);
+        let moved = events.iter().rev().find(|e| e.kind == TaskEventKind::Moved).unwrap();
+        assert_eq!(moved.body, "Review Skipped: docs only, tests green");
+        assert_eq!(moved.meta["review_skipped"], "docs only, tests green");
+        assert!(!events.iter().any(|e| e.kind == TaskEventKind::FollowUp), "no follow-up without a review");
+
+        let n = notices(&t.hub, &t.coord);
+        let done_title = format!("{} is Done", done.key);
+        let done_notice = n.iter().skip(initial_count).find(|m| m.meta_str("title") == Some(done_title.as_str())).expect("done notice");
+        assert!(done_notice.body.contains("Done: tested, review skipped; commit, push, open PR, merge PR per git policy."));
+    }
+
+    #[test]
+    fn skipping_the_review_routes_by_git_policy_and_says_so() {
+        let t = team();
+        t.set_git_switches(true, false, false, false);
+        let task = t.working("docs");
+        t.mv(&task, Testing).unwrap();
+        t.test(&task, TestStatus::Pass).unwrap();
+        let moved = t.mv_with_reason(&task, Done, "review skipped: skill text only").unwrap();
+        assert_eq!(moved.task.status, ToPush);
+        assert_eq!(moved.git_steps, vec!["commit".to_string()]);
+        let n = notices(&t.hub, &t.coord);
+        let last = n.last().unwrap();
+        assert!(last.body.starts_with("\"docs\" is tested, review skipped. Move the card"), "{}", last.body);
+    }
+
+    #[test]
+    fn skipping_the_review_needs_the_reason_and_a_green_test() {
+        let t = team();
+        t.set_git_switches(true, true, true, true);
+        let task = t.working("docs");
+        t.mv(&task, Testing).unwrap();
+        // No test result yet: refused even with the reason.
+        let why = conflict(t.mv_with_reason(&task, Done, "review skipped: docs only"));
+        assert!(why.contains("green test"), "{why}");
+        t.test(&task, TestStatus::Pass).unwrap();
+        // Without a reason, with another reason, or with an empty why: refused with the format.
+        for r in [None, Some("docs only"), Some("review skipped:  ")] {
+            let res = match r {
+                Some(r) => t.mv_with_reason(&task, Done, r),
+                None => t.mv_full(&task, Done),
+            };
+            let why = conflict(res);
+            assert!(why.contains("review skipped: <why>"), "{why}");
+        }
+        let why = conflict(t.mv_with_reason(&task, ToCommit, "because"));
+        assert!(why.contains("review skipped: <why>"), "{why}");
+        assert_eq!(t.get(&task).status, Testing);
+
+        // A red test: refused too.
+        let t = team();
+        let red = t.working("red");
+        t.mv(&red, Testing).unwrap();
+        t.test(&red, TestStatus::Fail).unwrap();
+        let why = conflict(t.mv_with_reason(&red, Done, "review skipped: docs only"));
+        assert!(why.contains("green test"), "{why}");
+    }
+
+    #[test]
+    fn skipping_the_review_keeps_the_git_waits_in_between() {
+        let t = team();
+        t.set_git_switches(false, false, false, false);
+        let task = t.working("docs");
+        t.mv(&task, Testing).unwrap();
+        t.test(&task, TestStatus::Pass).unwrap();
+        let why = conflict(t.mv_with_reason(&task, ToPush, "review skipped: docs only"));
+        assert!(why.contains("waits in To commit"), "{why}");
+        let in_commit = t.mv_with_reason(&task, ToCommit, "review skipped: docs only").unwrap().task;
+        assert_eq!(in_commit.status, ToCommit);
+    }
+
+    #[test]
+    fn review_with_changes_still_waits_for_the_user() {
+        let t = team();
+        t.set_git_switches(true, true, true, true);
+        let task = t.working("feature");
+        let reviewed = t.pass(&task, ReviewDecision::Changes, vec![critical()]);
+        let why = conflict(t.mv_with_reason(&reviewed, Done, "review skipped: trivial"));
+        assert!(why.contains("requested changes"), "{why}");
+    }
+
+    #[test]
+    fn skipping_the_review_after_a_changes_review_is_refused() {
+        let t = team();
+        t.set_git_switches(true, true, true, true);
+        let task = t.working("feature");
+        t.pass(&task, ReviewDecision::Changes, vec![critical()]);
+        // The user decides on a fix round: the Changes review stays on the card for the coder.
+        t.user_move(&task, Working);
+        t.mv(&task, Testing).unwrap();
+        t.test(&task, TestStatus::Pass).unwrap();
+        assert_eq!(t.get(&task).review_result.map(|r| r.decision), Some(ReviewDecision::Changes));
+        let why = conflict(t.mv_with_reason(&task, Done, "review skipped: small fix"));
+        assert!(why.contains("the reviewer asked for changes: send it to Review for a new review"), "{why}");
+        assert_eq!(t.get(&task).status, Testing);
+        // A new review is the way on.
+        t.mv(&task, Review).unwrap();
+        t.review(&task, ReviewDecision::Approved, vec![]).unwrap();
+        assert_eq!(t.mv(&task, Done).unwrap().status, Done);
+    }
+
+    #[test]
+    fn a_skip_is_logged_and_labelled_by_the_skip_move() {
+        let t = team();
+        t.set_git_switches(false, false, false, false);
+        let task = t.working("docs");
+        t.mv(&task, Testing).unwrap();
+        t.test(&task, TestStatus::Pass).unwrap();
+        let in_commit = t.mv_with_reason(&task, ToCommit, "review skipped: docs only").unwrap().task;
+        assert_eq!(in_commit.status, ToCommit);
+        let events = t.events(&in_commit);
+        let moved = events.iter().rev().find(|e| e.kind == TaskEventKind::Moved).unwrap();
+        assert_eq!(moved.meta["review_skipped"], "docs only");
+        let n = notices(&t.hub, &t.coord);
+        assert!(n.last().unwrap().body.contains("is tested, review skipped."), "{}", n.last().unwrap().body);
+        // A later git step still says the review was skipped.
+        t.user_move(&task, ToPush);
+        let n = notices(&t.hub, &t.coord);
+        assert!(n.last().unwrap().body.contains("is tested, review skipped."), "{}", n.last().unwrap().body);
+
+        // A reviewed card is labelled reviewed.
+        let reviewed = t.working("feature");
+        t.pass(&reviewed, ReviewDecision::Approved, vec![]);
+        t.mv(&reviewed, ToCommit).unwrap();
+        let n = notices(&t.hub, &t.coord);
+        assert!(n.last().unwrap().body.contains("is tested and reviewed."), "{}", n.last().unwrap().body);
+    }
+
+    #[test]
     fn coordinator_re_register_in_worktree_keeps_original_cwd() {
         let hub = hub();
         let coord = session(&hub, "coord-ext-1", jgt_core::COORDINATOR, "/w", None);

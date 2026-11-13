@@ -324,7 +324,7 @@ mod tests {
              auto-push: ON (push the task branch without asking)\n\
              auto-open-PR: OFF (ask first)\n\
              auto-merge-PR: ON (merge the pull request once its checks pass without asking)\n\
-             Always: reviewer approval (card past Review) before any commit, push or pull request.\n\
+             Always: reviewer approval (card past Review) before any commit, push or pull request, unless the Coordinator skipped the review for a simple task (card log says \"review skipped: <reason>\").\n\
              Never: commit, merge or push on main; force-push."
         );
         // The default: everything OFF, the default branch name.
