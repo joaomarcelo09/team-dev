@@ -521,6 +521,20 @@ pub fn parse_task_key(key: &str) -> Option<i64> {
     key[TASK_KEY_PREFIX.len()..].parse().ok().filter(|n| *n > 0)
 }
 
+/// How a move's `reason` starts when the Coordinator skips the reviewer for a simple task.
+pub const REVIEW_SKIPPED: &str = "review skipped:";
+
+/// The why of a `review skipped: <why>` reason (prefix case-insensitive), `None` when `reason`
+/// does not have that form or the why is empty.
+pub fn review_skip_reason(reason: Option<&str>) -> Option<&str> {
+    let reason = reason?.trim();
+    let prefix = reason.get(..REVIEW_SKIPPED.len())?;
+    if !prefix.eq_ignore_ascii_case(REVIEW_SKIPPED) {
+        return None;
+    }
+    Some(reason[REVIEW_SKIPPED.len()..].trim()).filter(|why| !why.is_empty())
+}
+
 /// A card on a workspace's Board.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {

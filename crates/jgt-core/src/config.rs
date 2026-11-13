@@ -722,7 +722,7 @@ impl Git {
             line("auto-push", self.auto_push, "push the task branch"),
             line("auto-open-PR", self.auto_open_pr, "open the pull request"),
             line("auto-merge-PR", self.auto_merge_pr, "merge the pull request once its checks pass"),
-            "Always: reviewer approval (card past Review) before any commit, push or pull request.".to_string(),
+            "Always: reviewer approval (card past Review) before any commit, push or pull request, unless the Coordinator skipped the review for a simple task (card log says \"review skipped: <reason>\").".to_string(),
             "Never: commit, merge or push on main; force-push.".to_string(),
         ]
         .join("\n")
@@ -1381,7 +1381,7 @@ mod tests {
              auto-push: OFF (ask first)\n\
              auto-open-PR: OFF (ask first)\n\
              auto-merge-PR: OFF (ask first)\n\
-             Always: reviewer approval (card past Review) before any commit, push or pull request.\n\
+             Always: reviewer approval (card past Review) before any commit, push or pull request, unless the Coordinator skipped the review for a simple task (card log says \"review skipped: <reason>\").\n\
              Never: commit, merge or push on main; force-push."
         );
 
@@ -1399,7 +1399,7 @@ mod tests {
              auto-push: ON (push the task branch without asking)\n\
              auto-open-PR: ON (open the pull request without asking)\n\
              auto-merge-PR: ON (merge the pull request once its checks pass without asking)\n\
-             Always: reviewer approval (card past Review) before any commit, push or pull request.\n\
+             Always: reviewer approval (card past Review) before any commit, push or pull request, unless the Coordinator skipped the review for a simple task (card log says \"review skipped: <reason>\").\n\
              Never: commit, merge or push on main; force-push."
         );
 

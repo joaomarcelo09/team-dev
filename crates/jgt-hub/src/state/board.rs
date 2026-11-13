@@ -8,7 +8,7 @@ use crate::db::{Board, NewTask};
 use jgt_core::{
     Actor, Finding, ROUND_LIMIT, ReviewDecision, ReviewResult, Session,
     Severity, Task, TaskEvent, TaskEventKind, TaskPriority, TaskStatus, TestResult, TestStatus, WaitingKind, api::*,
-    follow_up_priority, now_ms, parse_task_key,
+    REVIEW_SKIPPED, follow_up_priority, now_ms, parse_task_key, review_skip_reason,
 };
 use serde_json::json;
 use std::{
@@ -479,6 +479,35 @@ impl Hub {
         Ok(())
     }
 
+    /// The Coordinator's explicit skip of the reviewer for a simple task: a move from Testing past
+    /// Review with a green test and a `reason` of the form `review skipped: <why>`.
+    fn review_skip_allowed(task: &Task, to: TaskStatus, reason: Option<&str>) -> Result<(), String> {
+        if task.test_result.as_ref().map(|t| t.status) != Some(TestStatus::Pass) {
+            return Err(format!("{} needs a green test of this pass (K6)", to.label()));
+        }
+        if task.review_result.as_ref().is_some_and(|r| r.decision == ReviewDecision::Changes) {
+            return Err("the reviewer asked for changes: send it to Review for a new review".into());
+        }
+        if review_skip_reason(reason).is_none() {
+            return Err(format!(
+                "{} without a review needs reason \"{REVIEW_SKIPPED} <why>\" (e.g. \"{REVIEW_SKIPPED} docs only, tests green\"); otherwise move it to Review",
+                to.label()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The column the card left on its last move past Review (from a column before Review).
+    fn entered_past_review_from(events: &[TaskEvent]) -> Option<TaskStatus> {
+        let column = |e: &TaskEvent, k: &str| e.meta.get(k).and_then(|v| v.as_str()).and_then(|s| s.parse::<TaskStatus>().ok());
+        events
+            .iter()
+            .rev()
+            .filter(|e| e.kind == TaskEventKind::Moved)
+            .find(|e| column(e, "to").is_some_and(|s| s.is_past_review()) && !column(e, "from").is_some_and(|s| s.is_past_review()))
+            .and_then(|e| column(e, "from"))
+    }
+
     /// Whether the team does the step of the git column `status` on its own. `git` holds the
     /// switches the workspace allows (`Git::effective`).
     fn is_git_switch_on(status: TaskStatus, git: &jgt_core::config::Git) -> bool {
@@ -555,8 +584,13 @@ impl Hub {
                     return refused("no automatic fix round: the card stays where it is and the user decides".into());
                 }
             }
-            (Review, to) if to.is_git_stage() || to == Done => {
-                if let Err(why) = Self::review_passed(task, to) {
+            (Review | Testing, to) if to.is_git_stage() || to == Done => {
+                let passed = if from == Testing {
+                    Self::review_skip_allowed(task, to, reason)
+                } else {
+                    Self::review_passed(task, to)
+                };
+                if let Err(why) = passed {
                     return refused(why);
                 }
                 for col in TaskStatus::GIT_STAGES {
@@ -609,12 +643,15 @@ impl Hub {
         let mut follow_up_task = None;
         let mut git_steps = Vec::new();
         let mut from_status = task.status;
+        let mut review_skipped = false;
         self.db.board(|b| {
             // Re-read inside the transaction, so the gates see what is committed now.
             let mut task = b.task(&task.id)?.ok_or(HubError::NotFound("task"))?;
             let from = task.status;
             from_status = from;
-            let routed = actor != Actor::User && req.to == TaskStatus::Done && (from == TaskStatus::Review || from.is_git_stage());
+            let routed = actor != Actor::User
+                && req.to == TaskStatus::Done
+                && (matches!(from, TaskStatus::Review | TaskStatus::Testing) || from.is_git_stage());
             let to = if routed { policy.stop_after(from, caps) } else { req.to };
             git_steps = git.steps_between(from, to).into_iter().map(String::from).collect();
             queued = to == TaskStatus::OnQueue && from != to;
@@ -661,6 +698,21 @@ impl Hub {
             if let Some(why) = &gate_skipped {
                 meta["gate_skipped"] = json!(why);
             }
+            // The review is skipped by the move itself (Testing past Review), whatever an earlier
+            // review left on the card; a later move past Review inherits it from the entering move.
+            review_skipped = if from == TaskStatus::Testing && to.is_past_review() {
+                true
+            } else if from.is_past_review() {
+                Self::entered_past_review_from(&b.events(&task.id)?) == Some(TaskStatus::Testing)
+            } else {
+                false
+            };
+            if from == TaskStatus::Testing
+                && to.is_past_review()
+                && let Some(why) = review_skip_reason(reason)
+            {
+                meta["review_skipped"] = json!(why);
+            }
             changes.log(b, &task.id, TaskEventKind::Moved, &actor, &body, meta)?;
             if !from.is_past_review() && to.is_past_review() {
                 follow_up_task = self.follow_up(b, &task, &mut changes)?;
@@ -682,10 +734,8 @@ impl Hub {
             } else {
                 git_step_list(&git_steps)
             };
-            let body = format!(
-                "{} \"{}\" is Done: tested, reviewed; {steps} per git policy.{extra}",
-                task.key, task.title
-            );
+            let checked = if review_skipped { "tested, review skipped" } else { "tested, reviewed" };
+            let body = format!("{} \"{}\" is Done: {checked}; {steps} per git policy.{extra}", task.key, task.title);
             self.notify_task(&task, "success", &format!("{} is Done", task.key), &body)?;
         }
         if task.status.is_git_stage() && before != task.status {
@@ -695,8 +745,9 @@ impl Hub {
                 Some(why) if policy.switch(task.status) => format!(" The team cannot do it: {why}."),
                 _ => String::new(),
             };
+            let checked = if review_skipped { "tested, review skipped" } else { "tested and reviewed" };
             let body = format!(
-                "\"{}\" is tested and reviewed. Move the card (or answer in chat) to OK {}.{on_branch}{cannot}",
+                "\"{}\" is {checked}. Move the card (or answer in chat) to OK {}.{on_branch}{cannot}",
                 task.title,
                 git_step_noun(task.status)
             );
