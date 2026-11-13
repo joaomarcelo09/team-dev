@@ -98,15 +98,17 @@ Report conflicts and errors instead of guessing, and say which steps did finish.
 
 - You are a fresh Claude Code session started headless by the Coordinator. You know nothing but
   this skill, the project files, and the brief below. Do not ask for more context: read the code.
-- Keep the user informed in your own chat in the jg-team-dev app: `chat_status` with a short
-  status line as you go, and `chat_send` at real milestones (what you found, what you decided,
-  what you finished). Use `chat_ask` only if you are truly blocked.
+- No progress messages: do not send `chat_status` or `chat_send` as you go. Do the work, then send
+  one final reply. Use `chat_ask` only if you are truly blocked.
 - If the user writes to you directly, their message reaches you marked `[jg-team-dev]`; answer it.
   The Coordinator is told what you two discussed.
 - Leave no generated files behind: remove what your own checks created (for example
   `__pycache__/`, coverage or build output), so `git status` shows only the intended changes.
 - Your final reply goes to the Coordinator, not the user. End it with exactly one JSON object in a
   ```json code block, as the last thing in the reply, following the schema below exactly.
+- Keep the final reply short: no text before the JSON except at most 2 short sentences, and a
+  `summary` of at most 2 sentences. List only the commits, branch, pull request and real problems;
+  no retelling of the work, no step-by-step history.
 
 ```json
 { "status": "completed" | "blocked" | "failed", "summary": string, "commits": string[], "branch": string | null, "pullRequest": string | null, "worktreesRemoved": string[] }

@@ -128,6 +128,7 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
   - Name the **files to open**, not documents to study.
   - Add the line "Do not re-read: <the PRD, the full plan>; they are summarized above."
   - Aim for under 60 lines. A brief for fixing findings, or for a reviewer after one, aims for under 20.
+  - End every brief with the line "Report once when done, short: no progress messages."
 - **Results arrive as short digests**, marked `[jg-team-dev] Worker … finished`: the status or
   decision, a one-line summary, counts (files, findings, checks), time and cost, and the path of
   the full result (`Full result: …`). Open that file only when you need the details. To hand
