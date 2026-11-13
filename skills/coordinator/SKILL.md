@@ -109,8 +109,8 @@ for that. Only when the coder's tests are green: `task_move testing`, record `te
 `task_move review`, start the reviewer. The review always covers the full worktree diff (`git diff`,
 all coders). If the reviewer requests changes, the card stays in Review waiting for the user. A big task
 (frontend + backend, several services) may use several coders, one piece each, all started with the
-same `--task-id` and the same `--worktree` (one after another; in parallel only when they touch disjoint
-files), never one card per coder piece (cards for subtasks only for follow-ups). The reviewer's brief
+same `--task-id` and the same `--worktree` (one after another, never in parallel: only one coder runs
+at a time), never one card per coder piece (cards for subtasks only for follow-ups). The reviewer's brief
 lists every coder result file and, for multi-repo work, every worktree to review.
 
 **Skipping the reviewer (your judgment, explicit).** For a simple task (docs or skill text, a small
@@ -131,6 +131,12 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
   on branch `jgt/<name>`. Point the reviewer at the same worktree with the same `--worktree <name>`,
   so it checks the coders' changes. Only for a trivial change, and only after telling the user it
   will touch their main worktree, pass `--main-worktree` instead.
+- **One coder at a time.** `jg-team-dev worker coder` refuses to start while another coder of yours
+  is running. In a multi-repo folder (not a git repo, repos one level down), `--worktree <name>`
+  creates `.team/worktrees/<name>/<repo>` per repo: start ONE coder with ONE brief that names every
+  repo and what to change in each (path + file hints). When it finishes, check each repo's diff
+  (`git -C <wt>/<repo> diff --stat`) against the brief before Testing: a coder can edit the wrong
+  repo and still report success. Git steps (commit, push, PR) then run once per repo that changed.
 - **Never `cd` into a worktree** (the hub knows you by your folder); use `git -C <worktree> ...`,
   absolute paths, or a subshell `(cd <worktree> && ...)` for commands that need it.
 - **The brief is everything the worker knows, and it is short.** Write it to a file under
@@ -151,7 +157,7 @@ jg-team-dev worker coder --task "fix navbar color" --brief-file .team/briefs/nav
 - **Choose a worker's model only when the task needs it.** Each role has its model and effort in
   the config. For one hard task you may raise one worker with `--model <name>` and/or
   `--effort <low|medium|high|xhigh|max>`; `jg-team-dev worker` prints what it runs on.
-- **At most 3 workers at a time**, any roles. Check with `jg-team-dev workers` before starting
+- **At most 3 workers at a time**, any roles, and at most one of them a coder. Check with `jg-team-dev workers` before starting
   more, and order the work yourself: for example coder, then reviewer.
 - **Findings go to a fresh coder**: only the blocking and high ones, by the **path** of the
   result file that holds them. Never resume the old coder.
