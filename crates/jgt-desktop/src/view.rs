@@ -521,7 +521,6 @@ pub const AGENT_ROLES: &[&str] = &[
     jgt_core::COORDINATOR,
     "coder",
     "reviewer",
-    "git-coder",
 ];
 
 pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {

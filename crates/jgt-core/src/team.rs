@@ -22,7 +22,7 @@ pub const SESSION_ENV: &str = "JGT_SESSION";
 pub const TASK_ENV: &str = "JGT_TASK";
 
 /// Worker skills a Coordinator can start (`jg-team-dev worker <skill>`).
-pub const WORKER_SKILLS: &[&str] = &["coder", "reviewer", "git-coder"];
+pub const WORKER_SKILLS: &[&str] = &["coder", "reviewer"];
 
 /// Where `settings.json`, `mcp.json` and `plugin/` for team sessions are written.
 pub fn files_dir() -> PathBuf {
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn tool_lists_become_one_flag_per_tool() {
-        let mut settings = Config::default().team.for_skill("git-coder", Path::new("/nonexistent"));
+        let mut settings = Config::default().team.for_skill("reviewer", Path::new("/nonexistent"));
         settings.allowed_tools = vec!["Bash(cargo test:*)".into(), "Read".into()];
         settings.disallowed_tools = vec!["WebFetch".into()];
         let args = session_args(Path::new("/f"), "t", &settings);

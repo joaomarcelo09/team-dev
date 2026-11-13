@@ -721,7 +721,7 @@ impl Hub {
             let steps = git.steps_between(before, task.status);
             if !steps.is_empty() {
                 let text = format!(
-                    "[jg-team-dev] The user moved {} from {} to {}: their OK to {}.{on_branch} Run them with the git-coder now.",
+                    "[jg-team-dev] The user moved {} from {} to {}: their OK to {}.{on_branch} Run them yourself now.",
                     task.key,
                     before.label(),
                     task.status.label(),
@@ -1173,7 +1173,7 @@ impl Hub {
             let minutes = ((now - last_activity).max(0) / (60 * 1000)).max(1);
             let text = format!(
                 "[jg-team-dev] Task {} \"{}\" has sat in {} for {minutes} min with no worker running. \
-                 Take the next step of the flow now (test_result → review → reviewer → review_result → Done → git-coder), \
+                 Take the next step of the flow now (test_result → review → reviewer → review_result → Done → run the git steps yourself), \
                  or tell the user what blocks it.",
                 task.key,
                 task.title,

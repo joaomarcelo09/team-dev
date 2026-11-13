@@ -1,14 +1,14 @@
 # jg-team-dev
 
 A desktop chat with a **Coordinator**: a Claude Code session that listens to you and runs a team
-of worker sessions (coder, reviewer, git-coder). Each worker starts with a
+of worker sessions (coder, reviewer). Each worker starts with a
 clean context and one skill, reports progress in its own chat box, and exits when its task is done.
 
 ## In short
 
 jg-team-dev is a desktop app for running a small team of AI coding agents on your own projects.
 You chat with a Coordinator, which breaks the work into tasks on a Kanban board.
-The Coordinator writes the brief into the task, then coder, reviewer and git-coder take each task in turn, each in its own chat.
+The Coordinator writes the brief into the task, then coder and reviewer take each task in turn, each in its own chat; the Coordinator does the git steps itself.
 Every task gets its own branch and worktree; the coder runs the tests and the reviewer checks the full diff.
 You approve each git step (commit, push, pull request, merge) unless you switch it to automatic.
 The app, its hub and its data run on your machine; the agents use Claude Code or Antigravity.
@@ -27,7 +27,7 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   wakes it with its context intact.
 
 - **Workers and skills**: the Coordinator runs `jg-team-dev worker <skill> --task … --brief-file …`
-  (coder, reviewer, git-coder; there are no separate verifier or tester workers: the coder
+  (coder, reviewer; there are no separate verifier or tester workers: the coder
   runs the build and tests, and the reviewer is the only gate). It returns at once; a detached process runs
   `claude -p "/jg-team-dev:<skill> <brief>"` (or Antigravity / OpenCode as configured) and relays
   the result JSON to the Coordinator through the hub, waking it if needed. Workers get their own
@@ -38,11 +38,13 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   (`jg-team-dev worker coder --worktree <name>`; the reviewer points at the same worktree). In a
   git repository a coder without a worktree is refused unless the Coordinator passes `--main-worktree`
   after warning you. `.team/` is kept out of `git status` through the repository's local exclude
-  file. The git-coder commits each task on its own branch, pushes it, opens a pull request and merges
-  it (using `gh pr merge <n> --merge` without `--delete-branch`, deleting the remote branch with
-  `git push origin --delete`, removing the worktree, and deleting the local branch with `git branch -d`),
-  each step only after a review, a test and your OK (or its auto-switch); it never commits, merges or
-  pushes on `main`, and removes the worktree once the pull request is merged. Inspect the live policy
+  file. The Coordinator itself commits each task on its own branch, pushes it, opens a pull request
+  and merges it, following `jg-team-dev git-policy` (using `gh pr merge <n> --merge` without
+  `--delete-branch`, deleting the remote branch with `git push origin --delete`, removing the
+  worktree, and deleting the local branch with `git branch -d`), each step only after a review, a
+  test and your OK (or its auto-switch). Workers never run these git commands, and the team never
+  commits, merges or pushes on `main`; the worktree is removed once the pull request is merged.
+  Inspect the live policy
   at any time with `jg-team-dev git-policy`.
 
 - **Runs**: each request with workers is a *run*. `jg-team-dev run start` writes
@@ -66,7 +68,7 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   the pull request). When the Coordinator moves a card to `done` from Review or a git column, the
   hub routes it to the first later column whose auto-switch is OFF, or to Done if all are ON. The hub
   returns the ON steps passed along the way (`git_steps`: `commit`, `push`, `open_pr`, `merge_pr`) and
-  the task's branch name (`branch`), which the Coordinator hands to the git-coder. In a git
+  the task's branch name (`branch`), which the Coordinator uses to run those steps itself. In a git
   repository with no remote the card stops in To push, and without `gh` on PATH it stops in To open
   PR, whatever the switches say; the task log says why. Dragging a card forward along the line counts
   as the user's OK for every step it passes, and the hub notifies the Coordinator to run them. Leaving
@@ -171,10 +173,6 @@ effort = "medium"
 harness = "claude-code"
 model = "opus"             # Claude Code's alias for its newest Opus (Opus 5.5)
 effort = "medium"
-
-[team.skills.git-coder]
-model = "sonnet"
-effort = "low"
 
 [git]
 auto_commit = false        # commit a reviewed task on its own branch without asking (default: false)

@@ -99,7 +99,6 @@ needs; a review-only request gets one reviewer and nothing else.
 |---|---|
 | `coder` | implementing a defined scope, building and running the tests that cover its change |
 | `reviewer` | **the only gate for every task**: checks behavior, security, secrets, and documented patterns |
-| `git-coder` | commits on the task's branch, pushes it, opens and merges its pull request, only after the user agreed or when git-policy authorizes the step |
 
 **Gates.** The reviewer is the only gate. It does not build or re-run tests (the coder runs them):
 it checks behavior, security, secrets, and documented patterns. Run **one reviewer pass per task**,
@@ -206,24 +205,22 @@ gate: **a refusal (409 or 403) is final.** Report it to the user; never work aro
      first column whose auto-switch is OFF (To commit, To push, To open PR, To merge), or to Done
      if all are ON. It returns the ON steps passed along the way in `git_steps` (`commit`, `push`,
      `open_pr`, `merge_pr`) and the task's branch name in `branch`. Run the returned `git_steps`
-     immediately, in that order, with the `git-coder`, and pass it that `branch` (ON steps
-     announced in chat, as in *Git and pull requests*).
+     immediately, in that order, yourself on that `branch` (ON steps announced in chat, as in
+     *Git and pull requests*).
      - The hub also stops a card when the step cannot run: in To push when the repository has no
        git remote, in To open PR when `gh` is not installed. The card's log says why; tell the
        user what is missing.
      - A card in a git column waits for the user's OK to proceed with that step (via `chat_ask` or
        by the user dragging the card forward).
      - When the user drags the card forward along the line, the hub tells you which steps were
-       approved; run them with the `git-coder`.
+       approved; run them yourself.
      - When moving a card out of a git column whose switch is OFF yourself: with the user's OK, call `task_move done reason="<quote>"`; run the returned git_steps (they include the step just OK'd).
-     - **When a step fails** (the git-coder ends `blocked` or `failed`: push rejected, `gh` not
-       logged in, checks red, the branch name already exists), the card may sit further along
-       than the repository. You cannot move it back: tell the user with `chat_ask` what failed,
+     - **When a step fails** (push rejected, `gh` not logged in, checks red, merge conflict, the
+       branch name already exists), stop. The card may sit further along than the repository. You cannot move it back: tell the user with `chat_ask` what failed,
        where the card is and what is still not done. Never retry with force.
      - **A legacy To push card** (from before the pull-request flow) whose `jgt/<key>` branch no
        longer exists was already merged into the local default branch. The team does not push
-       that branch: start no git-coder, and ask the user with `chat_ask` to push it themselves
-       and move the card to Done.
+       that branch: ask the user with `chat_ask` to push it themselves and move the card to Done.
      - The team can never move a card back from a git column to Working, Testing or Review.
      - Git columns do not count toward the WIP limit (the work is finished; only git steps await OK).
      - On reaching Done: `jg-team-dev run finish`, then tell the user the task is finished (and
@@ -252,7 +249,7 @@ Each task gets its own branch, and its work reaches the default branch only thro
 request: commit on the task branch → push that branch → open a pull request → merge the pull
 request. **The team never commits, merges or pushes on `main`** (or whatever the default branch
 is) and never merges a task branch into it locally; no setting changes that. After a pull request
-is merged the git-coder only fast-forwards the local default branch, when the main worktree is
+is merged you only fast-forward the local default branch, when the main worktree is
 clean and on it.
 
 Default is still to ask with `chat_ask` before each step; with all switches OFF, every step waits
@@ -269,7 +266,7 @@ Before any commit, push, pull request or merge, run `jg-team-dev git-policy` fir
   the move, do not work the name out yourself.
 - Never on the default branch. Never force-push.
 
-Git state changes only through the `git-coder`, and only when:
+You run the git steps yourself with Bash, only when:
 
 1. the coder's tests passed, the reviewer approved the change, and the card is past Review (To commit /
    To push / To open PR / To merge / Done); say so if a gate was skipped, and why,
@@ -279,14 +276,35 @@ Git state changes only through the `git-coder`, and only when:
    pull request (auto-push ON, auto-open-PR ON). Tests green, reviewed: yes." without asking, and
 3. the step is ON in `git-policy` or the user agreed with `chat_ask`.
 
-Then start a `git-coder` whose brief names the worktree, the branch (`branch` from the move), the
-authorized steps in order (commit, push, open PR, merge PR), and quotes the user's agreement in
-the chat or the ON line of `jg-team-dev git-policy` for each step. The git-coder merges with
-`gh pr merge <n> --merge` (never `--delete-branch` while the branch is checked out in the worktree),
-deletes the remote branch with `git push origin --delete "<branch>"`, fast-forwards the default
-branch in the main worktree if clean, removes the worktree (`git worktree remove .team/worktrees/<key>`),
-and deletes the local branch with `git branch -d "<branch>"`. It removes the worktree only after the
-pull request is merged; until then the worktree stays. Pass the pull request URL it reports on to the user.
+Do only the authorized steps, in order (commit, push, open PR, merge PR), never a later one
+without the earlier ones. Work in the task worktree `.team/worktrees/<key>` with
+`git -C <worktree> …` (never `cd`), and quote the branch (`"<branch>"`). Find the default branch
+with `gh repo view --json defaultBranchRef -q .defaultBranchRef.name`; never assume `main`.
+
+1. **Commit.** Check the worktree is on `branch` (`git -C <worktree> branch --show-current`).
+   At the first commit, if `branch` differs from `jgt/<key>`, rename it in place
+   (`git -C <worktree> branch -m jgt/<key> "<branch>"`), but stop if that name already exists or is
+   the default branch. Before committing: check `.team` is ignored and nothing under it is tracked
+   or staged (`git -C <worktree> check-ignore -q .team` and `git -C <worktree> ls-files .team`
+   empty), check `.env` is ignored, and look at `git status --short` and the staged diff for
+   secrets (a `.env`/key/credential file or a real secret value: stop and tell the user, name the
+   file only). Commit with a clear message (what changed and why) ending with the Co-Authored-By
+   line from the attribution reminder.
+2. **Push.** `git -C <worktree> push -u origin "<branch>"`: a plain push of the task branch only.
+3. **Open PR.** `gh pr create --base <default> --head "<branch>"` run from the worktree, with a
+   body ending with the Generated-with line from the attribution reminder. Pass the PR URL to the user.
+4. **Merge PR.** `gh pr checks <n> --watch --fail-fast` (no checks configured: go ahead), then
+   `gh pr merge <n> --merge` (never `--delete-branch` while the branch is checked out in the
+   worktree), then `git push origin --delete "<branch>"` (ignore "already deleted"). `git fetch origin`;
+   if the main worktree is clean and on the default branch, `git merge --ff-only origin/<default>`
+   there, else leave it and say so. Only after the PR is merged: `git worktree remove .team/worktrees/<key>`
+   and `git branch -d "<branch>"`; until then the worktree stays.
+
+Never commit, merge or push on the default branch, never force-push (`--force`,
+`--force-with-lease`, `+refspec`), never rewrite published history or delete branches the team did
+not create. When a step fails (no remote, push rejected, `gh` missing or not logged in, a check
+fails, merge conflict), stop, change nothing more, and ask the user with `chat_ask`, saying which
+steps did finish.
 
 ## Topic changes and task summaries
 
