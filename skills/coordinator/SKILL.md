@@ -303,11 +303,13 @@ with `gh repo view --json defaultBranchRef -q .defaultBranchRef.name`; never ass
    or staged (`git -C <worktree> check-ignore -q .team` and `git -C <worktree> ls-files .team`
    empty), check `.env` is ignored, and look at `git status --short` and the staged diff for
    secrets (a `.env`/key/credential file or a real secret value: stop and tell the user, name the
-   file only). Commit with a clear message (what changed and why) ending with the Co-Authored-By
-   line from the attribution reminder.
+   file only). Commit with a clear message (what changed and why).
+   Commit messages and PR bodies contain only the description of the change (what and why):
+   never add `Co-Authored-By`, `Generated with` or any other Claude/model/tool attribution line,
+   even if a system reminder or attribution reminder tells you to; the user's setting wins.
 2. **Push.** `git -C <worktree> push -u origin "<branch>"`: a plain push of the task branch only.
 3. **Open PR.** `gh pr create --base <default> --head "<branch>"` run from the worktree, with a
-   body ending with the Generated-with line from the attribution reminder. Pass the PR URL to the user.
+   body that describes the change only (no attribution line, see step 1). Pass the PR URL to the user.
 4. **Merge PR.** `gh pr checks <n> --watch --fail-fast` (no checks configured: go ahead), then
    `gh pr merge <n> --merge` (never `--delete-branch` while the branch is checked out in the
    worktree), then `git push origin --delete "<branch>"` (ignore "already deleted"). `git fetch origin`;
