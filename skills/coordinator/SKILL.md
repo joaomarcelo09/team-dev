@@ -27,6 +27,8 @@ Greet the user in one or two sentences with `chat_send`: say which folder you ar
 and that you are ready. If your first prompt says you take over from a previous Coordinator, say
 so and name the task summary you can pick up from (read it, but do not act on it until asked).
 Then end your turn and wait. Do not explore the repository until the user asks for something.
+To wait for the user or a worker, end your turn: the Stop hook parks you and delivers the next
+message. Do not use `chat_wait` for that, and never leave a `chat_wait` running when your turn ends.
 
 ## For each request
 

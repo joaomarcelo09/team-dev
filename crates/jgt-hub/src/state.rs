@@ -41,6 +41,10 @@ pub struct Hub {
     queue_reminders: Mutex<HashMap<String, (String, Instant)>>,
     /// Stalled card ping guard: (task_id:updated_at) -> last ping timestamp (ms).
     stalled_reminders: Mutex<HashMap<String, i64>>,
+    /// Messages a `chat_wait` handed out that the agent has not confirmed yet, per session: the
+    /// harness may have moved the call to the background or dropped it, so the next `take` hands
+    /// them out again until an ack (the PostToolUse hook of that `chat_wait`) clears them.
+    unacked: Mutex<HashMap<String, Vec<i64>>>,
 }
 
 pub type SharedHub = Arc<Hub>;
@@ -84,6 +88,7 @@ impl Hub {
             reconnecting: Mutex::new(HashMap::new()),
             queue_reminders: Mutex::new(HashMap::new()),
             stalled_reminders: Mutex::new(HashMap::new()),
+            unacked: Mutex::new(HashMap::new()),
         })
     }
 
@@ -433,25 +438,45 @@ impl Hub {
         Ok(message)
     }
 
-    /// Hands queued messages to the agent.
+    /// Hands queued messages to the agent, after any a `chat_wait` handed out unconfirmed.
     pub fn take(&self, id: &str) -> HubResult<Vec<Message>> {
         let session = self.session(id)?;
         if session.status == SessionStatus::Ended {
             return Ok(vec![]);
         }
-        let messages = self.db.take_queued(id)?;
-        if !messages.is_empty() {
+        let unacked = self.unacked.lock().unwrap_or_else(|e| e.into_inner()).remove(id).unwrap_or_default();
+        let mut messages = unacked.into_iter().filter_map(|m| self.db.message(m).transpose()).collect::<Result<Vec<_>>>()?;
+        let queued = self.db.take_queued(id)?;
+        if !queued.is_empty() {
             self.db.set_awaiting_reply(id, true)?;
-            for m in &messages {
+            for m in &queued {
                 self.emit_message(m);
             }
             self.emit_session(id);
         }
+        messages.extend(queued);
         Ok(messages)
+    }
+
+    /// The agent received what its last `chat_wait` returned: stop handing those messages out.
+    pub fn ack(&self, id: &str) -> HubResult<()> {
+        self.session(id)?;
+        self.unacked.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        Ok(())
     }
 
     /// Parks the agent until the user writes (listen mode), then hands the messages over.
     pub async fn wait_messages(self: &Arc<Self>, id: &str, timeout: Duration) -> HubResult<Vec<Message>> {
+        self.wait_messages_with(id, timeout, false).await
+    }
+
+    /// Like `wait_messages`, but the messages stay unconfirmed until `ack`: a later `take` (hook or
+    /// `chat_inbox`) hands them out again, so none is lost when the caller can no longer show it.
+    pub async fn wait_messages_unacked(self: &Arc<Self>, id: &str, timeout: Duration) -> HubResult<Vec<Message>> {
+        self.wait_messages_with(id, timeout, true).await
+    }
+
+    async fn wait_messages_with(self: &Arc<Self>, id: &str, timeout: Duration, unacked: bool) -> HubResult<Vec<Message>> {
         let session = self.session(id)?;
         if session.status == SessionStatus::Ended {
             return Err(HubError::Gone("session has ended".into()));
@@ -465,6 +490,10 @@ impl Hub {
         let found = self
             .wait_for(timeout, || {
                 let messages = self.take(id)?;
+                if unacked && !messages.is_empty() {
+                    let ids = messages.iter().map(|m| m.id).collect();
+                    self.unacked.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), ids);
+                }
                 Ok((!messages.is_empty()).then_some(messages))
             })
             .await;

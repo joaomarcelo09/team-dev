@@ -179,6 +179,49 @@ async fn wait_times_out_back_to_idle() {
 }
 
 #[tokio::test]
+async fn message_taken_by_an_abandoned_chat_wait_reaches_the_next_take() {
+    // JGT-52: the harness moved chat_wait to the background, so the agent never saw its result.
+    let hub = hub();
+    let s = register(&hub, Harness::ClaudeCode, "s1", None);
+    let waiter = {
+        let hub = hub.clone();
+        let id = s.id.clone();
+        tokio::spawn(async move { hub.wait_messages_unacked(&id, Duration::from_secs(10)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    hub.send_from_user(&s.id, "build the pkg please").unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap().unwrap();
+    assert_eq!(got[0].body, "build the pkg please");
+    // No ack came: the Stop hook / chat_inbox still gets it, once.
+    let taken = hub.take(&s.id).unwrap();
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].body, "build the pkg please");
+    assert!(hub.take(&s.id).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn acked_chat_wait_gets_the_message_exactly_once() {
+    let hub = hub();
+    let s = register(&hub, Harness::ClaudeCode, "s1", None);
+    let waiter = {
+        let hub = hub.clone();
+        let id = s.id.clone();
+        tokio::spawn(async move { hub.wait_messages_unacked(&id, Duration::from_secs(10)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    hub.send_from_user(&s.id, "ping").unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(2), waiter).await.unwrap().unwrap().unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].body, "ping");
+    hub.ack(&s.id).unwrap();
+    assert!(hub.take(&s.id).unwrap().is_empty());
+    // A plain wait (the Stop hook) still confirms on hand-out.
+    hub.send_from_user(&s.id, "pong").unwrap();
+    assert_eq!(hub.wait_messages(&s.id, Duration::from_secs(1)).await.unwrap()[0].body, "pong");
+    assert!(hub.take(&s.id).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn questions_are_answered_once() {
     let hub = hub();
     let s = register(&hub, Harness::ClaudeCode, "s1", None);

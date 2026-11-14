@@ -195,6 +195,10 @@ impl Hook {
                 if session.status != SessionStatus::Active {
                     self.set_state(&session, SessionStatus::Active, None).await?;
                 }
+                // The agent has seen what its chat_wait returned (JGT-52).
+                if self.str("tool_name").is_some_and(|t| t.ends_with("__chat_wait")) {
+                    let _: Result<(), _> = self.client.post(&format!("/v1/sessions/{}/ack", session.id), &()).await;
+                }
                 if session.queued == 0 {
                     return Ok(None);
                 }

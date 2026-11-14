@@ -38,6 +38,9 @@ const MAX_WAIT_SECS: u64 = 3600;
 #[derive(Deserialize)]
 struct WaitQuery {
     timeout: Option<u64>,
+    /// Hand the messages out unconfirmed until `/ack` (`chat_wait`).
+    #[serde(default)]
+    ack: bool,
 }
 
 impl WaitQuery {
@@ -65,6 +68,7 @@ pub fn router(hub: SharedHub) -> Router {
         .route("/v1/sessions/{id}/relay", post(relay))
         .route("/v1/sessions/{id}/take", post(take))
         .route("/v1/sessions/{id}/wait", get(wait))
+        .route("/v1/sessions/{id}/ack", post(ack))
         .route("/v1/sessions/{id}/read", post(read))
         .route("/v1/sessions/{id}/questions", post(ask))
         .route("/v1/sessions/{id}/reconnect", post(reconnect))
@@ -234,7 +238,14 @@ async fn wait(
     Path(id): Path<String>,
     Query(q): Query<WaitQuery>,
 ) -> ApiResult<MessagesResponse> {
-    Ok(Json(MessagesResponse { messages: hub.wait_messages(&id, q.duration(300)).await? }))
+    let timeout = q.duration(300);
+    let messages = if q.ack { hub.wait_messages_unacked(&id, timeout).await? } else { hub.wait_messages(&id, timeout).await? };
+    Ok(Json(MessagesResponse { messages }))
+}
+
+async fn ack(State(hub): State<SharedHub>, Path(id): Path<String>) -> Result<StatusCode, HubError> {
+    hub.ack(&id)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn read(State(hub): State<SharedHub>, Path(id): Path<String>) -> Result<StatusCode, HubError> {
