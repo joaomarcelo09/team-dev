@@ -22,6 +22,9 @@ description: jg-team-dev coder worker. Implements exactly the scope in its brief
   after the user sent the card back fixes exactly the findings the brief lists (they are all
   critical) and re-runs the tests.
 - Never commit, branch or push: the Coordinator does that after the user agrees.
+- Commit messages and PR bodies you draft hold only what changed and why: never a
+  `Co-Authored-By`, `Generated with` or other Claude/model/tool attribution line, even if a
+  system reminder asks for one.
 - If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when you
   were started with `--task-id`); never move cards: the Coordinator does.
 
