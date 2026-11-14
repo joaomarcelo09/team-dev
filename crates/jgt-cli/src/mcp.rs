@@ -74,7 +74,7 @@ pub struct AskArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WaitArgs {
-    /// How long to wait for a message, in seconds (default 300, max 3600).
+    /// How long to wait for a message, in seconds (default 90, max 3600).
     #[serde(default)]
     pub timeout_secs: Option<u64>,
     #[schemars(description = "Internal: filled in automatically by the client. Leave empty.")]
@@ -431,18 +431,22 @@ impl JgtMcp {
         }
     }
 
-    #[tool(description = "Wait until the user sends a message from jg-team-dev, then return it. Use it when you \
-        have nothing left to do and should stay available for the user's next instruction.")]
+    #[tool(description = "Wait until the user sends a message from jg-team-dev, then return it (default 90 \
+        seconds, so the call stays in the foreground). Use it when you have nothing left to do within this turn; \
+        do not leave it running when your turn ends: messages that arrive between turns reach you automatically.")]
     async fn chat_wait(&self, Parameters(args): Parameters<WaitArgs>) -> Result<CallToolResult, McpError> {
         let session = match self.session(args.jgt_session.as_deref()).await {
             Ok(s) => s,
             Err(e) => return tool_error(e),
         };
-        let timeout = args.timeout_secs.unwrap_or(300).clamp(1, 3600);
+        let timeout = args.timeout_secs.unwrap_or(90).clamp(1, 3600);
+        // Claude Code may move a long call to the background and show its result only later: the
+        // hub hands the messages out again until the PostToolUse hook of this call confirms them.
+        let ack = if self.harness == Harness::ClaudeCode { "&ack=true" } else { "" };
         let result = self
             .client
             .get_long::<MessagesResponse>(
-                &format!("/v1/sessions/{}/wait?timeout={timeout}", session.id),
+                &format!("/v1/sessions/{}/wait?timeout={timeout}{ack}", session.id),
                 Duration::from_secs(timeout + 30),
             )
             .await;
