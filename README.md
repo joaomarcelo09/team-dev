@@ -17,7 +17,7 @@ The app, its hub and its data run on your machine; the agents use Claude Code or
 you ⇄ jg-team-dev app ⇄ jg-team-dev-hub (SQLite, unix socket) ⇄ MCP + hooks ⇄ Coordinator ─ claude -p ─▶ workers
 ```
 
-The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an MCP server, session hooks, and an iced desktop application (`jg-team-dev-desktop`). The system operates with its own unix socket, SQLite database, and configuration, and passes its hooks to sessions with `--settings` instead of modifying `~/.claude/settings.json`.
+The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an MCP server, session hooks, and an iced desktop application (`jg-team-dev-desktop`). The system operates with its own unix socket, SQLite database, and configuration, and passes its hooks to sessions with `--settings` instead of modifying `~/.claude/settings.json`. These generated settings also turn commit and PR attribution off for every team session.
 
 ## Features
 
