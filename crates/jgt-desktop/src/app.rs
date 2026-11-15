@@ -320,6 +320,8 @@ pub struct App {
     pub boards: HashMap<String, crate::board::Board>,
     /// The task whose side panel is open.
     pub open_task: Option<String>,
+    /// The open task is shown full screen over the app (only while `open_task` is set).
+    pub task_view: bool,
     /// Activity logs loaded so far, by task id.
     pub task_events: HashMap<String, Vec<TaskEvent>>,
     /// The "+" form: its column and the title typed so far.
@@ -403,6 +405,10 @@ pub enum Msg {
     TaskEventsLoaded { task: String, result: Result<Vec<TaskEvent>, String> },
     OpenTask(String),
     CloseTask,
+    /// Shows the open task full screen; the Board and its selection stay underneath.
+    OpenTaskView,
+    /// Back from the full-screen task to the Board, keeping the task selected.
+    CloseTaskView,
     NewTaskOpen(TaskStatus),
     NewTaskInput(String),
     NewTaskSave,
@@ -590,6 +596,7 @@ impl App {
             starting_team: false,
             boards: HashMap::new(),
             open_task: None,
+            task_view: false,
             task_events: HashMap::new(),
             new_task: None,
             edit_title: String::new(),
@@ -1015,6 +1022,7 @@ impl App {
         if let Some(id) = self.open_task.take() {
             self.task_events.remove(&id);
         }
+        self.task_view = false;
         self.confirm_delete_task = false;
         self.task_details.clear();
         self.comment.clear();
@@ -1410,6 +1418,14 @@ impl App {
             }
             Msg::CloseTask => {
                 self.close_task();
+                Task::none()
+            }
+            Msg::OpenTaskView => {
+                self.task_view = self.open_task().is_some();
+                Task::none()
+            }
+            Msg::CloseTaskView => {
+                self.task_view = false;
                 Task::none()
             }
             Msg::CommentInput(text) => {
@@ -1973,6 +1989,10 @@ impl App {
                     }
                     None if self.drag.is_some() && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {
                         self.drag = None;
+                        Task::none()
+                    }
+                    None if self.task_view && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        self.task_view = false;
                         Task::none()
                     }
                     None if self.open_task.is_some() && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {

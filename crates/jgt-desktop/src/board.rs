@@ -619,6 +619,27 @@ fn section<'a>(label: &'a str) -> Element<'a, Msg> {
 }
 
 fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Msg> {
+    container(scrollable(task_body(app, task, theme, false)).height(Fill))
+        .width(style::fs(14) * 27.0)
+        .height(Fill)
+        .style(style::task_panel)
+        .into()
+}
+
+/// The open task full screen over the app, in a wide reading column (Esc or Close goes back).
+pub fn task_view<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Msg> {
+    let body = scrollable(container(task_body(app, task, theme, true)).max_width(style::fs(14) * 60.0))
+        .width(Fill)
+        .height(Fill);
+    container(iced::widget::opaque(container(body).center_x(Fill).height(Fill)))
+        .width(Fill)
+        .height(Fill)
+        .style(style::task_panel)
+        .into()
+}
+
+/// The task's header, fields, results and log; `full` for the full-screen view.
+fn task_body<'a>(app: &'a App, task: &'a Task, theme: &Theme, full: bool) -> iced::widget::Column<'a, Msg> {
     let p = theme.extended_palette();
     let mut header = row![
         text(task.key.as_str()).size(style::fs(13)).font(bold()),
@@ -636,17 +657,29 @@ fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Ms
                 .padding([2, 8]),
         );
     }
-    header = header.push(
-        button(text("Close").size(style::fs(12)))
-            .on_press(Msg::CloseTask)
-            .style(style::ghost)
-            .padding([2, 8]),
-    );
+    header = if full {
+        header.push(
+            tip(
+                button(text("Close").size(style::fs(12))).on_press(Msg::CloseTaskView).style(style::ghost).padding([2, 8]),
+                "Back to the Board (Esc)",
+            ),
+        )
+    } else {
+        header
+            .push(tip(
+                button(text("Expand").size(style::fs(12))).on_press(Msg::OpenTaskView).style(style::ghost).padding([2, 8]),
+                "Read the task full screen",
+            ))
+            .push(button(text("Close").size(style::fs(12))).on_press(Msg::CloseTask).style(style::ghost).padding([2, 8]))
+    };
 
     let mut col = column![header]
     .spacing(12)
     // Room on the right for the scrollbar.
     .padding(Padding { top: 14.0, right: 24.0, bottom: 14.0, left: 16.0 });
+    if full {
+        col = col.push(text(task.title.as_str()).size(style::fs(20)).font(bold()));
+    }
 
     // Waiting for you: an open question, or the usage limit until its reset.
     if let Some(waiting) = &task.waiting {
@@ -680,7 +713,7 @@ fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Ms
                 .size(style::fs(13))
                 .padding([8, 10])
                 .min_height(90)
-                .max_height(260)
+                .max_height(if full { style::fs(14) * 30.0 } else { 260.0 })
                 .style(style::editor),
             row![
                 section("PRIORITY"),
@@ -794,12 +827,7 @@ fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Ms
         ]
         .into()
     });
-
-    container(scrollable(col).height(Fill))
-        .width(style::fs(14) * 27.0)
-        .height(Fill)
-        .style(style::task_panel)
-        .into()
+    col
 }
 
 /// The test and review of the current pass; findings grouped critical first.
@@ -1478,5 +1506,67 @@ mod tests {
         {
             let _other_task = task_panel(&app, &t99, &theme);
         }
+    }
+    #[test]
+    fn task_view_opens_and_closes_keeping_the_selection() {
+        let esc = || {
+            Msg::Key(iced::keyboard::Event::KeyPressed {
+                key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+                physical_key: iced::keyboard::key::Physical::Unidentified(iced::keyboard::key::NativeCode::Unidentified),
+                location: iced::keyboard::Location::Standard,
+                modifiers: iced::keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            })
+        };
+        let (mut app, _) = App::new(None);
+        app.boards.insert("/w".into(), Board::new(vec![task(1, TaskStatus::Backlog, 0), task(2, TaskStatus::Backlog, 1)]));
+
+        // Without an open task there is nothing to expand.
+        let _ = app.update(Msg::OpenTaskView);
+        assert!(!app.task_view);
+
+        // Expand, then Close: back to the Board with the same task selected.
+        let _ = app.update(Msg::OpenTask("t1".into()));
+        let _ = app.update(Msg::OpenTaskView);
+        assert!(app.task_view);
+        let _ = crate::view::view(&app);
+        let _ = task_view(&app, app.open_task().unwrap(), &Theme::Dark);
+        let _ = app.update(Msg::CloseTaskView);
+        assert!(!app.task_view);
+        assert_eq!(app.open_task.as_deref(), Some("t1"));
+
+        // Esc closes the full-screen view first, then the panel.
+        let _ = app.update(Msg::OpenTaskView);
+        let _ = app.update(esc());
+        assert!(!app.task_view);
+        assert_eq!(app.open_task.as_deref(), Some("t1"), "Esc closed the view, not the panel");
+        let _ = app.update(esc());
+        assert!(app.open_task.is_none());
+
+        // Settings over the view: Esc closes Settings and the view stays.
+        let _ = app.update(Msg::OpenTask("t1".into()));
+        let _ = app.update(Msg::OpenTaskView);
+        app.show_settings = true;
+        let _ = app.update(esc());
+        assert!(!app.show_settings);
+        assert!(app.task_view);
+
+        // A change to the task while shown updates the view.
+        let mut moved = task(1, TaskStatus::Working, 0);
+        moved.updated_at += 1;
+        moved.details = Some("# Plan".into());
+        let _ = app.update(Msg::TaskDeleted { id: "t2".into(), result: Ok(()) });
+        let _ = app.update(Msg::TaskChanged(Ok(moved)));
+        assert!(app.task_view);
+        assert_eq!(app.open_task().map(|t| t.status), Some(TaskStatus::Working));
+        assert!(!app.task_details.is_empty());
+
+        // The task gone while shown: the view closes, no panic on render.
+        let _ = app.update(Msg::TaskDeleted { id: "t1".into(), result: Ok(()) });
+        assert!(!app.task_view);
+        assert!(app.open_task.is_none());
+        let _ = crate::view::view(&app);
     }
 }

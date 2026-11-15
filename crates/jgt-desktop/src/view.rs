@@ -298,6 +298,13 @@ pub fn view(app: &App) -> Element<'_, Msg> {
         .height(Fill);
     let mut root = stack![container(layout).width(Fill).height(Fill)];
 
+    // Only while the task still exists: if it is gone, the Board shows again.
+    if app.task_view
+        && let Some(task) = app.open_task()
+    {
+        root = root.push(crate::board::task_view(app, task, &theme));
+    }
+
     if app.show_settings {
         root = root.push(settings(app));
     }
