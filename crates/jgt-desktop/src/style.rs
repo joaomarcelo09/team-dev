@@ -655,17 +655,6 @@ pub fn drop_line(theme: &Theme) -> container::Style {
     }
 }
 
-/// The task side panel, next to the columns.
-pub fn task_panel(theme: &Theme) -> container::Style {
-    let p = ext(theme);
-    container::Style {
-        background: Some(p.background.base.color.into()),
-        border: Border { color: p.background.strong.color.scale_alpha(0.5), width: 1.0, radius: 0.0.into() },
-        text_color: Some(p.background.base.text),
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

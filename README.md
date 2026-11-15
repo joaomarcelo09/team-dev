@@ -110,7 +110,7 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   `security`, `secret`, or `patterns`).
 
 - **Board interactions and export**: drag a card to another column or position (Esc cancels; ← →
-  and "Move to…" stay). Comment on a task from its panel or `jg-team-dev task comment`: the
+  and "Move to…" stay). Comment on a task from its modal (click the card) or `jg-team-dev task comment`: the
   comment reaches the Coordinator like a chat message and wakes it. A task reaching Done,
   entering a git column waiting for your OK, or getting *Waiting for you*, posts a notification in
   the Coordinator's chat, which also shows on the desktop. Done tasks are archived (kept, hidden;
@@ -136,7 +136,7 @@ The messaging layer consists of a background hub daemon (`jg-team-dev-hub`), an 
   brief. `jg-team-dev worker … --model <m> --effort <e>` raises one worker for a hard task without
   changing the config.
 
-- **IDE tab**: built-in read-only viewer in the desktop app sidebar (and from task panels) for
+- **IDE tab**: built-in read-only viewer in the desktop app sidebar (and from the task modal) for
   inspecting workspace files and git worktree changes across `main` and active tasks, featuring
   syntax highlighting, diff toggles, and safety guards (see [IDE tab](#ide-tab) below).
 
@@ -246,7 +246,7 @@ Settings save to `.team/agents.json` when a team starts. To change them live, ed
 
 ## IDE tab
 
-The desktop app includes an **IDE** module (in the sidebar below Board, or opened via the **Open in IDE** button on a task panel) for viewing project files and worktree changes:
+The desktop app includes an **IDE** module (in the sidebar below Board, or opened via the **Open in IDE** button in a task modal) for viewing project files and worktree changes:
 
 - **Read-only viewer**: displays highlighted file contents with line numbers. There is no editing, saving, or code execution.
 - **Syntax highlighting**: code colors follow the app theme: Dracula colors under the Dracula theme (pink keywords, yellow strings, green functions, purple numbers, grey-blue comments, cyan italic types), Tokyo Night colors under Tokyo Night, Base16 Mocha under the other dark themes and InspiredGitHub under light; the language is detected from the file extension (unknown extensions show plain text).

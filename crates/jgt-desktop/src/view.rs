@@ -299,10 +299,10 @@ pub fn view(app: &App) -> Element<'_, Msg> {
     let mut root = stack![container(layout).width(Fill).height(Fill)];
 
     // Only while the task still exists: if it is gone, the Board shows again.
-    if app.task_view
+    if app.task_modal
         && let Some(task) = app.open_task()
     {
-        root = root.push(crate::board::task_view(app, task, &theme));
+        root = root.push(crate::board::task_modal(app, task, &theme));
     }
 
     if app.show_settings {
@@ -492,13 +492,19 @@ fn settings(app: &App) -> Element<'_, Msg> {
     .max_width(style::fs(14) * 46.0)
     .max_height(style::fs(14) * 42.0)
     .style(style::card(Color::TRANSPARENT));
+    modal(card, Msg::ToggleSettings)
+}
+
+/// A dialog card centered over a dimmed backdrop; a click on the backdrop sends `on_close`,
+/// a click inside the card does not.
+pub fn modal<'a>(card: impl Into<Element<'a, Msg>>, on_close: Msg) -> Element<'a, Msg> {
     let backdrop = iced::widget::mouse_area(
         container(Space::new()).width(Fill).height(Fill).style(|_: &Theme| container::Style {
             background: Some(Color { a: 0.45, ..Color::BLACK }.into()),
             ..Default::default()
         }),
     )
-    .on_press(Msg::ToggleSettings);
+    .on_press(on_close);
     stack![backdrop, container(iced::widget::opaque(card)).center(Fill).padding(16)].into()
 }
 
