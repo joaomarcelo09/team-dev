@@ -53,6 +53,9 @@ pub fn claude_settings_for_role(exe: &Path, role: Option<&str>) -> Value {
     json!({
         "hooks": hooks,
         "permissions": { "allow": [format!("mcp__{MCP_NAME}")] },
+        // Sessions run with `--setting-sources project,local`, so the user's own attribution
+        // settings are never read; turn commit/PR attribution off for every team session.
+        "attribution": { "commit": "", "pr": "", "sessionUrl": false },
     })
 }
 
@@ -97,6 +100,14 @@ mod tests {
         for event in HookEvent::ALL {
             let command = s["hooks"][event.claude_name()][0]["hooks"][0]["command"].as_str().unwrap();
             assert_eq!(command, format!("/usr/bin/jg-team-dev hook --role coordinator {}", event.arg()));
+        }
+    }
+
+    #[test]
+    fn settings_turn_attribution_off() {
+        let exe = Path::new("/usr/bin/jg-team-dev");
+        for s in [claude_settings(exe), claude_settings_for_role(exe, Some("coordinator"))] {
+            assert_eq!(s["attribution"], json!({ "commit": "", "pr": "", "sessionUrl": false }));
         }
     }
 
