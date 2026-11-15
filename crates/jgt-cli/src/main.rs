@@ -2,6 +2,7 @@
 //! connectors for harnesses, and a few terminal helpers.
 
 mod agents;
+mod auto_reset;
 mod commands;
 mod hooks;
 mod mcp;
