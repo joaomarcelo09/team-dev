@@ -318,10 +318,10 @@ pub struct App {
     pub starting_team: bool,
     /// The tasks of each Board opened so far, by workspace.
     pub boards: HashMap<String, crate::board::Board>,
-    /// The task whose side panel is open.
+    /// The selected task: its card is highlighted on the Board.
     pub open_task: Option<String>,
-    /// The open task is shown full screen over the app (only while `open_task` is set).
-    pub task_view: bool,
+    /// The selected task is shown in a modal over the Board (only while `open_task` is set).
+    pub task_modal: bool,
     /// Activity logs loaded so far, by task id.
     pub task_events: HashMap<String, Vec<TaskEvent>>,
     /// The "+" form: its column and the title typed so far.
@@ -329,7 +329,7 @@ pub struct App {
     /// The open task's title and description as being edited.
     pub edit_title: String,
     pub edit_description: text_editor::Content,
-    /// `edit_description`'s text, kept so drawing the panel need not rebuild it.
+    /// `edit_description`'s text, kept so drawing the modal need not rebuild it.
     pub edit_description_text: String,
     /// The open task's Details, parsed.
     pub task_details: Vec<markdown::Item>,
@@ -403,12 +403,10 @@ pub enum Msg {
     ToggleRightBar,
     BoardLoaded { workspace: String, result: Result<Vec<BoardTask>, String> },
     TaskEventsLoaded { task: String, result: Result<Vec<TaskEvent>, String> },
+    /// Selects the task and shows it in a modal over the Board.
     OpenTask(String),
-    CloseTask,
-    /// Shows the open task full screen; the Board and its selection stay underneath.
-    OpenTaskView,
-    /// Back from the full-screen task to the Board, keeping the task selected.
-    CloseTaskView,
+    /// Closes the task modal; the task stays selected on the Board.
+    CloseTaskModal,
     NewTaskOpen(TaskStatus),
     NewTaskInput(String),
     NewTaskSave,
@@ -596,7 +594,7 @@ impl App {
             starting_team: false,
             boards: HashMap::new(),
             open_task: None,
-            task_view: false,
+            task_modal: false,
             task_events: HashMap::new(),
             new_task: None,
             edit_title: String::new(),
@@ -1013,7 +1011,7 @@ impl App {
         self.boards.values().find_map(|b| b.get(id))
     }
 
-    /// The task whose side panel is open.
+    /// The selected task, shown in the modal while `task_modal` is set.
     pub fn open_task(&self) -> Option<&BoardTask> {
         self.find_task(self.open_task.as_deref()?)
     }
@@ -1022,7 +1020,7 @@ impl App {
         if let Some(id) = self.open_task.take() {
             self.task_events.remove(&id);
         }
-        self.task_view = false;
+        self.task_modal = false;
         self.confirm_delete_task = false;
         self.task_details.clear();
         self.comment.clear();
@@ -1059,7 +1057,7 @@ impl App {
     }
 
     /// Updates the open panel to `task`. Text being edited stays unless it was unchanged from
-    /// `old` (`None`: the panel just opened, take everything).
+    /// `old` (`None`: the modal just opened, take everything).
     fn refresh_open(&mut self, old: Option<&BoardTask>, task: &BoardTask) {
         if old.is_none_or(|o| self.edit_title == o.title) {
             self.edit_title = task.title.clone();
@@ -1395,6 +1393,7 @@ impl App {
             Msg::OpenTask(id) => {
                 let Some(task) = self.find_task(&id).cloned() else { return Task::none() };
                 self.open_task = Some(id.clone());
+                self.task_modal = true;
                 self.confirm_delete_task = false;
                 self.refresh_open(None, &task);
                 let events_task = self.load_task_events(id);
@@ -1416,16 +1415,8 @@ impl App {
                     events_task
                 }
             }
-            Msg::CloseTask => {
-                self.close_task();
-                Task::none()
-            }
-            Msg::OpenTaskView => {
-                self.task_view = self.open_task().is_some();
-                Task::none()
-            }
-            Msg::CloseTaskView => {
-                self.task_view = false;
+            Msg::CloseTaskModal => {
+                self.task_modal = false;
                 Task::none()
             }
             Msg::CommentInput(text) => {
@@ -1991,8 +1982,8 @@ impl App {
                         self.drag = None;
                         Task::none()
                     }
-                    None if self.task_view && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                        self.task_view = false;
+                    None if self.task_modal && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                        self.task_modal = false;
                         Task::none()
                     }
                     None if self.open_task.is_some() && key == keyboard::Key::Named(keyboard::key::Named::Escape) => {

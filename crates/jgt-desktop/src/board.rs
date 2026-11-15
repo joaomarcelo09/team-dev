@@ -1,4 +1,4 @@
-//! The Board tab of a Coordinator's chat: nine columns of task cards and the task side panel.
+//! The Board tab of a Coordinator's chat: nine columns of task cards and the task modal.
 //! The pure helpers (column order, Done limit, labels) sit at the top and are unit-tested.
 
 use crate::{
@@ -406,13 +406,11 @@ pub fn board<'a>(app: &'a App, workspace: &str, theme: &Theme) -> Element<'a, Ms
     ));
     let board = column![bar, columns].height(Fill);
     // A release outside every card and column, or leaving the Board, drops nothing.
-    let board = if app.drag.is_some() {
-        Element::from(mouse_area(board).on_release(Msg::DragEnd).on_exit(Msg::DragEnd).interaction(mouse::Interaction::Grabbing))
+    if app.drag.is_some() {
+        mouse_area(board).on_release(Msg::DragEnd).on_exit(Msg::DragEnd).interaction(mouse::Interaction::Grabbing).into()
     } else {
         board.into()
-    };
-    // Always a row, so opening the panel keeps the columns' scroll position.
-    row![board].push(app.open_task().map(|task| task_panel(app, task, theme))).height(Fill).into()
+    }
 }
 
 /// While dragging, a drop target: hovering it aims the card there, releasing on it drops.
@@ -618,28 +616,19 @@ fn section<'a>(label: &'a str) -> Element<'a, Msg> {
     muted(label).size(style::fs(11)).font(bold()).into()
 }
 
-fn task_panel<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Msg> {
-    container(scrollable(task_body(app, task, theme, false)).height(Fill))
-        .width(style::fs(14) * 27.0)
-        .height(Fill)
-        .style(style::task_panel)
-        .into()
+/// The selected task in a modal over the Board: a wide reading card that scrolls inside.
+/// Close, Esc or a click on the backdrop closes it; the task stays selected.
+pub fn task_modal<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Msg> {
+    let card = container(scrollable(task_body(app, task, theme)).width(Fill))
+        .padding(8)
+        .max_width(style::fs(14) * 60.0)
+        .max_height(style::fs(14) * 52.0)
+        .style(style::card(iced::Color::TRANSPARENT));
+    crate::view::modal(card, Msg::CloseTaskModal)
 }
 
-/// The open task full screen over the app, in a wide reading column (Esc or Close goes back).
-pub fn task_view<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> Element<'a, Msg> {
-    let body = scrollable(container(task_body(app, task, theme, true)).max_width(style::fs(14) * 60.0))
-        .width(Fill)
-        .height(Fill);
-    container(iced::widget::opaque(container(body).center_x(Fill).height(Fill)))
-        .width(Fill)
-        .height(Fill)
-        .style(style::task_panel)
-        .into()
-}
-
-/// The task's header, fields, results and log; `full` for the full-screen view.
-fn task_body<'a>(app: &'a App, task: &'a Task, theme: &Theme, full: bool) -> iced::widget::Column<'a, Msg> {
+/// The task's header, fields, results and log.
+fn task_body<'a>(app: &'a App, task: &'a Task, theme: &Theme) -> iced::widget::Column<'a, Msg> {
     let p = theme.extended_palette();
     let mut header = row![
         text(task.key.as_str()).size(style::fs(13)).font(bold()),
@@ -657,29 +646,16 @@ fn task_body<'a>(app: &'a App, task: &'a Task, theme: &Theme, full: bool) -> ice
                 .padding([2, 8]),
         );
     }
-    header = if full {
-        header.push(
-            tip(
-                button(text("Close").size(style::fs(12))).on_press(Msg::CloseTaskView).style(style::ghost).padding([2, 8]),
-                "Back to the Board (Esc)",
-            ),
-        )
-    } else {
-        header
-            .push(tip(
-                button(text("Expand").size(style::fs(12))).on_press(Msg::OpenTaskView).style(style::ghost).padding([2, 8]),
-                "Read the task full screen",
-            ))
-            .push(button(text("Close").size(style::fs(12))).on_press(Msg::CloseTask).style(style::ghost).padding([2, 8]))
-    };
+    header = header.push(tip(
+        button(text("Close").size(style::fs(12))).on_press(Msg::CloseTaskModal).style(style::ghost).padding([2, 8]),
+        "Back to the Board (Esc)",
+    ));
 
     let mut col = column![header]
     .spacing(12)
     // Room on the right for the scrollbar.
     .padding(Padding { top: 14.0, right: 24.0, bottom: 14.0, left: 16.0 });
-    if full {
-        col = col.push(text(task.title.as_str()).size(style::fs(20)).font(bold()));
-    }
+    col = col.push(text(task.title.as_str()).size(style::fs(20)).font(bold()));
 
     // Waiting for you: an open question, or the usage limit until its reset.
     if let Some(waiting) = &task.waiting {
@@ -713,7 +689,7 @@ fn task_body<'a>(app: &'a App, task: &'a Task, theme: &Theme, full: bool) -> ice
                 .size(style::fs(13))
                 .padding([8, 10])
                 .min_height(90)
-                .max_height(if full { style::fs(14) * 30.0 } else { 260.0 })
+                .max_height(style::fs(14) * 20.0)
                 .style(style::editor),
             row![
                 section("PRIORITY"),
@@ -1293,7 +1269,7 @@ mod tests {
         };
         let _ = app.update(Msg::Key(esc));
         assert!(app.drag.is_none());
-        assert_eq!(app.open_task.as_deref(), Some("t1"), "Esc ended the drag, not the panel");
+        assert_eq!(app.open_task.as_deref(), Some("t1"), "Esc ended the drag, not the selection");
         // A drop on another place leaves the drag state cleared (the move goes to the hub).
         let _ = app.update(Msg::DragStart("t2".into()));
         let _ = app.update(Msg::DragOver(Target::Before(TaskStatus::Backlog, 0)));
@@ -1469,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn test_task_panel_open_in_ide_button() {
+    fn test_task_modal_open_in_ide_button() {
         let (mut app, _) = App::new(None);
         let t = task(34, TaskStatus::Working, 0);
         let theme = Theme::Dark;
@@ -1477,7 +1453,7 @@ mod tests {
         // Without matching worktree: source_for_task is None
         assert!(crate::ide::source_for_task(&app.ide.sources, &t.key).is_none());
         {
-            let _without_wt = task_panel(&app, &t, &theme);
+            let _without_wt = task_modal(&app, &t, &theme);
         }
 
         // With matching worktree: source_for_task is Some
@@ -1497,18 +1473,18 @@ mod tests {
         ];
         assert!(crate::ide::source_for_task(&app.ide.sources, &t.key).is_some());
         {
-            let _with_wt = task_panel(&app, &t, &theme);
+            let _with_wt = task_modal(&app, &t, &theme);
         }
 
         // Another task without worktree: None
         let t99 = task(99, TaskStatus::Working, 0);
         assert!(crate::ide::source_for_task(&app.ide.sources, &t99.key).is_none());
         {
-            let _other_task = task_panel(&app, &t99, &theme);
+            let _other_task = task_modal(&app, &t99, &theme);
         }
     }
     #[test]
-    fn task_view_opens_and_closes_keeping_the_selection() {
+    fn card_click_opens_the_task_modal_and_closing_keeps_the_selection() {
         let esc = || {
             Msg::Key(iced::keyboard::Event::KeyPressed {
                 key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
@@ -1521,51 +1497,88 @@ mod tests {
             })
         };
         let (mut app, _) = App::new(None);
+        app.module = crate::app::Module::Board;
         app.boards.insert("/w".into(), Board::new(vec![task(1, TaskStatus::Backlog, 0), task(2, TaskStatus::Backlog, 1)]));
 
-        // Without an open task there is nothing to expand.
-        let _ = app.update(Msg::OpenTaskView);
-        assert!(!app.task_view);
-
-        // Expand, then Close: back to the Board with the same task selected.
-        let _ = app.update(Msg::OpenTask("t1".into()));
-        let _ = app.update(Msg::OpenTaskView);
-        assert!(app.task_view);
-        let _ = crate::view::view(&app);
-        let _ = task_view(&app, app.open_task().unwrap(), &Theme::Dark);
-        let _ = app.update(Msg::CloseTaskView);
-        assert!(!app.task_view);
-        assert_eq!(app.open_task.as_deref(), Some("t1"));
-
-        // Esc closes the full-screen view first, then the panel.
-        let _ = app.update(Msg::OpenTaskView);
-        let _ = app.update(esc());
-        assert!(!app.task_view);
-        assert_eq!(app.open_task.as_deref(), Some("t1"), "Esc closed the view, not the panel");
-        let _ = app.update(esc());
+        // A task that does not exist opens nothing.
+        let _ = app.update(Msg::OpenTask("t404".into()));
+        assert!(!app.task_modal);
         assert!(app.open_task.is_none());
 
-        // Settings over the view: Esc closes Settings and the view stays.
+        // A click on the card opens the modal at once.
         let _ = app.update(Msg::OpenTask("t1".into()));
-        let _ = app.update(Msg::OpenTaskView);
+        assert!(app.task_modal);
+        assert_eq!(app.open_task.as_deref(), Some("t1"));
+        let _ = crate::view::view(&app);
+        let _ = task_modal(&app, app.open_task().unwrap(), &Theme::Dark);
+
+        // The Close button and a backdrop click send CloseTaskModal: the task stays selected.
+        let _ = app.update(Msg::CloseTaskModal);
+        assert!(!app.task_modal);
+        assert_eq!(app.open_task.as_deref(), Some("t1"), "closing the modal keeps the selection");
+        let _ = crate::view::view(&app);
+
+        // Esc closes the modal and keeps the selection.
+        let _ = app.update(Msg::OpenTask("t1".into()));
+        let _ = app.update(esc());
+        assert!(!app.task_modal);
+        assert_eq!(app.open_task.as_deref(), Some("t1"), "Esc closed the modal, not the selection");
+
+        // Settings over the modal: Esc closes Settings first, then the modal.
+        let _ = app.update(Msg::OpenTask("t1".into()));
         app.show_settings = true;
+        let _ = crate::view::view(&app);
         let _ = app.update(esc());
         assert!(!app.show_settings);
-        assert!(app.task_view);
+        assert!(app.task_modal, "Esc closed Settings, not the modal");
+        let _ = app.update(esc());
+        assert!(!app.task_modal);
+        assert_eq!(app.open_task.as_deref(), Some("t1"));
 
-        // A change to the task while shown updates the view.
+        // A change to the task while open updates the modal.
+        let _ = app.update(Msg::OpenTask("t1".into()));
         let mut moved = task(1, TaskStatus::Working, 0);
         moved.updated_at += 1;
         moved.details = Some("# Plan".into());
         let _ = app.update(Msg::TaskDeleted { id: "t2".into(), result: Ok(()) });
-        let _ = app.update(Msg::TaskChanged(Ok(moved)));
-        assert!(app.task_view);
+        let _ = app.update(Msg::TaskChanged(Ok(moved.clone())));
+        assert!(app.task_modal);
         assert_eq!(app.open_task().map(|t| t.status), Some(TaskStatus::Working));
         assert!(!app.task_details.is_empty());
 
-        // The task gone while shown: the view closes, no panic on render.
+        // Archived while open: the modal closes, no panic on render.
+        let mut archived = moved;
+        archived.updated_at += 1;
+        archived.archived = true;
+        let _ = app.update(Msg::TaskChanged(Ok(archived)));
+        assert!(!app.task_modal);
+        assert!(app.open_task.is_none());
+        let _ = crate::view::view(&app);
+    }
+
+    #[test]
+    fn task_modal_closes_when_the_task_is_deleted_or_the_board_is_left() {
+        let (mut app, _) = App::new(None);
+        app.module = crate::app::Module::Board;
+        app.boards.insert("/w".into(), Board::new(vec![task(1, TaskStatus::Backlog, 0), task(2, TaskStatus::Backlog, 1)]));
+
+        // Deleted while open: the modal closes, no panic on render.
+        let _ = app.update(Msg::OpenTask("t1".into()));
         let _ = app.update(Msg::TaskDeleted { id: "t1".into(), result: Ok(()) });
-        assert!(!app.task_view);
+        assert!(!app.task_modal);
+        assert!(app.open_task.is_none());
+        let _ = crate::view::view(&app);
+
+        // Even if the flag were left on, a missing task renders no modal and does not panic.
+        app.task_modal = true;
+        app.open_task = Some("t1".into());
+        let _ = crate::view::view(&app);
+
+        // Leaving the Board closes the modal.
+        let _ = app.update(Msg::OpenTask("t2".into()));
+        assert!(app.task_modal);
+        let _ = app.update(Msg::SelectModule(crate::app::Module::Coordinator));
+        assert!(!app.task_modal);
         assert!(app.open_task.is_none());
         let _ = crate::view::view(&app);
     }
