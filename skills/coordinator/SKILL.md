@@ -339,7 +339,24 @@ styling to a backend queue), ask with `chat_ask`: "New topic — save a summary 
 - If they decline, carry on in this session.
 - When the user brings up an earlier task, look in `.team/tasks/` first.
 - After you have finished 5 or 6 tasks (cards moved to Done) in this same chat, offer once, in
-  one short `chat_ask` line, to save a summary and reset. The user decides; never reset on your
-  own. Offer again only after 5 more finished tasks. If they agree, use the same file and
-  `jg-team-dev reset --summary` flow as above; the summary keeps the Board state, open decisions
-  and the next queued work.
+  one short `chat_ask` line, to save a summary and reset. The user decides; apart from the
+  automatic reset below, never reset on your own. Offer again only after 5 more finished tasks.
+  If they agree, use the same file and `jg-team-dev reset --summary` flow as above; the summary
+  keeps the Board state, open decisions and the next queued work.
+
+### Automatic reset when your context is large
+
+When your context passes `reset_window` (80000 tokens by default), your Stop hook adds a
+`[jg-team-dev] Automatic reset` line. This reset is allowed without asking the user; topic-change
+resets above still ask.
+
+- Never reset mid-card or mid-git-step. If the line lists something to finish first (a card in
+  Working, Testing, Review or a git column, a running worker, a card waiting for the user), finish
+  it as usual, including its git steps, and answer any question to the user that is still open in
+  this chat. Do not start a new card meanwhile; the fresh Coordinator picks up the queue.
+- At the safe point (the hook tells you once more when it is reached), write the summary into
+  `.team/tasks/task-<YYYYMMDD-HHMM>-<slug>.md` as above (goal, decisions, Board state, open
+  decisions, next queued work), tell the user in one line that a fresh Coordinator takes over, run
+  `/usr/bin/jg-team-dev reset --summary <that file>` (the path given in your session context) and
+  end your turn without writing anything else.
+- Compaction (`compact_window`, higher) is only a safety net for when no safe point comes in time.

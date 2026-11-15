@@ -224,6 +224,10 @@ set `permission_mode = "bypassPermissions"` for that role, which runs `agy
 The Coordinator compacts its context at `compact_window = 120000` tokens unless set under
 `[team.skills.coordinator]` (`0` leaves it to Claude Code): it lives for days, and every step
 re-reads its whole context. Any Claude Code role takes `compact_window` (100000 to 1000000).
+Before that, at `reset_window = 80000` tokens (`[team.skills.coordinator]`, `0` turns it off), its
+Stop hook tells it to reset to a fresh Coordinator at the next safe point (no card in progress or
+in a git column, no worker running): it writes a summary into `.team/tasks/` and runs
+`jg-team-dev reset --summary`; compaction stays the safety net above it.
 
 A project can override these in `.team/config.toml`, with the same `[team]` and
 `[team.skills.<skill>]` tables. Harness, model and effort come as one unit from the first of:

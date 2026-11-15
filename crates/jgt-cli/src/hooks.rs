@@ -4,12 +4,13 @@
 
 use jgt_core::{
     Harness, HubClient, Message, MessageKind, QuestionStatus, Session, SessionStatus,
-    api::{EndRequest, MessagesResponse, QuestionRequest, RegisterRequest, StateRequest},
+    api::{EndRequest, MessagesResponse, QuestionRequest, RegisterRequest, SessionsResponse, StateRequest, TasksResponse},
     client::encode_query,
     config::Config,
     format_for_agent, launch, procs, short_id,
     team::{self, PARENT_ENV, ROLE_ENV},
 };
+use crate::auto_reset;
 use serde_json::{Value, json};
 use std::{io::Read, time::Duration};
 
@@ -254,6 +255,18 @@ impl Hook {
             team::relay(&self.client, parent, Some(&session.id), &text).await.map_err(anyhow::Error::msg)?;
         }
 
+        // Past its reset limit the Coordinator is told to reset at the next safe point (JGT-65).
+        // The notice ends this turn with a block, so it goes out with any waiting messages and
+        // skips the listen wait; `auto_reset::should_notify` keeps it from repeating.
+        if session.is_coordinator()
+            && let Some(notice) = self.reset_notice(&session).await
+        {
+            let messages = self.take(&session).await.unwrap_or_default();
+            self.set_state(&session, SessionStatus::Active, None).await?;
+            let reason = if messages.is_empty() { notice } else { format!("{notice}\n\n{}", format_for_agent(&messages)) };
+            return Ok(Some(json!({ "decision": "block", "reason": reason })));
+        }
+
         let mut messages = self.take(&session).await?;
         if messages.is_empty() && session.listen {
             let config = Config::load();
@@ -291,6 +304,29 @@ impl Hook {
         }
         self.set_state(&session, SessionStatus::Active, None).await?;
         Ok(Some(json!({ "decision": "block", "reason": format_for_agent(&messages) })))
+    }
+
+    /// The automatic reset notice for this Coordinator, when its context is past `reset_window`
+    /// and it has not been told yet (see `auto_reset::should_notify`). Any failure (no transcript,
+    /// no usage, hub unreachable, marker not writable) means no notice.
+    async fn reset_notice(&self, session: &Session) -> Option<String> {
+        let workspace = team::project_folder(session.cwd.as_deref()?).to_string();
+        let limit = Config::load().team.for_skill(jgt_core::COORDINATOR, std::path::Path::new(&workspace)).reset_window;
+        let transcript = self.str("transcript_path")?;
+        let tokens = auto_reset::over_limit(auto_reset::context_tokens(std::path::Path::new(transcript)), limit)?;
+        let tasks: TasksResponse = self.client.get(&format!("/v1/tasks?workspace={}", encode_query(&workspace))).await.ok()?;
+        let sessions: SessionsResponse = self.client.get("/v1/sessions?archived=true").await.ok()?;
+        let blockers = auto_reset::safe_point_blockers(&session.id, &tasks.tasks, &sessions.sessions);
+        let now = if blockers.is_empty() { auto_reset::Notice::Safe } else { auto_reset::Notice::Blocked };
+        let marker = auto_reset::marker_path(&session.id);
+        if !auto_reset::should_notify(auto_reset::read_marker(&marker), now) {
+            return None;
+        }
+        // Without the marker the notice would repeat on every turn: then give none.
+        auto_reset::write_marker(&marker, now).ok()?;
+        let exe = std::env::current_exe().ok().map(|e| e.canonicalize().unwrap_or(e));
+        let exe = exe.map_or_else(|| "jg-team-dev".to_string(), |e| e.display().to_string());
+        Some(auto_reset::notice_text(tokens, limit?, &blockers, &exe))
     }
 
     /// The user's messages since the worker's last mirrored reply (relays from other agents excluded).

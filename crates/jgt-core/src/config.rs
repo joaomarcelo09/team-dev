@@ -91,6 +91,12 @@ pub struct SkillSettings {
     /// [`COORDINATOR_COMPACT_WINDOW`]: it lives for days, and every step re-reads its whole context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_window: Option<u64>,
+    /// Coordinator only: context size in tokens past which its Stop hook tells it to reset to a
+    /// fresh Coordinator at the next safe point (JGT-65); 0 turns the automatic reset off. Defaults
+    /// to [`COORDINATOR_RESET_WINDOW`], below `compact_window`, so compaction stays a safety net
+    /// for a Coordinator that cannot reach a safe point in time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_window: Option<u64>,
     /// What a worker runs on instead when `harness` cannot run here (its program is missing):
     /// `[team.skills.coder.fallback]`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -113,6 +119,12 @@ pub struct FallbackSettings {
 /// Default `compact_window` of the Coordinator.
 pub const COORDINATOR_COMPACT_WINDOW: u64 = 120_000;
 
+/// Default `reset_window` of the Coordinator: the context size at which it is told to reset.
+/// It must stay below [`COORDINATOR_COMPACT_WINDOW`]: the reset comes first, at a safe point, and
+/// compaction only catches a Coordinator that keeps growing before it reaches one.
+pub const COORDINATOR_RESET_WINDOW: u64 = 80_000;
+const _: () = assert!(COORDINATOR_RESET_WINDOW < COORDINATOR_COMPACT_WINDOW);
+
 /// The range Claude Code accepts for `autoCompactWindow`.
 pub const COMPACT_WINDOW_RANGE: (u64, u64) = (100_000, 1_000_000);
 
@@ -127,6 +139,7 @@ impl SkillSettings {
             allowed_tools: self.allowed_tools.or_else(|| other.allowed_tools.clone()),
             disallowed_tools: self.disallowed_tools.or_else(|| other.disallowed_tools.clone()),
             compact_window: self.compact_window.or(other.compact_window),
+            reset_window: self.reset_window.or(other.reset_window),
             fallback: self.fallback.or_else(|| other.fallback.clone()),
         }
     }
@@ -186,6 +199,9 @@ pub struct SessionSettings {
     pub disallowed_tools: Vec<String>,
     /// `autoCompactWindow` for the session; `None` leaves it to Claude Code.
     pub compact_window: Option<u64>,
+    /// Coordinator only: the context size at which it is told to reset (`reset_window`); `None`
+    /// turns the automatic reset off. Always `None` for other roles.
+    pub reset_window: Option<u64>,
     /// What to run on when `harness` cannot run here.
     pub fallback: Option<Fallback>,
 }
@@ -351,6 +367,24 @@ impl Team {
                 effort: check_effort(skill, harness, f.effort.as_deref(), &mut warnings),
             }
         });
+        let compact_window = match merged.compact_window {
+            Some(0) => None,
+            Some(w) => Some(w.clamp(COMPACT_WINDOW_RANGE.0, COMPACT_WINDOW_RANGE.1)),
+            None => (skill == crate::model::COORDINATOR).then_some(COORDINATOR_COMPACT_WINDOW),
+        };
+        let reset_window = match merged.reset_window {
+            _ if skill != crate::model::COORDINATOR => None,
+            Some(0) => None,
+            Some(w) => Some(w),
+            None => Some(COORDINATOR_RESET_WINDOW),
+        };
+        if let (Some(reset), Some(compact)) = (reset_window, compact_window)
+            && reset >= compact
+        {
+            warnings.push(format!(
+                "{skill}: reset_window {reset} is not below compact_window {compact}; the session compacts before it is told to reset"
+            ));
+        }
         let settings = SessionSettings {
             harness,
             model,
@@ -358,11 +392,8 @@ impl Team {
             permission_mode: merged.permission_mode.unwrap_or_else(|| "auto".into()),
             allowed_tools: merged.allowed_tools.unwrap_or_default(),
             disallowed_tools: merged.disallowed_tools.unwrap_or_default(),
-            compact_window: match merged.compact_window {
-                Some(0) => None,
-                Some(w) => Some(w.clamp(COMPACT_WINDOW_RANGE.0, COMPACT_WINDOW_RANGE.1)),
-                None => (skill == crate::model::COORDINATOR).then_some(COORDINATOR_COMPACT_WINDOW),
-            },
+            compact_window,
+            reset_window,
             fallback,
         };
         (settings, warnings)
@@ -865,6 +896,37 @@ mod tests {
         .unwrap();
         assert_eq!(user.team.resolve("coordinator", &none).0.compact_window, None);
         assert_eq!(user.team.resolve("coder", &none).0.compact_window, Some(COMPACT_WINDOW_RANGE.0));
+    }
+
+    #[test]
+    fn the_coordinator_resets_below_its_compact_window_unless_turned_off() {
+        let none = ProjectTeam::default();
+        let team = Config::default().team;
+        let (coordinator, warnings) = team.resolve(COORDINATOR, &none);
+        assert_eq!(coordinator.reset_window, Some(COORDINATOR_RESET_WINDOW));
+        assert!(coordinator.reset_window < coordinator.compact_window);
+        assert!(warnings.is_empty());
+        assert_eq!(team.resolve("coder", &none).0.reset_window, None);
+
+        let off: Config = toml::from_str("[team.skills.coordinator]\nreset_window = 0\n").unwrap();
+        assert_eq!(off.team.resolve(COORDINATOR, &none).0.reset_window, None);
+
+        // Only the Coordinator resets; a worker's value is ignored.
+        let set: Config =
+            toml::from_str("[team.skills.coordinator]\nreset_window = 60000\n[team.skills.coder]\nreset_window = 5000\n")
+                .unwrap();
+        assert_eq!(set.team.resolve(COORDINATOR, &none).0.reset_window, Some(60_000));
+        assert_eq!(set.team.resolve("coder", &none).0.reset_window, None);
+
+        // A project's value wins over the user's.
+        let project: ProjectConfig = toml::from_str("[team.skills.coordinator]\nreset_window = 70000\n").unwrap();
+        assert_eq!(set.team.resolve(COORDINATOR, &project.team).0.reset_window, Some(70_000));
+
+        // A reset window at or above the compact window is kept, with a warning.
+        let late: Config = toml::from_str("[team.skills.coordinator]\nreset_window = 150000\n").unwrap();
+        let (coordinator, warnings) = late.team.resolve(COORDINATOR, &none);
+        assert_eq!(coordinator.reset_window, Some(150_000));
+        assert!(warnings.iter().any(|w| w.contains("reset_window 150000")), "{warnings:?}");
     }
 
     #[test]
