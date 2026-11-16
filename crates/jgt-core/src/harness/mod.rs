@@ -1,13 +1,15 @@
-//! What each harness (Claude Code, OpenCode, Antigravity) supports, and how a worker is started
+//! What each harness (Claude Code, Claude DS, OpenCode, Antigravity) supports, and how a worker is started
 //! on it (PRD Part B, H4). One `HarnessAdapter` per harness; `worker-run` and the reconnect
 //! launcher go through it. The Coordinator stays on Claude Code (D2), whose hooks it needs.
 
 pub mod antigravity;
 pub mod claude_code;
+pub mod claude_ds;
 pub mod opencode;
 
 pub use antigravity::Antigravity;
 pub use claude_code::{ClaudeCode, session_args, session_args_for_role};
+pub use claude_ds::ClaudeDs;
 pub use opencode::Opencode;
 
 use crate::{
@@ -104,13 +106,15 @@ pub fn adapter(harness: Harness) -> Option<&'static dyn HarnessAdapter> {
         Harness::ClaudeCode => Some(&ClaudeCode),
         Harness::Opencode => Some(&Opencode),
         Harness::Antigravity => Some(&Antigravity),
+        Harness::ClaudeDs => Some(&ClaudeDs),
         Harness::Custom => None,
     }
 }
 
-/// The worker harnesses whose program is installed here, for the app's Settings.
+/// The worker harnesses whose program is installed here, for the app's Settings. Claude DS
+/// counts only where its config dir exists (`ClaudeDs::find`).
 pub fn installed(config: &Config) -> Vec<Harness> {
-    [Harness::ClaudeCode, Harness::Opencode, Harness::Antigravity]
+    [Harness::ClaudeCode, Harness::Opencode, Harness::Antigravity, Harness::ClaudeDs]
         .into_iter()
         .filter(|h| adapter(*h).is_some_and(|a| a.find(config).is_ok()))
         .collect()
@@ -143,6 +147,8 @@ pub fn effort_levels(harness: Harness) -> &'static [&'static str] {
     match harness {
         // `claude --help`: --effort <level> (low, medium, high, xhigh, max).
         Harness::ClaudeCode => EFFORT_LEVELS,
+        // The same `claude` program and flag.
+        Harness::ClaudeDs => EFFORT_LEVELS,
         // `agy --help` (1.4.8): --effort (low|medium|high|xhigh|max).
         Harness::Antigravity => EFFORT_LEVELS,
         // `opencode run --variant` is "provider-specific reasoning effort". `opencode models
@@ -275,6 +281,7 @@ pub(crate) fn run_with_timeout(
 /// Lists the models or aliases available for `harness`.
 ///
 /// Claude Code returns built-in aliases (`opus`, `sonnet`, `fable`, `haiku`) without running a command.
+/// Claude DS returns `deepseek`: whatever its config dir's `ANTHROPIC_MODEL` says.
 /// Antigravity runs `agy models` with a 20 s timeout and keeps the first column of lines that contain a tab.
 /// OpenCode runs `opencode models` with a 20 s timeout and keeps lines that contain `/`.
 pub fn models(harness: Harness, config: &Config) -> Result<Vec<String>, String> {
@@ -292,6 +299,7 @@ mod tests {
     fn effort_maps_to_the_harness_levels() {
         assert_eq!(nearest_effort(Harness::ClaudeCode, "xhigh"), Some("xhigh"));
         assert_eq!(nearest_effort(Harness::Antigravity, "low"), Some("low"));
+        assert_eq!(nearest_effort(Harness::ClaudeDs, "max"), Some("max"));
         assert_eq!(nearest_effort(Harness::Opencode, "high"), None);
         assert_eq!(nearest_effort(Harness::ClaudeCode, "bogus"), None);
     }

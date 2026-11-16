@@ -118,7 +118,7 @@ enum Command {
 pub(crate) fn parse_harness(s: &str) -> Result<Harness, String> {
     match s.parse::<Harness>() {
         Ok(Harness::Custom) | Err(_) => {
-            Err(format!("unknown harness `{s}` (use claude-code, opencode or antigravity)"))
+            Err(format!("unknown harness `{s}` (use claude-code, opencode, antigravity or claude-ds)"))
         }
         Ok(h) => Ok(h),
     }

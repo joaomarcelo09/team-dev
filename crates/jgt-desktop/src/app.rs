@@ -3466,6 +3466,13 @@ allowed_tools = ["Bash"]
         let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::Antigravity));
         assert_eq!(app.agents[0].harness, Harness::Antigravity);
         assert_eq!(app.agents[0].effort, "low");
+
+        // Claude DS: its one model, Claude Code's effort levels
+        app.harness_models.insert(Harness::ClaudeDs, Ok(vec!["deepseek".into()]));
+        let _ = app.update(Msg::SetAgentHarness("coder".into(), Harness::ClaudeDs));
+        assert_eq!((app.agents[0].harness, app.agents[0].model.as_str(), app.agents[0].effort.as_str()), (Harness::ClaudeDs, "deepseek", "low"));
+        let _ = app.update(Msg::SetAgentHarness("coordinator".into(), Harness::ClaudeDs));
+        assert_eq!(app.agents[1].harness, Harness::ClaudeCode);
     }
 
     #[test]

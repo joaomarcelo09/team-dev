@@ -136,6 +136,7 @@ impl HarnessAdapter for Opencode {
             wait: true,
             log: None,
             env,
+            env_remove: vec![],
         })
     }
 

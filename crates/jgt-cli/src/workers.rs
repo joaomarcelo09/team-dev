@@ -587,7 +587,7 @@ async fn register(client: &HubClient, args: &WorkerRunArgs, settings: &SessionSe
 /// Records the worker's model and effort on its session once it registered (Claude Code
 /// registers itself from its hook a moment after it starts).
 async fn record_settings(client: HubClient, harness: Harness, external_id: String, settings: SessionSettings) {
-    let path = format!("/v1/resolve?harness={}&external_id={}", harness.as_str(), encode_query(&external_id));
+    let path = format!("/v1/resolve?harness={}&external_id={}", harness.session_harness().as_str(), encode_query(&external_id));
     for _ in 0..60 {
         if let Ok(s) = client.get::<Session>(&path).await {
             let req = jgt_core::api::PatchSessionRequest {
@@ -675,6 +675,9 @@ fn start_worker(config: &Config, args: &WorkerRunArgs, title: &str) -> Result<St
         })
         .map_err(anyhow::Error::msg)?;
     let mut cmd = tokio::process::Command::new(&plan.program);
+    for key in &plan.env_remove {
+        cmd.env_remove(key);
+    }
     cmd.args(&plan.args)
         .envs(plan.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::null())
@@ -764,7 +767,7 @@ pub async fn run(args: WorkerRunArgs) -> Result<()> {
         None => client
             .get(&format!(
                 "/v1/resolve?harness={}&external_id={}",
-                settings.harness.as_str(),
+                settings.harness.session_harness().as_str(),
                 encode_query(&args.session_id)
             ))
             .await

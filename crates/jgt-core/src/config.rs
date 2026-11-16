@@ -23,7 +23,7 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Team {
-    /// Harness for team sessions: `claude-code`, `opencode` or `antigravity`. Below each role's
+    /// Harness for team sessions: `claude-code`, `opencode`, `antigravity` or `claude-ds`. Below each role's
     /// built-in default (`role_defaults`), so it applies to roles without one; else `claude-code`.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub harness: String,
@@ -71,7 +71,7 @@ pub const EFFORT_LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SkillSettings {
-    /// `claude-code`, `opencode` or `antigravity`.
+    /// `claude-code`, `opencode`, `antigravity` or `claude-ds`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -430,7 +430,7 @@ fn check_harness(role: &str, value: Option<&str>, warnings: &mut Vec<String>) ->
     match name.parse::<Harness>() {
         Ok(Harness::Custom) | Err(_) => {
             warnings.push(format!(
-                "{role}: unknown harness `{name}` (use claude-code, opencode or antigravity); using claude-code"
+                "{role}: unknown harness `{name}` (use claude-code, opencode, antigravity or claude-ds); using claude-code"
             ));
             Harness::ClaudeCode
         }
@@ -565,6 +565,11 @@ pub struct Commands {
     /// Absolute path to Antigravity's `agy`, for workers on the `antigravity` harness.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub antigravity: Option<String>,
+    /// The Claude Code config dir of workers on the `claude-ds` harness (`CLAUDE_CONFIG_DIR`;
+    /// its `settings.json` names the endpoint, token and model). A leading `~/` is the home
+    /// folder. Unset: `~/.claude-opencode`. The `claude` program is `claude` above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub claude_ds_config_dir: Option<String>,
     /// Terminal used to reopen sessions. `{cwd}` is replaced by the session folder and the
     /// agent command is appended, e.g. `["kitty", "--directory", "{cwd}", "--"]`.
     pub terminal: Option<Vec<String>>,
@@ -995,6 +1000,21 @@ mod tests {
         assert!(w.iter().all(|w| !w.starts_with("reviewer")), "{w:?}");
         let all = user.team.warnings(None);
         assert!(all.iter().any(|w| w.starts_with("coordinator:")) && all.iter().any(|w| w.starts_with("coder:")));
+    }
+
+    #[test]
+    fn claude_ds_runs_workers_but_never_the_coordinator() {
+        let user: Config = toml::from_str(
+            "[team.skills.coordinator]\nharness = \"claude-ds\"\n[team.skills.coder]\nharness = \"claude-ds\"\nmodel = \"deepseek\"\n",
+        )
+        .unwrap();
+        let none = ProjectTeam::default();
+        let (coordinator, w) = user.team.resolve(COORDINATOR, &none);
+        assert_eq!(coordinator.harness, Harness::ClaudeCode);
+        assert_eq!(w, ["coordinator: the Coordinator runs on Claude Code only, not Claude DS; using claude-code"]);
+        let (coder, w) = user.team.resolve("coder", &none);
+        assert_eq!((coder.harness, coder.model.as_str(), coder.effort.as_str()), (Harness::ClaudeDs, "deepseek", "medium"));
+        assert!(w.is_empty(), "{w:?}");
     }
 
     #[test]

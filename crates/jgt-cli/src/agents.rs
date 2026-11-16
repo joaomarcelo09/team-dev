@@ -24,7 +24,7 @@ pub enum AgentsCommand {
     Set {
         /// The role to change (coordinator, coder, reviewer).
         role: String,
-        /// Harness (claude-code, opencode, antigravity).
+        /// Harness (claude-code, opencode, antigravity, claude-ds).
         #[arg(long, value_parser = crate::parse_harness)]
         harness: Option<Harness>,
         /// Model name or alias.
