@@ -4,6 +4,7 @@
 //! `opencode run [message]` runs headless; `--format json` prints one JSON event per line:
 //! `{"type": "text", "sessionID", "part": {"messageID", "text"}}` for the reply and
 //! `{"type": "step_finish", "part": {"tokens": {"input", "output", …}, "cost"}}` per step.
+//! `--standalone` (avoids shared background service that ignores config env vars),
 //! `--model provider/model#variant`, `--agent`, `--title`, `--auto` (approve what is not
 //! denied), and `--session` exist. `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG_CONTENT` are
 //! read from the environment.
@@ -113,7 +114,7 @@ impl HarnessAdapter for Opencode {
     }
 
     fn worker(&self, w: &WorkerLaunch) -> Result<LaunchPlan, String> {
-        let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
+        let mut args: Vec<String> = vec!["run".into(), "--standalone".into(), "--format".into(), "json".into()];
         args.extend(["--agent".into(), agent(w.skill)]);
         // OpenCode names models `provider/model`; anything else (a Claude alias) is left to its default.
         if w.settings.model.contains('/') {
@@ -311,7 +312,7 @@ deepseek/deepseek-chat
         assert_eq!(
             plan.args,
             [
-                "run", "--format", "json", "--agent", "jgt-reviewer", "--model",
+                "run", "--standalone", "--format", "json", "--agent", "jgt-reviewer", "--model",
                 "deepseek/deepseek-chat", "--title", "reviewer · x", "--auto", "Review it."
             ]
         );
