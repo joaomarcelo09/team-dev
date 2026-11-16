@@ -632,8 +632,8 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
             .style(style::input)
             .width(model_width);
 
-        // Effort control
-        let levels = jgt_core::harness::effort_levels(agent.harness);
+        // Effort control: OpenCode's are the selected model's own variants.
+        let levels = app.agent_efforts(agent);
         let r_name = role.to_string();
         let effort_control: Element<'_, Msg> = if levels.is_empty() {
             container(muted("n/a").size(style::fs(12)))
@@ -641,9 +641,9 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
                 .align_y(Alignment::Center)
                 .into()
         } else {
-            let selected = levels.iter().copied().find(|&l| l == agent.effort.as_str());
+            let selected = levels.iter().find(|l| *l == &agent.effort).cloned();
             pick_list(levels, selected, move |e| {
-                Msg::SetAgentEffort(r_name.clone(), e.to_string())
+                Msg::SetAgentEffort(r_name.clone(), e)
             })
             .text_size(style::fs(13))
             .padding([4, 8])
@@ -2542,6 +2542,13 @@ mod tests {
         app.harness_models.insert(
             Harness::Antigravity,
             Ok(vec!["gemini-3.8-flash-high".into()]),
+        );
+        app.model_efforts.insert(
+            Harness::Opencode,
+            Ok(std::collections::BTreeMap::from([(
+                "gemini-3.8-flash-high".to_string(),
+                vec!["low".to_string(), "high".to_string(), "max".to_string()],
+            )])),
         );
 
         assert!(app.agents_locked.is_none());

@@ -18,6 +18,7 @@ use crate::{
     model::{Harness, Session},
 };
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -94,10 +95,16 @@ pub trait HarnessAdapter: Sync {
     /// The command that resumes a worker session for one more headless turn.
     fn resume(&self, s: &Session, prompt: &str, config: &Config) -> Result<LaunchPlan, String>;
     fn parse_result(&self, stdout: &str, stderr: &str, ok: bool) -> Outcome;
-    /// The flags for `level`, or `None` when the harness takes no effort setting.
-    fn effort_args(&self, level: &str) -> Option<Vec<String>>;
+    /// The flags for `level` on `model`, or `None` when the harness takes no effort setting.
+    /// OpenCode puts the level in the model spec instead (`--model provider/model#level`).
+    fn effort_args(&self, level: &str, model: &str) -> Option<Vec<String>>;
     /// Lists the models or aliases available for this harness.
     fn models(&self, config: &Config) -> Result<Vec<String>, String>;
+    /// The effort levels each model takes, by `provider/model`, when the harness reports them
+    /// per model. Empty: `effort_levels` applies to every model.
+    fn model_efforts(&self, _config: &Config) -> Result<BTreeMap<String, Vec<String>>, String> {
+        Ok(BTreeMap::new())
+    }
 }
 
 /// The adapter of `harness`, if jg-team-dev can run workers on it.
@@ -151,10 +158,8 @@ pub fn effort_levels(harness: Harness) -> &'static [&'static str] {
         Harness::ClaudeDs => EFFORT_LEVELS,
         // `agy --help` (1.4.8): --effort (low|medium|high|xhigh|max).
         Harness::Antigravity => EFFORT_LEVELS,
-        // `opencode run --variant` is "provider-specific reasoning effort". `opencode models
-        // --verbose` (1.18.35) lists each model's `variants`: mostly our names, but a different
-        // subset per model (none at all, `high, max`, `none, thinking`, …), so one table cannot
-        // map them; we pass none (PRD Q7: no variant if unclear).
+        // OpenCode takes the reasoning variant in the model spec (`--model provider/model#variant`)
+        // and the variants differ per model (`model_efforts`), so there is no harness-wide list.
         Harness::Opencode | Harness::Custom => &[],
     }
 }
@@ -165,6 +170,43 @@ pub fn nearest_effort(harness: Harness, level: &str) -> Option<&'static str> {
     let levels = effort_levels(harness);
     let wanted = EFFORT_LEVELS.iter().position(|l| *l == level)?;
     EFFORT_LEVELS[..=wanted].iter().rev().find_map(|l| levels.iter().find(|h| *h == l).copied()).or(levels.first().copied())
+}
+
+/// The canonical effort order, including the extra names some per-model variant lists use
+/// (`none`, `minimal`, or an opaque `thinking`).
+const EFFORT_ORDER: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+fn effort_rank(level: &str) -> Option<usize> {
+    EFFORT_ORDER.iter().position(|l| *l == level)
+}
+
+/// Sorts effort levels lowest first; names outside the canonical order come after, alphabetically.
+pub(crate) fn sort_efforts(levels: &mut [String]) {
+    levels.sort_by(|a, b| {
+        effort_rank(a)
+            .unwrap_or(usize::MAX)
+            .cmp(&effort_rank(b).unwrap_or(usize::MAX))
+            .then_with(|| a.cmp(b))
+    });
+}
+
+/// The level of `levels` nearest to `level`: the same, else the nearest lower one, else the
+/// lowest. `None` when `level` is not a known effort name or `levels` is empty.
+///
+/// Unlike `nearest_effort`, `levels` may be a per-model list (OpenCode's variants) with names
+/// outside `EFFORT_LEVELS`.
+pub fn nearest_effort_of(levels: &[String], level: &str) -> Option<String> {
+    let wanted = effort_rank(level)?;
+    let mut best: Option<(usize, &String)> = None;
+    for level in levels {
+        let Some(rank) = effort_rank(level) else {
+            continue;
+        };
+        if rank <= wanted && best.is_none_or(|(best_rank, _)| rank > best_rank) {
+            best = Some((rank, level));
+        }
+    }
+    best.map(|(_, level)| level.clone()).or_else(|| levels.first().cloned())
 }
 
 /// How long `models` commands may take before being stopped.
@@ -291,9 +333,30 @@ pub fn models(harness: Harness, config: &Config) -> Result<Vec<String>, String> 
     }
 }
 
+/// The effort levels each model of `harness` takes, by `provider/model`, when it reports them
+/// per model (OpenCode). Empty when one fixed list (`effort_levels`) applies to all its models.
+pub fn model_efforts(harness: Harness, config: &Config) -> Result<BTreeMap<String, Vec<String>>, String> {
+    match adapter(harness) {
+        Some(a) => a.model_efforts(config),
+        None => Ok(BTreeMap::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nearest_effort_of_per_model_variants() {
+        let levels = ["low", "high", "max"].map(str::to_string);
+        assert_eq!(nearest_effort_of(&levels, "max").as_deref(), Some("max"));
+        assert_eq!(nearest_effort_of(&levels, "medium").as_deref(), Some("low"));
+        assert_eq!(nearest_effort_of(&levels, "xhigh").as_deref(), Some("high"));
+        assert_eq!(nearest_effort_of(&levels, "turbo"), None);
+        assert_eq!(nearest_effort_of(&[], "low"), None);
+        let extra = ["none", "minimal", "high"].map(str::to_string);
+        assert_eq!(nearest_effort_of(&extra, "low").as_deref(), Some("minimal"));
+    }
 
     #[test]
     fn effort_maps_to_the_harness_levels() {

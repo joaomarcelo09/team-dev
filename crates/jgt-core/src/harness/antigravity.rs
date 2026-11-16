@@ -93,7 +93,7 @@ impl HarnessAdapter for Antigravity {
         );
         let mut args = vec!["-p".to_string(), prompt, "--output-format".into(), "json".into()];
         args.extend(["--model".into(), w.settings.model.clone()]);
-        args.extend(self.effort_args(&w.settings.effort).unwrap_or_default());
+        args.extend(self.effort_args(&w.settings.effort, &w.settings.model).unwrap_or_default());
         // `--mode auto` does not approve tool calls headless (see the module docs); a denied call
         // fails the run in `parse_result`. `--print-timeout` stops a run that never ends.
         match w.settings.permission_mode.as_str() {
@@ -170,7 +170,7 @@ impl HarnessAdapter for Antigravity {
         }
     }
 
-    fn effort_args(&self, level: &str) -> Option<Vec<String>> {
+    fn effort_args(&self, level: &str, _model: &str) -> Option<Vec<String>> {
         Some(vec!["--effort".into(), level.to_string()])
     }
 

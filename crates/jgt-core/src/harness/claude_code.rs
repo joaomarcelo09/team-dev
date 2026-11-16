@@ -28,7 +28,7 @@ pub fn session_args(files: &Path, title: &str, settings: &SessionSettings) -> Ve
 pub fn session_args_for_role(files: &Path, title: &str, settings: &SessionSettings, role: Option<&str>) -> Vec<String> {
     let file = |n: &str| files.join(n).to_string_lossy().into_owned();
     let mut args: Vec<String> = vec!["--model".into(), settings.model.clone()];
-    args.extend(ClaudeCode.effort_args(&settings.effort).unwrap_or_default());
+    args.extend(ClaudeCode.effort_args(&settings.effort, &settings.model).unwrap_or_default());
     args.extend([
         "--permission-mode".into(),
         settings.permission_mode.clone(),
@@ -162,7 +162,7 @@ impl HarnessAdapter for ClaudeCode {
         }
     }
 
-    fn effort_args(&self, level: &str) -> Option<Vec<String>> {
+    fn effort_args(&self, level: &str, _model: &str) -> Option<Vec<String>> {
         Some(vec!["--effort".into(), level.to_string()])
     }
 
