@@ -248,8 +248,10 @@ When a role's harness is not installed, the worker runs on that role's fallback 
 coder: Claude Code + `sonnet` + `medium`), and its chat says so. Permission mode and tools merge
 field by field, the most specific first. A bad setting (unknown harness or effort, a
 Coordinator off Claude Code) is replaced and shown as a warning in **Settings**; an effort the
-harness lacks maps to the nearest lower one, and a harness with no effort setting (OpenCode)
-runs without one. `jg-team-dev worker … --model <m> --effort <e>` overrides one worker.
+harness lacks maps to the nearest lower one, and OpenCode runs with the reasoning variant its
+model reports (its effort list in **Settings** is the model's own variants, `max` included when
+the model has one; an effort the model does not report is left out). `jg-team-dev worker
+… --model <m> --effort <e>` overrides one worker.
 Settings save to `.team/agents.json` when a team starts. To change them live, edit them in **Settings** and click **Apply to this team**, or run `jg-team-dev agents set <role> [--harness h] [--model m] [--effort e]`; new workers use the changes immediately (the Coordinator row applies after a reset).
 
 ## IDE tab

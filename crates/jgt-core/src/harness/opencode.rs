@@ -11,6 +11,11 @@
 //! environment variable, not from the process cwd (a stale inherited `PWD` makes files land in
 //! the wrong folder), so the worker env sets `PWD` to the worker cwd.
 //!
+//! The reasoning variant is part of the model spec (`--model provider/model#variant`); v2.3 has
+//! no `--variant` flag and no `models --verbose` any more. The model registry it serves at
+//! `opencode api --standalone GET /api/model` lists each model's `variants`, which is what that
+//! spec validates against: an unsupported variant fails with `provider.no-route`.
+//!
 //! Our files live under jg-team-dev's own data folder: the user's `~/.config/opencode` (and its
 //! plugins) is never touched; worker cwd is set on the spawned process.
 
@@ -23,6 +28,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -44,6 +50,70 @@ pub fn parse_models(output: &str) -> Vec<String> {
             Some(token.to_string())
         })
         .collect()
+}
+
+/// Extracts every model's reasoning variants from `opencode api --standalone GET /api/model`.
+///
+/// Keys are `provider/model`, values the variant ids, lowest first. Entries without a provider,
+/// a model or variants are skipped; a model that reports no variants maps to an empty list.
+pub fn parse_variants(output: &str) -> BTreeMap<String, Vec<String>> {
+    let Ok(value) = serde_json::from_str::<Value>(output) else {
+        return BTreeMap::new();
+    };
+    let entries = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array());
+    let Some(entries) = entries else {
+        return BTreeMap::new();
+    };
+    let mut out = BTreeMap::new();
+    for entry in entries {
+        let provider = entry.get("providerID").and_then(Value::as_str);
+        let model = entry
+            .get("modelID")
+            .or_else(|| entry.get("id"))
+            .and_then(Value::as_str)
+            .filter(|m| !m.is_empty());
+        let (Some(provider), Some(model)) = (provider, model) else {
+            continue;
+        };
+        let mut levels: Vec<String> = entry
+            .get("variants")
+            .and_then(Value::as_array)
+            .map(|variants| {
+                variants
+                    .iter()
+                    .filter_map(|v| {
+                        v.get("id")
+                            .and_then(Value::as_str)
+                            .or_else(|| v.as_str())
+                            .map(str::to_owned)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        super::sort_efforts(&mut levels);
+        levels.dedup();
+        out.insert(format!("{provider}/{model}"), levels);
+    }
+    out
+}
+
+/// The model registry v2.3 serves at `/api/model`, parsed into each model's variants.
+fn run_variants(program: &Path) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let stdout = super::run_with_timeout(
+        program,
+        &["api", "--standalone", "GET", "/api/model"],
+        super::MODELS_TIMEOUT,
+    )?;
+    Ok(parse_variants(&stdout))
+}
+
+/// The model registry, or an empty map when OpenCode cannot answer: then no variant is passed.
+fn variants(program: &Path) -> BTreeMap<String, Vec<String>> {
+    run_variants(program).unwrap_or_default()
 }
 
 /// `<files>/opencode`: our OpenCode config folder (`OPENCODE_CONFIG_DIR`), with one agent per skill.
@@ -119,10 +189,21 @@ impl HarnessAdapter for Opencode {
         let mut args: Vec<String> = vec!["run".into(), "--standalone".into(), "--format".into(), "json".into()];
         args.extend(["--agent".into(), agent(w.skill)]);
         // OpenCode names models `provider/model`; anything else (a Claude alias) is left to its default.
+        // The effort (reasoning variant) is appended to that spec as `#variant`, but only when the
+        // model reports it: v2.3 fails a worker with `provider.no-route` on an unknown variant, and
+        // an old saved or default effort must not do that.
         if w.settings.model.contains('/') {
-            args.extend(["--model".into(), w.settings.model.clone()]);
+            let level = w.settings.effort.trim();
+            let supported = !level.is_empty()
+                && variants(&w.program)
+                    .get(&w.settings.model)
+                    .is_some_and(|levels| levels.iter().any(|l| l == level));
+            let model_args = if supported { self.effort_args(level, &w.settings.model) } else { None };
+            match model_args {
+                Some(model_args) => args.extend(model_args),
+                None => args.extend(["--model".into(), w.settings.model.clone()]),
+            }
         }
-        args.extend(self.effort_args(&w.settings.effort).unwrap_or_default());
         args.extend(["--title".into(), w.title.to_string(), "--auto".into()]);
         args.push(brief_prompt(w.brief, w.brief_file));
         let mut env = w.env.clone();
@@ -207,15 +288,25 @@ impl HarnessAdapter for Opencode {
         }
     }
 
-    /// `--variant` names are provider-specific; with no table of them we pass none (PRD Q7).
-    fn effort_args(&self, _level: &str) -> Option<Vec<String>> {
-        None
+    /// v2.3 takes the reasoning variant in the model spec, not in a flag: `--model
+    /// provider/model#variant`. An empty effort (or a non-`provider/model` alias) leaves the
+    /// model untouched and lets OpenCode use its default.
+    fn effort_args(&self, level: &str, model: &str) -> Option<Vec<String>> {
+        let level = level.trim();
+        (model.contains('/') && !level.is_empty())
+            .then(|| vec!["--model".into(), format!("{model}#{level}")])
     }
 
     fn models(&self, config: &Config) -> Result<Vec<String>, String> {
         let program = self.find(config)?;
         let stdout = super::run_with_timeout(&program, &["models"], super::MODELS_TIMEOUT)?;
         Ok(parse_models(&stdout))
+    }
+
+    /// The reasoning variants each model reports, by `provider/model` (v2.3's model registry).
+    fn model_efforts(&self, config: &Config) -> Result<BTreeMap<String, Vec<String>>, String> {
+        let program = self.find(config)?;
+        run_variants(&program)
     }
 }
 
@@ -249,6 +340,91 @@ deepseek/deepseek-chat
     fn parse_models_handles_descriptions_and_whitespace() {
         let sample = "  anthropic/claude-3-5-sonnet (recommended)  \nopenai/gpt-4o\tDefault\n";
         assert_eq!(parse_models(sample), ["anthropic/claude-3-5-sonnet", "openai/gpt-4o"]);
+    }
+
+    #[test]
+    fn parse_variants_reads_each_models_effort_levels() {
+        // `opencode api --standalone GET /api/model` in v2.3 (trimmed to the fields we read).
+        let sample = r#"{"location":{"directory":"/tmp"},"data":[
+{"id":"deepseek-v4.1-flash","modelID":"deepseek-v4.1-flash","providerID":"opencode-go",
+ "variants":[{"id":"max","settings":{}},{"id":"low","settings":{}},{"id":"high","settings":{}}]},
+{"id":"glm-5.2","modelID":"glm-5.2","providerID":"opencode-go",
+ "variants":[{"id":"high"},{"id":"max"}]},
+{"id":"kimi-k2.7-code","modelID":"kimi-k2.7-code","providerID":"opencode-go"},
+{"id":"legacy","providerID":"opencode-go","variants":["high","low"]},
+{"modelID":"orphan","variants":[{"id":"low"}]}
+]}"#;
+        let variants = parse_variants(sample);
+        let levels = |key: &str| variants.get(key).map(|v| v.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(levels("opencode-go/deepseek-v4.1-flash"), Some(vec!["low", "high", "max"]));
+        assert_eq!(levels("opencode-go/glm-5.2"), Some(vec!["high", "max"]));
+        assert_eq!(levels("opencode-go/kimi-k2.7-code"), Some(vec![]));
+        assert_eq!(levels("opencode-go/legacy"), Some(vec!["low", "high"]));
+        assert!(!variants.contains_key("opencode-go/orphan"));
+        assert!(parse_variants("not json").is_empty());
+    }
+
+    #[test]
+    fn the_effort_is_a_variant_of_the_model_spec() {
+        let args = |level: &str, model: &str| Opencode.effort_args(level, model);
+        assert_eq!(
+            args("max", "opencode-go/deepseek-v4.1-flash"),
+            Some(vec!["--model".into(), "opencode-go/deepseek-v4.1-flash#max".into()])
+        );
+        assert_eq!(
+            args("high", "opencode-go/deepseek-v4.1-flash"),
+            Some(vec!["--model".into(), "opencode-go/deepseek-v4.1-flash#high".into()])
+        );
+        assert_eq!(args("", "opencode-go/deepseek-v4.1-flash"), None);
+        // A Claude alias is left to OpenCode's default.
+        assert_eq!(args("high", "sonnet"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workers_pass_a_variant_the_model_reports_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("jgt-oc-variants-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let program = dir.join("opencode");
+        std::fs::write(
+            &program,
+            "#!/bin/sh\ncat <<'JSON'\n{\"data\":[{\"id\":\"deepseek-v4.1-flash\",\"providerID\":\"opencode-go\",\"variants\":[{\"id\":\"low\"},{\"id\":\"high\"},{\"id\":\"max\"}]}]}\nJSON\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut settings = Config::default().team.for_skill("reviewer", Path::new("/nonexistent"));
+        settings.harness = Harness::Opencode;
+        settings.model = "opencode-go/deepseek-v4.1-flash".into();
+        let mut launch = |effort: &str| {
+            settings.effort = effort.into();
+            Opencode
+                .worker(&WorkerLaunch {
+                    program: program.clone(),
+                    exe: "/bin/jg-team-dev".into(),
+                    files: &dir,
+                    skill: "reviewer",
+                    title: "reviewer · x",
+                    brief: "Review it.",
+                    brief_file: Path::new("/b.md"),
+                    settings: &settings,
+                    cwd: Path::new("/w"),
+                    session_id: "uuid",
+                    env: vec![],
+                })
+                .unwrap()
+        };
+        let model_arg = |args: &[String]| {
+            args.iter().position(|a| a == "--model").map(|i| args[i + 1].clone())
+        };
+
+        assert_eq!(model_arg(&launch("max").args).as_deref(), Some("opencode-go/deepseek-v4.1-flash#max"));
+        // `medium` is our default effort, but this model does not report it: no variant.
+        assert_eq!(model_arg(&launch("medium").args).as_deref(), Some("opencode-go/deepseek-v4.1-flash"));
+        assert_eq!(model_arg(&launch("turbo").args).as_deref(), Some("opencode-go/deepseek-v4.1-flash"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

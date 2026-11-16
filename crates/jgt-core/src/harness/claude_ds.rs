@@ -103,8 +103,8 @@ impl HarnessAdapter for ClaudeDs {
         ClaudeCode.parse_result(stdout, stderr, ok)
     }
 
-    fn effort_args(&self, level: &str) -> Option<Vec<String>> {
-        ClaudeCode.effort_args(level)
+    fn effort_args(&self, level: &str, model: &str) -> Option<Vec<String>> {
+        ClaudeCode.effort_args(level, model)
     }
 
     fn models(&self, _config: &Config) -> Result<Vec<String>, String> {
