@@ -7,7 +7,9 @@
 //! `--standalone` (avoids shared background service that ignores config env vars),
 //! `--model provider/model#variant`, `--agent`, `--title`, `--auto` (approve what is not
 //! denied), and `--session` exist. `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG_CONTENT` are
-//! read from the environment.
+//! read from the environment. OpenCode v2.3 takes its working directory from the `PWD`
+//! environment variable, not from the process cwd (a stale inherited `PWD` makes files land in
+//! the wrong folder), so the worker env sets `PWD` to the worker cwd.
 //!
 //! Our files live under jg-team-dev's own data folder: the user's `~/.config/opencode` (and its
 //! plugins) is never touched; worker cwd is set on the spawned process.
@@ -125,6 +127,8 @@ impl HarnessAdapter for Opencode {
         args.push(brief_prompt(w.brief, w.brief_file));
         let mut env = w.env.clone();
         env.push(("OPENCODE_CONFIG_DIR".into(), config_dir(w.files).to_string_lossy().into_owned()));
+        // OpenCode v2.3 reads its working directory from `PWD`, not the process cwd.
+        env.push(("PWD".into(), w.cwd.to_string_lossy().into_owned()));
         env.push(("OPENCODE_CONFIG_CONTENT".into(), inline_config(&w.exe, w.session_id).to_string()));
         env.push((SESSION_ENV.into(), w.session_id.to_string()));
         Ok(LaunchPlan {
@@ -318,6 +322,7 @@ deepseek/deepseek-chat
         );
         let env = |k: &str| plan.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
         assert_eq!(env("OPENCODE_CONFIG_DIR"), files.join("opencode").to_string_lossy());
+        assert_eq!(env("PWD"), "/w");
         assert_eq!(env(SESSION_ENV), "uuid");
         let inline: Value = serde_json::from_str(&env("OPENCODE_CONFIG_CONTENT")).unwrap();
         assert_eq!(inline["mcp"]["jg-team-dev"]["command"], json!(["/bin/jg-team-dev", "mcp", "--harness", "opencode"]));
