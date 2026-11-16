@@ -44,6 +44,9 @@ string_enum! {
         Opencode => "opencode",
         /// Google Antigravity (`agy`); team workers only.
         Antigravity => "antigravity",
+        /// Claude Code with another config dir (`CLAUDE_CONFIG_DIR`, DeepSeek behind it); team
+        /// workers only. Its sessions register as `claude-code` (`session_harness`).
+        ClaudeDs => "claude-ds",
         Custom => "custom",
     }
 }
@@ -54,7 +57,17 @@ impl Harness {
             Harness::ClaudeCode => "Claude Code",
             Harness::Opencode => "opencode",
             Harness::Antigravity => "Antigravity",
+            Harness::ClaudeDs => "Claude DS",
             Harness::Custom => "Custom",
+        }
+    }
+
+    /// The harness its hub session is registered under: a `claude-ds` worker is a Claude Code
+    /// process, whose session-start hook registers it as `claude-code`.
+    pub fn session_harness(self) -> Harness {
+        match self {
+            Harness::ClaudeDs => Harness::ClaudeCode,
+            h => h,
         }
     }
 

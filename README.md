@@ -148,7 +148,7 @@ effort: its built-in default, shown below as the config that spells it out. A
 
 ```toml
 [team]
-# harness = "claude-code"  # claude-code, opencode or antigravity (workers only)
+# harness = "claude-code"  # claude-code, opencode, antigravity or claude-ds (workers only)
 # model = "opus"           # below the role defaults: set a role's table to change that role
 # effort = "medium"        # low, medium, high, xhigh, max (checked against the harness)
 permission_mode = "auto"   # only prompts auto mode can't settle reach the app
@@ -186,6 +186,7 @@ auto_merge_pr = false      # merge the pull request once its checks pass (defaul
 [commands]
 # opencode = "/path/to/opencode"   # when it is not on PATH (e.g. an nvm install)
 # antigravity = "/path/to/agy"
+# claude_ds_config_dir = "~/.claude-opencode"  # CLAUDE_CONFIG_DIR of `claude-ds` workers
 ```
 
 The `[git]` section configures git autonomy: the steps the team takes on its own once the
@@ -220,6 +221,13 @@ that needs it (shell commands included), and `--mode auto` is not available on e
 Such a run is reported as failed, naming the denied calls. To let an `agy` coder build and test,
 set `permission_mode = "bypassPermissions"` for that role, which runs `agy
 --dangerously-skip-permissions`; otherwise keep the coder on its Claude Code fallback.
+
+A `claude-ds` worker is Claude Code run as `env -u ANTHROPIC_API_KEY
+CLAUDE_CONFIG_DIR=~/.claude-opencode claude` (the dir is `[commands] claude_ds_config_dir`), with
+`--setting-sources user,project,local` so that dir's `settings.json` (endpoint, token and model,
+e.g. DeepSeek) applies; jg-team-dev never reads it. It shows in **Settings** only where the dir
+exists. Its one model, `deepseek`, passes no `--model` (the dir's `ANTHROPIC_MODEL` decides); any
+other model name is passed as is. Workers only: the Coordinator stays on Claude Code.
 
 The Coordinator compacts its context at `compact_window = 120000` tokens unless set under
 `[team.skills.coordinator]` (`0` leaves it to Claude Code): it lives for days, and every step

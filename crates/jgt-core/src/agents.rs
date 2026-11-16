@@ -120,7 +120,7 @@ impl TeamAgents {
 
         if new_harness == Harness::Custom {
             return Err(format!(
-                "unknown harness `{}` (use claude-code, opencode or antigravity)",
+                "unknown harness `{}` (use claude-code, opencode, antigravity or claude-ds)",
                 new_harness.as_str()
             ));
         }

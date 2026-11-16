@@ -199,6 +199,7 @@ pub fn coordinator_plan(claude: PathBuf, folder: &Path, files: &Path, config: &C
         wait: true,
         log: None,
         env: vec![(ROLE_ENV.into(), COORDINATOR.into())],
+        env_remove: vec![],
     }
 }
 

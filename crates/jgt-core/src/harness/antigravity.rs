@@ -116,6 +116,7 @@ impl HarnessAdapter for Antigravity {
             wait: true,
             log: None,
             env: w.env.clone(),
+            env_remove: vec![],
         })
     }
 

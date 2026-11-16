@@ -26,6 +26,8 @@ pub struct LaunchPlan {
     pub log: Option<PathBuf>,
     /// Extra environment variables for the agent (and so for its hooks).
     pub env: Vec<(String, String)>,
+    /// Environment variables removed for the agent (e.g. `ANTHROPIC_API_KEY` for `claude-ds`).
+    pub env_remove: Vec<String>,
 }
 
 impl LaunchPlan {
@@ -56,6 +58,8 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
         Harness::ClaudeCode => (find_program("claude", config.commands.claude.as_deref())?, vec![]),
         Harness::Opencode => (find_program("opencode", config.commands.opencode.as_deref())?, vec![]),
         Harness::Antigravity => return Err("Antigravity workers cannot be restarted by jg-team-dev yet".into()),
+        // Its sessions are stored as `claude-code` (`Harness::session_harness`), so none gets here.
+        Harness::ClaudeDs => return Err("Claude DS workers are resumed headless only".into()),
         Harness::Custom => return Err("custom sessions cannot be restarted by jg-team-dev".into()),
     };
     let path_prepend = program.parent().map(Path::to_path_buf);
@@ -75,7 +79,7 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
             if session.is_coordinator() {
                 env.push((crate::team::ROLE_ENV.into(), crate::model::COORDINATOR.into()));
             }
-            Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: true, log: None, env })
+            Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: true, log: None, env, env_remove: vec![] })
         }
         (Harness::ClaudeCode, ReconnectMode::Terminal) => {
             let mut env = vec![];
@@ -93,7 +97,7 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
             }
             agent_args.push(prompt.unwrap_or_else(|| DEFAULT_PROMPT.into()));
             let log = crate::paths::data_dir().join("logs").join(format!("{}.log", session.id));
-            Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: false, log: Some(log), env: vec![] })
+            Ok(LaunchPlan { program, args: agent_args, cwd, path_prepend, wait: false, log: Some(log), env: vec![], env_remove: vec![] })
         }
         (Harness::Opencode, ReconnectMode::Terminal) => {
             if let Some(dir) = &cwd {
@@ -105,7 +109,7 @@ pub fn plan(session: &Session, mode: ReconnectMode, prompt: Option<&str>, config
             }
             in_terminal(program, agent_args, cwd, path_prepend, vec![], config)
         }
-        (Harness::Antigravity | Harness::Custom, _) => unreachable!(),
+        (Harness::Antigravity | Harness::ClaudeDs | Harness::Custom, _) => unreachable!(),
     }
 }
 
@@ -115,6 +119,9 @@ pub fn spawn(plan: &LaunchPlan) -> Result<String, String> {
 
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.args).envs(plan.env.iter().map(|(k, v)| (k, v))).stdin(Stdio::null());
+    for key in &plan.env_remove {
+        cmd.env_remove(key);
+    }
     if let Some(dir) = &plan.cwd {
         cmd.current_dir(dir);
     }
@@ -192,7 +199,7 @@ fn in_terminal(
     command.extend(agent_args);
     let terminal = command.remove(0);
     let terminal = which(&terminal).unwrap_or_else(|| PathBuf::from(&terminal));
-    Ok(LaunchPlan { program: terminal, args: command, cwd, path_prepend, wait: false, log: None, env })
+    Ok(LaunchPlan { program: terminal, args: command, cwd, path_prepend, wait: false, log: None, env, env_remove: vec![] })
 }
 
 fn detect_terminal(cwd: &str) -> Option<Vec<String>> {

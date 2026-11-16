@@ -55,6 +55,39 @@ pub fn session_args_for_role(files: &Path, title: &str, settings: &SessionSettin
     args
 }
 
+impl ClaudeCode {
+    /// The headless resume of a worker that ran on `harness` (`claude-code`, or `claude-ds`,
+    /// which adapts this plan): a worker answers one message, then exits again (it never listens).
+    pub(crate) fn resume_on(&self, harness: Harness, s: &Session, prompt: &str, config: &Config) -> Result<LaunchPlan, String> {
+        let program = self.find(config)?;
+        let cwd = s.cwd.as_deref().map(PathBuf::from).filter(|p| p.is_dir());
+        let role = s.role.clone().unwrap_or_default();
+        let title = s.title.clone().unwrap_or_else(|| role.clone());
+        let mut args = vec!["-p".to_string(), "--resume".into(), s.external_id.clone(), prompt.to_string()];
+        args.extend(["--output-format".into(), "json".into()]);
+        let mut settings = config.team.for_skill(&role, cwd.as_deref().unwrap_or(Path::new(".")));
+        if settings.harness != harness {
+            // The role runs elsewhere, so this worker ran on the fallback.
+            settings = settings.on_fallback().unwrap_or(settings);
+        }
+        // The model and effort it really ran with, when recorded (PRD H7).
+        if let Some(model) = &s.model {
+            settings.model = model.clone();
+        }
+        if let Some(effort) = s.effort.as_ref().filter(|e| crate::config::EFFORT_LEVELS.contains(&e.as_str())) {
+            settings.effort = effort.clone();
+        }
+        args.extend(session_args(&crate::team::files_dir(), &title, &settings));
+        let mut env = vec![(ROLE_ENV.to_string(), role)];
+        if let Some(parent) = &s.parent_id {
+            env.push((PARENT_ENV.into(), parent.clone()));
+        }
+        let log = crate::paths::data_dir().join("logs").join(format!("{}.log", s.id));
+        let path_prepend = program.parent().map(Path::to_path_buf);
+        Ok(LaunchPlan { program, args, cwd, path_prepend, wait: false, log: Some(log), env, env_remove: vec![] })
+    }
+}
+
 impl HarnessAdapter for ClaudeCode {
     fn harness(&self) -> Harness {
         Harness::ClaudeCode
@@ -95,37 +128,19 @@ impl HarnessAdapter for ClaudeCode {
             wait: true,
             log: None,
             env: w.env.clone(),
+            env_remove: vec![],
         })
     }
 
     fn resume(&self, s: &Session, prompt: &str, config: &Config) -> Result<LaunchPlan, String> {
-        // A worker answers one message headless, then exits again (it never listens).
-        let program = self.find(config)?;
-        let cwd = s.cwd.as_deref().map(PathBuf::from).filter(|p| p.is_dir());
+        // A `claude-ds` worker registers as `claude-code`; its conversation lives in its own
+        // config dir, so it is resumed there.
         let role = s.role.clone().unwrap_or_default();
-        let title = s.title.clone().unwrap_or_else(|| role.clone());
-        let mut args = vec!["-p".to_string(), "--resume".into(), s.external_id.clone(), prompt.to_string()];
-        args.extend(["--output-format".into(), "json".into()]);
-        let mut settings = config.team.for_skill(&role, cwd.as_deref().unwrap_or(Path::new(".")));
-        if settings.harness != Harness::ClaudeCode {
-            // The role runs elsewhere, so this worker ran on the fallback.
-            settings = settings.on_fallback().unwrap_or(settings);
+        let cwd = s.cwd.as_deref().map(Path::new).filter(|p| p.is_dir()).unwrap_or(Path::new("."));
+        if config.team.for_skill(&role, cwd).harness == Harness::ClaudeDs && super::ClaudeDs.find(config).is_ok() {
+            return super::ClaudeDs.resume(s, prompt, config);
         }
-        // The model and effort it really ran with, when recorded (PRD H7).
-        if let Some(model) = &s.model {
-            settings.model = model.clone();
-        }
-        if let Some(effort) = s.effort.as_ref().filter(|e| crate::config::EFFORT_LEVELS.contains(&e.as_str())) {
-            settings.effort = effort.clone();
-        }
-        args.extend(session_args(&crate::team::files_dir(), &title, &settings));
-        let mut env = vec![(ROLE_ENV.to_string(), role)];
-        if let Some(parent) = &s.parent_id {
-            env.push((PARENT_ENV.into(), parent.clone()));
-        }
-        let log = crate::paths::data_dir().join("logs").join(format!("{}.log", s.id));
-        let path_prepend = program.parent().map(Path::to_path_buf);
-        Ok(LaunchPlan { program, args, cwd, path_prepend, wait: false, log: Some(log), env })
+        self.resume_on(Harness::ClaudeCode, s, prompt, config)
     }
 
     /// `result`, `is_error`, `total_cost_usd` and `usage` of `claude -p --output-format json`.
