@@ -1,15 +1,15 @@
 //! OpenCode workers (PRD H5).
 //!
-//! Checked on this machine with `opencode run --help` (1.18.35) and one smoke run (Oct 27, 2026):
+//! Checked on this machine with `opencode run --help` (v2.3.0) and smoke runs:
 //! `opencode run [message]` runs headless; `--format json` prints one JSON event per line:
 //! `{"type": "text", "sessionID", "part": {"messageID", "text"}}` for the reply and
 //! `{"type": "step_finish", "part": {"tokens": {"input", "output", …}, "cost"}}` per step.
-//! `--model provider/model`, `--agent`, `--dir`, `--variant`, `--auto` (approve what is not
-//! denied), `--pure` (no external plugins) and `--session` exist. `OPENCODE_CONFIG_DIR` and
-//! `OPENCODE_CONFIG_CONTENT` are read from the environment.
+//! `--model provider/model#variant`, `--agent`, `--title`, `--auto` (approve what is not
+//! denied), and `--session` exist. `OPENCODE_CONFIG_DIR` and `OPENCODE_CONFIG_CONTENT` are
+//! read from the environment.
 //!
 //! Our files live under jg-team-dev's own data folder: the user's `~/.config/opencode` (and its
-//! plugins) is never touched, and `--pure` keeps those plugins out of the worker.
+//! plugins) is never touched; worker cwd is set on the spawned process.
 
 use super::{Caps, HarnessAdapter, Outcome, WorkerLaunch, brief_prompt, effort_levels, skill_text};
 use crate::{
@@ -113,9 +113,8 @@ impl HarnessAdapter for Opencode {
     }
 
     fn worker(&self, w: &WorkerLaunch) -> Result<LaunchPlan, String> {
-        let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into(), "--pure".into()];
+        let mut args: Vec<String> = vec!["run".into(), "--format".into(), "json".into()];
         args.extend(["--agent".into(), agent(w.skill)]);
-        args.extend(["--dir".into(), w.cwd.to_string_lossy().into_owned()]);
         // OpenCode names models `provider/model`; anything else (a Claude alias) is left to its default.
         if w.settings.model.contains('/') {
             args.extend(["--model".into(), w.settings.model.clone()]);
@@ -174,12 +173,16 @@ impl HarnessAdapter for Opencode {
         };
         let costs: Vec<f64> = steps.iter().filter_map(|e| part(e, "cost").and_then(|c| c.as_f64())).collect();
         // An error event (seen with an unknown model, exit 1):
-        // `{"type": "error", "error": {"name": "UnknownError", "data": {"message": "…"}}}`.
+        // `{"type": "error", "error": {"name": "UnknownError", "data": {"message": "…"}}}`
+        // or v2.3 `{"type": "error", "error": {"type": "provider.no-route", "message": "…"}}`.
         let error = events.iter().find(|e| kind(e) == "error").map(|e| {
             let err = e.get("error");
             let field = |k: &str| err.and_then(|v| v.get(k)).and_then(Value::as_str);
-            let message = err.and_then(|v| v.pointer("/data/message")).and_then(Value::as_str);
-            match (field("name"), message) {
+            let message = err
+                .and_then(|v| v.pointer("/data/message").or_else(|| v.get("message")))
+                .and_then(Value::as_str);
+            let name = field("name").or_else(|| field("type"));
+            match (name, message) {
                 (Some(name), Some(m)) => format!("{name}: {m}"),
                 (None, Some(m)) => m.to_string(),
                 _ => err.or_else(|| e.get("part")).map_or_else(|| e.to_string(), Value::to_string),
@@ -262,6 +265,18 @@ deepseek/deepseek-chat
         assert_eq!((o.ok, o.text.as_str()), (false, "UnknownError: Unexpected server error. Check server logs for details."));
         let none = Opencode.parse_result("", "Error: provider not configured", false);
         assert_eq!((none.ok, none.text.as_str()), (false, "Error: provider not configured"));
+
+        // OpenCode v2.3 real run output
+        let v23 = "{\"type\":\"step_start\",\"timestamp\":1794861181996,\"sessionID\":\"ses_e19efd5b2ffefFFAG0umlkLWp0\",\"part\":{\"id\":\"prt_1\",\"sessionID\":\"ses_e19efd5b2ffefFFAG0umlkLWp0\",\"messageID\":\"msg_1\",\"type\":\"step-start\"}}\n\
+{\"type\":\"text\",\"timestamp\":1794861182101,\"sessionID\":\"ses_e19efd5b2ffefFFAG0umlkLWp0\",\"part\":{\"id\":\"prt_2\",\"sessionID\":\"ses_e19efd5b2ffefFFAG0umlkLWp0\",\"messageID\":\"msg_1\",\"type\":\"text\",\"text\":\"combined_ok\"}}\n\
+{\"type\":\"step_finish\",\"timestamp\":1794861182108,\"sessionID\":\"ses_e19efd5b2ffefFFAG0umlkLWp0\",\"part\":{\"id\":\"prt_3\",\"sessionID\":\"ses_e19efd5b2ffefFFAG0umlkLWp0\",\"messageID\":\"msg_1\",\"type\":\"step-finish\",\"reason\":\"stop\",\"cost\":0,\"tokens\":{\"input\":3346,\"output\":3,\"reasoning\":27,\"cache\":{\"read\":3904,\"write\":0}}}}";
+        let o23 = Opencode.parse_result(v23, "", true);
+        assert_eq!((o23.ok, o23.text.as_str(), o23.cost_usd, o23.tokens_in, o23.tokens_out), (true, "combined_ok", Some(0.0), Some(3346), Some(3)));
+        assert_eq!(o23.conversation.as_deref(), Some("ses_e19efd5b2ffefFFAG0umlkLWp0"));
+
+        let err_v23 = r#"{"type":"error","timestamp":1794861204926,"sessionID":"ses_e19ef7a5affejSzt6NdXD4wZro","error":{"type":"provider.no-route","message":"Model unavailable: invalid/nonexistent"}}"#;
+        let o_err23 = Opencode.parse_result(err_v23, "", false);
+        assert_eq!((o_err23.ok, o_err23.text.as_str()), (false, "provider.no-route: Model unavailable: invalid/nonexistent"));
     }
 
     #[test]
@@ -296,7 +311,7 @@ deepseek/deepseek-chat
         assert_eq!(
             plan.args,
             [
-                "run", "--format", "json", "--pure", "--agent", "jgt-reviewer", "--dir", "/w", "--model",
+                "run", "--format", "json", "--agent", "jgt-reviewer", "--model",
                 "deepseek/deepseek-chat", "--title", "reviewer · x", "--auto", "Review it."
             ]
         );
