@@ -14,7 +14,7 @@ use jgt_core::{
     config::{Config, Desktop as DesktopConfig, Git},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -92,6 +92,39 @@ pub struct AgentRow {
     pub harness: Harness,
     pub model: String,
     pub effort: String,
+}
+
+/// The effort levels `agent` can be set to: the variants its model reports when the harness
+/// lists them per model (OpenCode), else the harness's fixed list. OpenCode also reports
+/// non-effort variants (`none`, `thinking`, …); only real effort levels are offered, since the
+/// rest of the app validates efforts against `EFFORT_LEVELS`.
+pub(crate) fn agent_efforts(
+    agent: &AgentRow,
+    model_efforts: &HashMap<Harness, Result<BTreeMap<String, Vec<String>>, String>>,
+) -> Vec<String> {
+    if let Some(Ok(efforts)) = model_efforts.get(&agent.harness)
+        && let Some(levels) = efforts.get(&agent.model)
+    {
+        return levels
+            .iter()
+            .filter(|l| jgt_core::config::EFFORT_LEVELS.contains(&l.as_str()))
+            .cloned()
+            .collect();
+    }
+    jgt_core::harness::effort_levels(agent.harness).iter().map(|l| (*l).to_string()).collect()
+}
+
+/// Moves `agent.effort` to one of its supported levels when a harness or model change leaves it
+/// unsupported: the nearest lower one, else the lowest.
+fn clamp_agent_effort(
+    agent: &mut AgentRow,
+    model_efforts: &HashMap<Harness, Result<BTreeMap<String, Vec<String>>, String>>,
+) {
+    let levels = agent_efforts(agent, model_efforts);
+    if !levels.is_empty() && !levels.contains(&agent.effort) {
+        agent.effort = jgt_core::harness::nearest_effort_of(&levels, &agent.effort)
+            .unwrap_or_else(|| levels[0].clone());
+    }
 }
 
 /// A team workspace: a project folder with its Coordinator.
@@ -309,6 +342,10 @@ pub struct App {
     // used by M5
     #[allow(dead_code)]
     pub harness_models: HashMap<Harness, Result<Vec<String>, String>>,
+    /// The effort variants each model reports (`provider/model` → levels; OpenCode), populated
+    /// asynchronously with `harness_models`.
+    #[allow(dead_code)]
+    pub model_efforts: HashMap<Harness, Result<BTreeMap<String, Vec<String>>, String>>,
     /// Saved team agents if the selected workspace has a connected Coordinator, locking Settings.
     // used by M5
     #[allow(dead_code)]
@@ -474,6 +511,7 @@ pub enum Msg {
     #[allow(dead_code)]
     SetAgentEffort(String, String),
     ModelsListed(Harness, Result<Vec<String>, String>),
+    ModelEffortsListed(Harness, Result<BTreeMap<String, Vec<String>>, String>),
     // used by M5
     #[allow(dead_code)]
     SaveAgents,
@@ -537,6 +575,11 @@ pub fn decide_thread_scroll(
 }
 
 impl App {
+    /// The effort levels one Settings row can be set to (see `agent_efforts`).
+    pub(crate) fn agent_efforts(&self, agent: &AgentRow) -> Vec<String> {
+        agent_efforts(agent, &self.model_efforts)
+    }
+
     pub fn new(start_session: Option<String>) -> (App, Task<Msg>) {
         let config = Config::load();
         let desktop = &config.desktop;
@@ -589,6 +632,7 @@ impl App {
             agents: Vec::new(),
             installed_harnesses: Vec::new(),
             harness_models: HashMap::new(),
+            model_efforts: HashMap::new(),
             agents_locked: None,
             new_team: None,
             starting_team: false,
@@ -1827,14 +1871,15 @@ impl App {
 
                     self.installed_harnesses = jgt_core::harness::installed(&config);
                     self.harness_models.clear();
+                    self.model_efforts.clear();
 
                     let tasks = self
                         .installed_harnesses
                         .iter()
                         .copied()
-                        .map(|h| {
+                        .flat_map(|h| {
                             let cfg = config.clone();
-                            Task::perform(
+                            let models = Task::perform(
                                 async move {
                                     match tokio::task::spawn_blocking(move || {
                                         jgt_core::harness::models(h, &cfg)
@@ -1846,7 +1891,22 @@ impl App {
                                     }
                                 },
                                 move |res| Msg::ModelsListed(h, res),
-                            )
+                            );
+                            let cfg = config.clone();
+                            let efforts = Task::perform(
+                                async move {
+                                    match tokio::task::spawn_blocking(move || {
+                                        jgt_core::harness::model_efforts(h, &cfg)
+                                    })
+                                    .await
+                                    {
+                                        Ok(res) => res,
+                                        Err(e) => Err(format!("failed to list model efforts: {e}")),
+                                    }
+                                },
+                                move |res| Msg::ModelEffortsListed(h, res),
+                            );
+                            [models, efforts]
                         })
                         .collect::<Vec<_>>();
 
@@ -1889,17 +1949,14 @@ impl App {
                         .cloned()
                         .unwrap_or_default();
                     agent.model = first_model;
-                    let levels = jgt_core::harness::effort_levels(harness);
-                    if !levels.is_empty() && !levels.contains(&agent.effort.as_str()) {
-                        let effort = jgt_core::harness::nearest_effort(harness, &agent.effort).unwrap_or(levels[0]);
-                        agent.effort = effort.to_string();
-                    }
+                    clamp_agent_effort(agent, &self.model_efforts);
                 }
                 Task::none()
             }
             Msg::SetAgentModel(role, model) => {
                 if let Some(agent) = self.agents.iter_mut().find(|a| a.role == role) {
                     agent.model = model;
+                    clamp_agent_effort(agent, &self.model_efforts);
                 }
                 Task::none()
             }
@@ -1911,6 +1968,13 @@ impl App {
             }
             Msg::ModelsListed(harness, result) => {
                 self.harness_models.insert(harness, result);
+                Task::none()
+            }
+            Msg::ModelEffortsListed(harness, result) => {
+                self.model_efforts.insert(harness, result);
+                for agent in self.agents.iter_mut().filter(|a| a.harness == harness) {
+                    clamp_agent_effort(agent, &self.model_efforts);
+                }
                 Task::none()
             }
             Msg::SaveAgents => {
@@ -3473,6 +3537,54 @@ allowed_tools = ["Bash"]
         assert_eq!((app.agents[0].harness, app.agents[0].model.as_str(), app.agents[0].effort.as_str()), (Harness::ClaudeDs, "deepseek", "low"));
         let _ = app.update(Msg::SetAgentHarness("coordinator".into(), Harness::ClaudeDs));
         assert_eq!(app.agents[1].harness, Harness::ClaudeCode);
+    }
+
+    #[test]
+    fn test_model_efforts_follow_the_opencode_model() {
+        let (mut app, _) = App::new(None);
+        app.agents = vec![AgentRow {
+            role: "coder".into(),
+            harness: Harness::Opencode,
+            model: "opencode-go/deepseek-v4.1-flash".into(),
+            effort: "medium".into(),
+        }];
+
+        let efforts = BTreeMap::from([
+            (
+                "opencode-go/deepseek-v4.1-flash".to_string(),
+                vec!["low".to_string(), "high".to_string(), "max".to_string()],
+            ),
+            (
+                "opencode-go/glm-5.2".to_string(),
+                vec!["high".to_string(), "max".to_string()],
+            ),
+        ]);
+        let _ = app.update(Msg::ModelEffortsListed(Harness::Opencode, Ok(efforts)));
+
+        // The select offers exactly the model's variants, and the old default is moved into them.
+        assert_eq!(
+            app.agent_efforts(&app.agents[0]),
+            vec!["low".to_string(), "high".to_string(), "max".to_string()]
+        );
+        assert_eq!(app.agents[0].effort, "low");
+
+        // max is now selectable and survives a model change that also has it.
+        let _ = app.update(Msg::SetAgentEffort("coder".into(), "max".into()));
+        let _ = app.update(Msg::SetAgentModel("coder".into(), "opencode-go/glm-5.2".into()));
+        assert_eq!(app.agents[0].effort, "max");
+
+        // A model without the current level moves to its nearest lower one (or its lowest).
+        let _ = app.update(Msg::SetAgentEffort("coder".into(), "high".into()));
+        let _ = app.update(Msg::SetAgentModel("coder".into(), "opencode-go/deepseek-v4.1-flash".into()));
+        assert_eq!(app.agents[0].effort, "high");
+
+        // A model OpenCode reports without variants has no effort setting.
+        app.agents[0].model = "opencode-go/kimi-k2.7-code".into();
+        let mut efforts = BTreeMap::new();
+        efforts.insert("opencode-go/deepseek-v4.1-flash".to_string(), vec!["low".to_string()]);
+        efforts.insert("opencode-go/kimi-k2.7-code".to_string(), Vec::new());
+        let _ = app.update(Msg::ModelEffortsListed(Harness::Opencode, Ok(efforts)));
+        assert!(app.agent_efforts(&app.agents[0]).is_empty());
     }
 
     #[test]

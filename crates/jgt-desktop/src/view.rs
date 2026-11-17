@@ -537,12 +537,27 @@ pub const AGENT_ROLES: &[&str] = &[
     "git-coder",
 ];
 
+/// Wraps a model control so hovering it shows the full model name: the input and the select are
+/// wide in the column but a very long model id can still outgrow them.
+fn model_name_tip<'a>(content: impl Into<Element<'a, Msg>>, model: &str) -> Element<'a, Msg> {
+    tooltip(
+        content,
+        container(text(model.to_string()).size(style::fs(12)))
+            .padding([6, 10])
+            .style(container::rounded_box),
+        tooltip::Position::Bottom,
+    )
+    .gap(4)
+    .into()
+}
+
 pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
+    // Model names can be long (`opencode-go/deepseek-v4.1-flash`). The model input and the
+    // suggestions select share one full-width column, stacked, so the selected value and the
+    // dropdown options show the whole name; hovering either one shows it in a tooltip too.
     let role_width = style::fs(14) * 7.0;
     let harness_width = style::fs(14) * 9.5;
-    let model_width = style::fs(14) * 8.0;
     let effort_width = style::fs(14) * 5.5;
-    let suggestions_width = style::fs(14) * 8.5;
 
     let is_locked = app.agents_locked.is_some();
     let header_desc = if is_locked {
@@ -560,9 +575,8 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
     let col_header = row![
         muted("ROLE").size(style::fs(11)).font(bold()).width(role_width),
         muted("HARNESS").size(style::fs(11)).font(bold()).width(harness_width),
-        muted("MODEL").size(style::fs(11)).font(bold()).width(model_width),
+        muted("MODEL").size(style::fs(11)).font(bold()).width(Fill),
         muted("EFFORT").size(style::fs(11)).font(bold()).width(effort_width),
-        muted("SUGGESTIONS").size(style::fs(11)).font(bold()).width(suggestions_width),
     ]
     .spacing(8)
     .align_y(Alignment::Center);
@@ -626,15 +640,18 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
 
         // Model text input
         let r_name = role.to_string();
-        let model_input = text_input("Model…", &agent.model)
-            .on_input(move |m| Msg::SetAgentModel(r_name.clone(), m))
-            .size(style::fs(13))
-            .padding([4, 8])
-            .style(style::input)
-            .width(model_width);
+        let model_input = model_name_tip(
+            text_input("Model…", &agent.model)
+                .on_input(move |m| Msg::SetAgentModel(r_name.clone(), m))
+                .size(style::fs(13))
+                .padding([4, 8])
+                .style(style::input)
+                .width(Fill),
+            &agent.model,
+        );
 
-        // Effort control
-        let levels = jgt_core::harness::effort_levels(agent.harness);
+        // Effort control: OpenCode's are the selected model's own variants.
+        let levels = app.agent_efforts(agent);
         let r_name = role.to_string();
         let effort_control: Element<'_, Msg> = if levels.is_empty() {
             container(muted("n/a").size(style::fs(12)))
@@ -642,9 +659,9 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
                 .align_y(Alignment::Center)
                 .into()
         } else {
-            let selected = levels.iter().copied().find(|&l| l == agent.effort.as_str());
+            let selected = levels.iter().find(|l| *l == &agent.effort).cloned();
             pick_list(levels, selected, move |e| {
-                Msg::SetAgentEffort(r_name.clone(), e.to_string())
+                Msg::SetAgentEffort(r_name.clone(), e)
             })
             .text_size(style::fs(13))
             .padding([4, 8])
@@ -656,7 +673,7 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
         let r_name = role.to_string();
         let suggestions_control: Element<'_, Msg> = match app.harness_models.get(&agent.harness) {
             None => container(muted("Loading models…").size(style::fs(12)))
-                .width(suggestions_width)
+                .width(Fill)
                 .align_y(Alignment::Center)
                 .into(),
             Some(Err(err)) => container(
@@ -664,37 +681,42 @@ pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
                     .size(style::fs(11))
                     .wrapping(text::Wrapping::Word),
             )
-            .width(suggestions_width)
+            .width(Fill)
             .align_y(Alignment::Center)
             .into(),
             Some(Ok(suggestions)) if suggestions.is_empty() => container(
                 muted("No suggestions").size(style::fs(12)),
             )
-            .width(suggestions_width)
+            .width(Fill)
             .align_y(Alignment::Center)
             .into(),
             Some(Ok(suggestions)) => {
                 let selected = suggestions.iter().find(|s| *s == &agent.model).cloned();
-                pick_list(suggestions.as_slice(), selected, move |m| {
-                    Msg::SetAgentModel(r_name.clone(), m)
-                })
-                .placeholder("Suggestions…")
-                .text_size(style::fs(13))
-                .padding([4, 8])
-                .width(suggestions_width)
-                .into()
+                model_name_tip(
+                    pick_list(suggestions.as_slice(), selected, move |m| {
+                        Msg::SetAgentModel(r_name.clone(), m)
+                    })
+                    .placeholder("Suggestions…")
+                    .text_size(style::fs(13))
+                    .padding([4, 8])
+                    .width(Fill),
+                    &agent.model,
+                )
             }
         };
+
+        let model_column = column![model_input, suggestions_control]
+            .spacing(4)
+            .width(Fill);
 
         let r = row![
             text(role).size(style::fs(13)).font(bold()).width(role_width),
             harness_control,
-            model_input,
+            model_column,
             effort_control,
-            suggestions_control,
         ]
         .spacing(8)
-        .align_y(Alignment::Center);
+        .align_y(Alignment::Start);
 
         section = section.push(r);
 
@@ -2544,6 +2566,13 @@ mod tests {
             Harness::Antigravity,
             Ok(vec!["gemini-3.8-flash-high".into()]),
         );
+        app.model_efforts.insert(
+            Harness::Opencode,
+            Ok(std::collections::BTreeMap::from([(
+                "gemini-3.8-flash-high".to_string(),
+                vec!["low".to_string(), "high".to_string(), "max".to_string()],
+            )])),
+        );
 
         assert!(app.agents_locked.is_none());
         assert_eq!(HarnessChoice(Harness::ClaudeCode).to_string(), "Claude Code");
@@ -2679,26 +2708,60 @@ mod tests {
 
     #[test]
     fn test_settings_agents_row_width_fits_card() {
+        // The model input and the suggestions select are stacked in the column after ROLE,
+        // HARNESS and before EFFORT; that column gets all the width the card has left.
         for fs14 in [14.0, style::fs(14)] {
             let role_width = fs14 * 7.0;
             let harness_width = fs14 * 9.5;
-            let model_width = fs14 * 8.0;
             let effort_width = fs14 * 5.5;
-            let suggestions_width = fs14 * 8.5;
-            let spacing = 8.0 * 4.0;
+            let spacing = 8.0 * 3.0;
 
-            let total_row_width = role_width + harness_width + model_width + effort_width + suggestions_width + spacing;
             let card_max_width = fs14 * 46.0;
             let card_padding = 22.0 * 2.0;
             let scrollable_padding_right = 8.0;
             let scrollbar_width = 12.0;
             let usable_width = card_max_width - card_padding - scrollable_padding_right - scrollbar_width;
 
+            let fixed_width = role_width + harness_width + effort_width + spacing;
             assert!(
-                total_row_width <= usable_width,
-                "Row width ({total_row_width}px) exceeds usable width ({usable_width}px) at fs(14)={fs14}"
+                fixed_width <= usable_width,
+                "Fixed columns ({fixed_width}px) exceed usable width ({usable_width}px) at fs(14)={fs14}"
+            );
+
+            let model_width = usable_width - fixed_width;
+            // `opencode-go/deepseek-v4.1-flash` is 31 characters: at fs(13) it needs roughly
+            // 14 × fs(14) pixels, leaving room for the longest model names the harnesses list.
+            assert!(
+                model_width >= fs14 * 14.0,
+                "Model column ({model_width}px) is too narrow for long model names at fs(14)={fs14}"
             );
         }
+    }
+
+    #[test]
+    fn test_settings_agents_long_model_name_renders() {
+        let (mut app, _) = App::new(None);
+        app.show_settings = true;
+        app.installed_harnesses = vec![Harness::Opencode];
+        let long_model = "opencode-go/deepseek-v4.1-flash";
+        app.agents = AGENT_ROLES
+            .iter()
+            .map(|&role| AgentRow {
+                role: role.to_string(),
+                harness: Harness::Opencode,
+                model: long_model.to_string(),
+                effort: "medium".into(),
+            })
+            .collect();
+        app.harness_models.insert(
+            Harness::Opencode,
+            Ok(vec![long_model.to_string(), "openai/gpt-4o".to_string()]),
+        );
+
+        // The whole name must reach the pick_list (selected value + options) and the tooltip.
+        let _ = agents_section(&app);
+        let _ = settings(&app);
+        let _ = view(&app);
     }
 
     #[test]
