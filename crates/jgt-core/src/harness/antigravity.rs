@@ -15,7 +15,9 @@
 //! "command", …}]` in its JSON. `--mode auto` may not exist for an account ("not available for
 //! this account; continuing in the default mode" on stderr). Only `--dangerously-skip-permissions`
 //! (our `bypassPermissions`) lets a worker run commands; allow rules live in agy's own
-//! `settings.json`, which is the user's.
+//! `settings.json`, which is the user's. `--settings` takes session-only settings (a JSON object
+//! of `settings.json` keys), so non-git-coder workers get the git write commands and `gh` denied
+//! there; agy matches `command(...)` as a prefix, so a `git -C <path> commit` is not covered.
 
 use super::{Caps, HarnessAdapter, Outcome, WorkerLaunch, brief_prompt, effort_levels, skill_text};
 use crate::{
@@ -48,6 +50,20 @@ pub fn parse_models(output: &str) -> Vec<String> {
 
 /// `agy --print-timeout`: the longest a worker turn may take; agy stops it itself.
 const PRINT_TIMEOUT: &str = "2h";
+
+/// What a worker's prompt says about git state. Non-git-coder roles also get the plain git write
+/// steps and `gh` denied in [`crate::team::git_permission_settings`]; this note covers the forms
+/// agy cannot tell apart (notably `git -C <path> commit`, which looks like a read-only `git -C`).
+fn git_permission_note(skill: &str) -> &'static str {
+    if crate::team::may_run_git(skill) {
+        "Git state: you are the only worker allowed to run the git write commands (commit, push, \
+         merge, rebase, reset --hard) and gh; follow the git-coder skill."
+    } else {
+        "Git state: do not run git write commands (commit, push, merge, rebase, reset --hard) or \
+         gh, not even with git -C <path>. The harness denies the plain forms; it cannot tell \
+         git -C <path> commit from a read-only git -C command, so follow this rule for those."
+    }
+}
 
 impl HarnessAdapter for Antigravity {
     fn harness(&self) -> Harness {
@@ -84,11 +100,13 @@ impl HarnessAdapter for Antigravity {
              are not available in this session; skip them. Your final reply goes to the Coordinator. \
              Stay strictly inside the role and scope of the brief (a coder does not go beyond its brief; \
              a reviewer does not implement features). \
+             {} \
              Before each step write one short plain-text line saying what you are about to do \
              (these lines appear in the run output). \
              The final reply starts with a short recap of the steps (3-8 bullets: what was done, \
              what was checked), then the JSON block the skill requires, still last.\n\n\
              # Your brief\n\n{}",
+            git_permission_note(w.skill),
             brief_prompt(w.brief, w.brief_file)
         );
         let mut args = vec!["-p".to_string(), prompt, "--output-format".into(), "json".into()];
@@ -101,6 +119,11 @@ impl HarnessAdapter for Antigravity {
             "acceptEdits" => args.extend(["--mode".into(), "accept-edits".into()]),
             "plan" => args.extend(["--mode".into(), "plan".into()]),
             _ => args.extend(["--mode".into(), "auto".into()]),
+        }
+        // Session-only settings, never saved: non-git-coder roles get the git write steps and gh
+        // denied (the prompt covers the `-C` form agy's command prefixes cannot distinguish).
+        if let Some(settings) = crate::team::git_permission_settings(w.skill) {
+            args.extend(["--settings".into(), settings]);
         }
         if w.brief.len() > super::INLINE_BRIEF_MAX
             && let Some(dir) = w.brief_file.parent()
@@ -233,6 +256,57 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
     }
 
     #[test]
+    fn only_the_git_coder_may_run_git_writes_and_gh() {
+        let files = std::env::temp_dir().join(format!("jgt-agy-git-{}", std::process::id()));
+        for skill in crate::team::WORKER_SKILLS {
+            let dir = files.join("plugin/skills").join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), format!("---\nname: {skill}\n---\n\n# {skill}\n")).unwrap();
+        }
+        let plan = |skill: &str| {
+            let mut settings = Config::default().team.for_skill(skill, Path::new("/nonexistent"));
+            settings.harness = Harness::Antigravity;
+            let title = format!("{skill} · x");
+            let w = WorkerLaunch {
+                program: "/bin/agy".into(),
+                exe: "/bin/jg-team-dev".into(),
+                files: &files,
+                skill,
+                title: &title,
+                brief: "Fix it.",
+                brief_file: Path::new("/b.md"),
+                settings: &settings,
+                cwd: Path::new("/w"),
+                session_id: "uuid",
+                env: vec![],
+            };
+            Antigravity.worker(&w).unwrap()
+        };
+
+        // Every other worker is denied the plain git write steps and gh in `--settings`, and the
+        // prompt covers the `git -C` form agy cannot deny without denying read-only `git -C`.
+        for skill in ["coder", "reviewer"] {
+            let plan = plan(skill);
+            let i = plan.args.iter().position(|a| a == "--settings").unwrap_or_else(|| panic!("{skill}: no --settings"));
+            let settings: Value = serde_json::from_str(&plan.args[i + 1]).unwrap();
+            let deny: Vec<&str> =
+                settings["permissions"]["deny"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+            for sub in crate::team::GIT_WRITE_SUBCOMMANDS {
+                assert!(deny.contains(&format!("command(git {sub})").as_str()), "{skill}: {deny:?}");
+            }
+            assert!(deny.contains(&"command(gh)"), "{skill}: {deny:?}");
+            assert!(!deny.iter().any(|rule| rule.starts_with("command(git -C")), "{deny:?}");
+            let prompt = &plan.args[1];
+            assert!(prompt.contains("not even with git -C <path>"), "{skill}: {prompt}");
+        }
+        // The git-coder gets no deny settings.
+        let git_coder = plan("git-coder");
+        assert!(!git_coder.args.iter().any(|a| a == "--settings"), "{:?}", git_coder.args);
+        assert!(git_coder.args[1].contains("you are the only worker allowed to run the git write commands"), "{}", git_coder.args[1]);
+        let _ = std::fs::remove_dir_all(&files);
+    }
+
+    #[test]
     fn workers_get_the_skill_inline_and_only_known_flags() {
         let files = std::env::temp_dir().join(format!("jgt-agy-{}", std::process::id()));
         let skill = files.join("plugin/skills/coder");
@@ -259,9 +333,13 @@ gpt-oss-120b-medium\tGPT-OSS 120B (Medium)
         assert!(!prompt.contains("name: coder"));
         assert!(prompt.contains("short recap of the steps"), "{prompt}");
         assert_eq!(
-            plan.args[2..],
-            ["--output-format", "json", "--model", "gemini-3.8-flash-medium", "--effort", "medium", "--mode", "auto", "--print-timeout", "2h"]
+            &plan.args[2..10],
+            ["--output-format", "json", "--model", "gemini-3.8-flash-medium", "--effort", "medium", "--mode", "auto"]
         );
+        assert_eq!(plan.args[10], "--settings");
+        let settings: Value = serde_json::from_str(&plan.args[11]).unwrap();
+        assert!(settings["permissions"]["deny"].as_array().unwrap().contains(&serde_json::json!("command(git commit)")));
+        assert_eq!(&plan.args[12..], ["--print-timeout", "2h"]);
         assert_eq!(plan.path_prepend.as_deref(), Some(Path::new("/home/u/.local/bin")));
         let _ = std::fs::remove_dir_all(&files);
     }

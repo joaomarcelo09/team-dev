@@ -78,6 +78,7 @@ impl ClaudeCode {
             settings.effort = effort.clone();
         }
         args.extend(session_args(&crate::team::files_dir(), &title, &settings));
+        args.extend(crate::team::git_permission_args(&role));
         let mut env = vec![(ROLE_ENV.to_string(), role)];
         if let Some(parent) = &s.parent_id {
             env.push((PARENT_ENV.into(), parent.clone()));
@@ -120,6 +121,7 @@ impl HarnessAdapter for ClaudeCode {
         let mut args = vec!["-p".to_string(), prompt];
         args.extend(["--session-id".into(), w.session_id.to_string(), "--output-format".into(), "json".into()]);
         args.extend(session_args(w.files, w.title, w.settings));
+        args.extend(crate::team::git_permission_args(w.skill));
         Ok(LaunchPlan {
             program: w.program.clone(),
             args,
@@ -199,8 +201,52 @@ mod tests {
         let plan = ClaudeCode.worker(&w).unwrap();
         let args = plan.args.join(" ");
         assert!(args.starts_with("-p /jg-team-dev:reviewer check it --session-id uuid --output-format json --model opus --effort medium"), "{args}");
-        assert!(args.ends_with("--plugin-dir /f/plugin -n reviewer · x"), "{args}");
+        assert!(args.ends_with("--disallowedTools Bash(gh*)"), "{args}");
+        assert!(args.contains("--plugin-dir /f/plugin -n reviewer · x"), "{args}");
         assert_eq!((plan.cwd.as_deref(), plan.path_prepend, plan.env.len()), (Some(Path::new("/w")), None, 1));
+    }
+
+    #[test]
+    fn only_the_git_coder_may_run_git_writes_and_gh() {
+        let plan = |skill: &str| {
+            let mut settings = Config::default().team.for_skill(skill, Path::new("/nonexistent"));
+            settings.harness = Harness::ClaudeCode;
+            let title = format!("{skill} · x");
+            let w = WorkerLaunch {
+                program: "/bin/claude".into(),
+                exe: "/bin/jg-team-dev".into(),
+                files: Path::new("/f"),
+                skill,
+                title: &title,
+                brief: "do it",
+                brief_file: Path::new("/b.md"),
+                settings: &settings,
+                cwd: Path::new("/w"),
+                session_id: "uuid",
+                env: vec![(ROLE_ENV.into(), skill.into())],
+            };
+            ClaudeCode.worker(&w).unwrap().args.join(" ")
+        };
+
+        // The git-coder is allowed to run the git write steps and gh.
+        let git_coder = plan("git-coder");
+        for tool in crate::team::git_write_tools() {
+            assert!(git_coder.contains(&format!("--allowedTools {tool}")), "{git_coder}");
+            assert!(!git_coder.contains(&format!("--disallowedTools {tool}")), "{git_coder}");
+        }
+        // Every other worker is denied them.
+        for skill in ["coder", "reviewer"] {
+            let args = plan(skill);
+            for tool in crate::team::git_write_tools() {
+                assert!(args.contains(&format!("--disallowedTools {tool}")), "{skill}: {args}");
+                assert!(!args.contains(&format!("--allowedTools {tool}")), "{skill}: {args}");
+            }
+            // The documented worktree form (`git -C <path> commit`) is denied too.
+            assert!(args.contains("--disallowedTools Bash(git -C * commit*)"), "{skill}: {args}");
+            assert!(args.contains("--disallowedTools Bash(git -c * push*)"), "{skill}: {args}");
+            assert!(args.contains("--disallowedTools Bash(git --no-pager reset --hard*)"), "{skill}: {args}");
+            assert!(!args.contains("Bash(git -C:*)"), "{skill}: {args}");
+        }
     }
 
     #[test]

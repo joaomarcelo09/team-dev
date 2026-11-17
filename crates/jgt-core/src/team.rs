@@ -22,17 +22,105 @@ pub const SESSION_ENV: &str = "JGT_SESSION";
 pub const TASK_ENV: &str = "JGT_TASK";
 
 /// Worker skills a Coordinator can start (`jg-team-dev worker <skill>`).
-pub const WORKER_SKILLS: &[&str] = &["coder", "reviewer"];
+pub const WORKER_SKILLS: &[&str] = &["coder", "reviewer", "git-coder"];
+
+/// The worker skill allowed to change git state: it alone commits, pushes, opens and merges the
+/// pull request (and so runs `gh`).
+pub const GIT_CODER: &str = "git-coder";
+
+/// The git write steps only the git-coder may run.
+pub const GIT_WRITE_SUBCOMMANDS: &[&str] = &["commit", "push", "merge", "rebase", "reset --hard"];
+
+/// The bash commands only the git-coder may run: the git write steps and the `gh` CLI. OpenCode's
+/// permission rules take them as globs; Claude Code takes them through [`git_write_tools`], and
+/// Antigravity through [`git_permission_settings`].
+///
+/// The `-C` and `-c` forms are the ones the team's worktree workflow uses (`git -C <worktree>
+/// commit`), and `--no-pager` is a common option before the subcommand. A wildcard covers the
+/// options after `-C`/`-c`, so `git -C * commit*` also matches `git -C <path> -c k=v commit`.
+pub const GIT_WRITE_GLOBS: &[&str] = &[
+    "git commit*",
+    "git -C * commit*",
+    "git -c * commit*",
+    "git --no-pager commit*",
+    "git --no-pager -C * commit*",
+    "git --no-pager -c * commit*",
+    "git push*",
+    "git -C * push*",
+    "git -c * push*",
+    "git --no-pager push*",
+    "git --no-pager -C * push*",
+    "git --no-pager -c * push*",
+    "git merge*",
+    "git -C * merge*",
+    "git -c * merge*",
+    "git --no-pager merge*",
+    "git --no-pager -C * merge*",
+    "git --no-pager -c * merge*",
+    "git rebase*",
+    "git -C * rebase*",
+    "git -c * rebase*",
+    "git --no-pager rebase*",
+    "git --no-pager -C * rebase*",
+    "git --no-pager -c * rebase*",
+    "git reset --hard*",
+    "git -C * reset --hard*",
+    "git -c * reset --hard*",
+    "git --no-pager reset --hard*",
+    "git --no-pager -C * reset --hard*",
+    "git --no-pager -c * reset --hard*",
+    "gh*",
+];
+
+/// Whether `skill` may run [`GIT_WRITE_GLOBS`]: only the git-coder.
+pub fn may_run_git(skill: &str) -> bool {
+    skill == GIT_CODER
+}
+
+/// [`GIT_WRITE_GLOBS`] as Claude Code Bash rules (`Bash(git commit*)`, `Bash(git -C * commit*)`).
+///
+/// Claude Code matches a rule with a `*` as a wildcard. A trailing `:*` is its prefix syntax, but
+/// when the same rule also holds a `*` it is matched literally (checked in Claude Code's rule
+/// validator), so the wildcard form is the one that covers the `-C`/`-c` patterns.
+pub fn git_write_tools() -> Vec<String> {
+    GIT_WRITE_GLOBS.iter().map(|glob| format!("Bash({glob})")).collect()
+}
+
+/// `--allowedTools`/`--disallowedTools` flags for a role's git policy: allowed for the git-coder,
+/// denied for every other role (the Coordinator included).
+pub fn git_permission_args(skill: &str) -> Vec<String> {
+    let flag = if may_run_git(skill) { "--allowedTools" } else { "--disallowedTools" };
+    git_write_tools().into_iter().flat_map(|tool| [flag.to_string(), tool]).collect()
+}
+
+/// Antigravity's session settings that deny the git write steps and `gh` to a non-git-coder role,
+/// or `None` for the git-coder. Antigravity matches `command(...)` as a command prefix, so these
+/// cover `git commit -m …` but not options before the subcommand (`git -C <path> commit`): denying
+/// `command(git -C)` would also deny read-only `git -C <path> status`, so that form stays prompt-
+/// enforced (see README).
+pub fn git_permission_settings(skill: &str) -> Option<String> {
+    if may_run_git(skill) {
+        return None;
+    }
+    let mut deny: Vec<String> =
+        GIT_WRITE_SUBCOMMANDS.iter().map(|sub| format!("command(git {sub})")).collect();
+    deny.push("command(gh)".into());
+    Some(serde_json::json!({ "permissions": { "deny": deny } }).to_string())
+}
 
 /// Where `settings.json`, `mcp.json` and `plugin/` for team sessions are written.
 pub fn files_dir() -> PathBuf {
     paths::data_dir().join("claude")
 }
 
-/// Claude Code flags for a Coordinator in `folder`, without `--bg` and the prompt.
+/// Claude Code flags for a Coordinator in `folder`, without `--bg` and the prompt. The Coordinator
+/// gets the git write commands denied like every other non-git-coder role.
 pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<String> {
     let name = folder.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "project".into());
-    session_args_for_role(files, &format!("{COORDINATOR} · {name}"), &config.team.for_skill(COORDINATOR, folder), Some(COORDINATOR))
+    let mut args =
+        session_args_for_role(files, &format!("{COORDINATOR} · {name}"), &config.team.for_skill(COORDINATOR, folder), Some(COORDINATOR));
+    args.extend(git_permission_args(COORDINATOR));
+    args
 }
 
 /// Chat title of a worker: `<skill> · <task>`.
@@ -242,7 +330,15 @@ mod tests {
         assert!(args.starts_with("--model opus --effort medium --permission-mode auto"));
         assert!(args.contains("--settings /data/claude/settings-coordinator.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
         assert!(args.contains("--setting-sources project,local --plugin-dir /data/claude/plugin"));
-        assert!(args.ends_with("-n coordinator · app"));
+        assert!(args.contains("-n coordinator · app"));
+        // The Coordinator is denied the git write steps and gh like every non-git-coder role.
+        for tool in git_write_tools() {
+            assert!(args.contains(&format!("--disallowedTools {tool}")), "{tool}: {args}");
+            assert!(!args.contains(&format!("--allowedTools {tool}")), "{tool}: {args}");
+        }
+        // Read-only git and `git worktree add` stay allowed: no rule denies them.
+        assert!(!args.contains("--disallowedTools Bash(git worktree"), "{args}");
+        assert!(!args.contains("--disallowedTools Bash(git status"), "{args}");
     }
 
     #[test]
@@ -277,6 +373,59 @@ mod tests {
         let args = session_args(Path::new("/f"), "t", &settings);
         let tail = &args[args.len() - 6..];
         assert_eq!(tail, ["--allowedTools", "Bash(cargo test:*)", "--allowedTools", "Read", "--disallowedTools", "WebFetch"]);
+    }
+
+    #[test]
+    fn only_the_git_coder_may_run_git_writes_and_gh() {
+        assert!(may_run_git(GIT_CODER));
+        for skill in ["coder", "reviewer", "coordinator", ""] {
+            assert!(!may_run_git(skill), "{skill}");
+        }
+        assert!(GIT_WRITE_GLOBS.contains(&"git commit*") && GIT_WRITE_GLOBS.contains(&"gh*"));
+        let tools = git_write_tools();
+        assert!(tools.contains(&"Bash(git commit*)".to_string()));
+        assert!(tools.contains(&"Bash(gh*)".to_string()));
+        // No `:*` prefix rules: Claude Code reads them literally when the rule holds a wildcard.
+        assert!(tools.iter().all(|tool| !tool.contains(":*")), "{tools:?}");
+        let denied = git_permission_args("coder").join(" ");
+        assert!(denied.contains("--disallowedTools Bash(git -C * commit*)"), "{denied}");
+        let allowed = git_permission_args(GIT_CODER).join(" ");
+        assert!(allowed.contains("--allowedTools Bash(git -C * commit*)"), "{allowed}");
+        assert!(!allowed.contains("--disallowedTools"), "{allowed}");
+    }
+
+    #[test]
+    fn git_write_rules_cover_options_before_the_subcommand() {
+        for sub in GIT_WRITE_SUBCOMMANDS {
+            for glob in [
+                format!("git {sub}*"),
+                format!("git -C * {sub}*"),
+                format!("git -c * {sub}*"),
+                format!("git --no-pager {sub}*"),
+                format!("git --no-pager -C * {sub}*"),
+                format!("git --no-pager -c * {sub}*"),
+            ] {
+                assert!(GIT_WRITE_GLOBS.contains(&glob.as_str()), "{glob} missing");
+            }
+        }
+        // Read-only git is not denied.
+        for glob in GIT_WRITE_GLOBS {
+            assert!(!glob.contains("worktree") && !glob.contains("status") && !glob.contains("log"), "{glob}");
+        }
+    }
+
+    #[test]
+    fn antigravity_denies_only_plain_git_write_commands() {
+        assert!(git_permission_settings(GIT_CODER).is_none());
+        let settings: serde_json::Value = serde_json::from_str(&git_permission_settings("coder").unwrap()).unwrap();
+        let deny: Vec<&str> =
+            settings["permissions"]["deny"].as_array().unwrap().iter().filter_map(|v| v.as_str()).collect();
+        for sub in GIT_WRITE_SUBCOMMANDS {
+            assert!(deny.contains(&format!("command(git {sub})").as_str()), "{deny:?}");
+        }
+        assert!(deny.contains(&"command(gh)"), "{deny:?}");
+        // A blanket `command(git -C)` would also deny read-only `git -C <path> status`.
+        assert!(!deny.iter().any(|rule| rule.starts_with("command(git -C")), "{deny:?}");
     }
 
     #[test]

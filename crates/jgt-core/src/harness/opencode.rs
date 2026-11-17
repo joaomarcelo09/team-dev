@@ -127,14 +127,15 @@ fn agent(skill: &str) -> String {
 }
 
 /// What `OPENCODE_CONFIG_CONTENT` adds for a worker: our MCP server, told the worker's id, and
-/// deny rules for the git commands no worker may run: the Coordinator does the git steps
-/// (PRD Q8: no routing, `--auto`).
-fn inline_config(exe: &Path, session_id: &str) -> Value {
+/// deny rules for the git commands only the git-coder may run (PRD Q8: no routing, `--auto`).
+fn inline_config(exe: &Path, session_id: &str, skill: &str) -> Value {
     let mut bash = serde_json::Map::new();
-    // Checked with `opencode debug agent`: each becomes a `bash` rule with this glob pattern,
-    // after the `*` allow, so it wins.
-    for cmd in ["git commit*", "git push*", "git merge*", "git rebase*", "git reset --hard*"] {
-        bash.insert(cmd.into(), json!("deny"));
+    if !crate::team::may_run_git(skill) {
+        // Checked with `opencode debug agent`: each becomes a `bash` rule with this glob pattern,
+        // after the `*` allow, so it wins.
+        for cmd in crate::team::GIT_WRITE_GLOBS {
+            bash.insert((*cmd).into(), json!("deny"));
+        }
     }
     // Everything else is approved by `--auto`, so no catch-all rule (whose place in the
     // matching order is unverified).
@@ -177,7 +178,13 @@ impl HarnessAdapter for Opencode {
         let agents = config_dir(files).join("agents");
         std::fs::create_dir_all(&agents)?;
         for skill in WORKER_SKILLS {
-            let body = skill_text(files, skill)?;
+            // The CLI that writes the plugin may not bundle every worker skill in this version
+            // (the git-coder skill comes in its own piece); install the ones it wrote.
+            let body = match skill_text(files, skill) {
+                Ok(body) => body,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
             // `opencode debug agent` reads these as name, description, mode and the body as the prompt.
             let text = format!("---\ndescription: jg-team-dev {skill} worker\nmode: primary\n---\n\n{body}\n");
             std::fs::write(agents.join(format!("{}.md", agent(skill))), text)?;
@@ -210,7 +217,7 @@ impl HarnessAdapter for Opencode {
         env.push(("OPENCODE_CONFIG_DIR".into(), config_dir(w.files).to_string_lossy().into_owned()));
         // OpenCode v2.3 reads its working directory from `PWD`, not the process cwd.
         env.push(("PWD".into(), w.cwd.to_string_lossy().into_owned()));
-        env.push(("OPENCODE_CONFIG_CONTENT".into(), inline_config(&w.exe, w.session_id).to_string()));
+        env.push(("OPENCODE_CONFIG_CONTENT".into(), inline_config(&w.exe, w.session_id, w.skill).to_string()));
         env.push((SESSION_ENV.into(), w.session_id.to_string()));
         Ok(LaunchPlan {
             program: w.program.clone(),
@@ -458,6 +465,57 @@ deepseek/deepseek-chat
         let err_v23 = r#"{"type":"error","timestamp":1794861204926,"sessionID":"ses_e19ef7a5affejSzt6NdXD4wZro","error":{"type":"provider.no-route","message":"Model unavailable: invalid/nonexistent"}}"#;
         let o_err23 = Opencode.parse_result(err_v23, "", false);
         assert_eq!((o_err23.ok, o_err23.text.as_str()), (false, "provider.no-route: Model unavailable: invalid/nonexistent"));
+    }
+
+    #[test]
+    fn install_skips_skills_the_cli_has_not_written_yet() {
+        let files = std::env::temp_dir().join(format!("jgt-oc-skip-{}", std::process::id()));
+        let coder = files.join("plugin/skills/coder");
+        std::fs::create_dir_all(&coder).unwrap();
+        std::fs::write(coder.join("SKILL.md"), "---\nname: coder\n---\n\n# coder\n").unwrap();
+        Opencode.install(&files).unwrap();
+        assert!(files.join("opencode/agents/jgt-coder.md").is_file());
+        assert!(!files.join("opencode/agents/jgt-git-coder.md").exists());
+        let _ = std::fs::remove_dir_all(&files);
+    }
+
+    #[test]
+    fn only_the_git_coder_may_run_git_writes_and_gh() {
+        let inline = |skill: &str| {
+            let mut settings = Config::default().team.for_skill(skill, Path::new("/nonexistent"));
+            settings.harness = Harness::Opencode;
+            let w = WorkerLaunch {
+                program: "/bin/opencode".into(),
+                exe: "/bin/jg-team-dev".into(),
+                files: Path::new("/f"),
+                skill,
+                title: "t",
+                brief: "b",
+                brief_file: Path::new("/b.md"),
+                settings: &settings,
+                cwd: Path::new("/w"),
+                session_id: "uuid",
+                env: vec![],
+            };
+            let plan = Opencode.worker(&w).unwrap();
+            let text = plan.env.iter().find(|(k, _)| k == "OPENCODE_CONFIG_CONTENT").unwrap().1.clone();
+            serde_json::from_str::<Value>(&text).unwrap()
+        };
+
+        // Every other worker is denied the git write steps and gh.
+        for skill in ["coder", "reviewer"] {
+            let config = inline(skill);
+            for glob in crate::team::GIT_WRITE_GLOBS {
+                assert_eq!(config["permission"]["bash"][*glob], "deny", "{skill}: {glob}");
+            }
+            // The documented worktree and option forms are covered.
+            assert_eq!(config["permission"]["bash"]["git -C * commit*"], "deny", "{skill}");
+            assert_eq!(config["permission"]["bash"]["git -c * push*"], "deny", "{skill}");
+            assert_eq!(config["permission"]["bash"]["git --no-pager merge*"], "deny", "{skill}");
+        }
+        // The git-coder has no deny rule; `--auto` lets it run them.
+        let git_coder = inline("git-coder");
+        assert_eq!(git_coder["permission"]["bash"], json!({}));
     }
 
     #[test]

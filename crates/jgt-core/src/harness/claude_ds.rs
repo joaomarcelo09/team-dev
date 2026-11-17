@@ -118,21 +118,26 @@ mod tests {
     use crate::{config::SessionSettings, team::ROLE_ENV};
     use std::path::Path;
 
-    fn launch_plan(settings: &SessionSettings) -> LaunchPlan {
+    fn launch_plan_for(skill: &str, settings: &SessionSettings) -> LaunchPlan {
+        let title = format!("{skill} · x");
         let w = WorkerLaunch {
             program: "/bin/claude".into(),
             exe: "/bin/jg-team-dev".into(),
             files: Path::new("/f"),
-            skill: "coder",
-            title: "coder · x",
+            skill,
+            title: &title,
             brief: "do it",
             brief_file: Path::new("/b.md"),
             settings,
             cwd: Path::new("/w"),
             session_id: "uuid",
-            env: vec![(ROLE_ENV.into(), "coder".into())],
+            env: vec![(ROLE_ENV.into(), skill.into())],
         };
         ClaudeDs.worker(&w).unwrap()
+    }
+
+    fn launch_plan(settings: &SessionSettings) -> LaunchPlan {
+        launch_plan_for("coder", settings)
     }
 
     fn settings(model: &str) -> SessionSettings {
@@ -161,10 +166,29 @@ mod tests {
         assert!(args.starts_with("-p /jg-team-dev:coder do it --session-id uuid --output-format json --effort medium"), "{args}");
         assert!(!plan.args.contains(&"--model".to_string()), "{args}");
         assert!(args.contains("--setting-sources user,project,local"), "{args}");
-        assert!(args.ends_with("--plugin-dir /f/plugin -n coder · x"), "{args}");
+        assert!(args.contains("--plugin-dir /f/plugin -n coder · x"), "{args}");
+        assert!(args.ends_with("--disallowedTools Bash(gh*)"), "{args}");
         assert!(plan.env.iter().any(|(k, v)| k == CONFIG_DIR_ENV && !v.is_empty()), "{:?}", plan.env);
         assert!(plan.env.contains(&(ROLE_ENV.into(), "coder".into())));
         assert_eq!(plan.env_remove, ["ANTHROPIC_API_KEY"]);
+    }
+
+    #[test]
+    fn only_the_git_coder_may_run_git_writes_and_gh() {
+        let mut git_coder = Config::default().team.for_skill("git-coder", Path::new("/nonexistent"));
+        git_coder.harness = Harness::ClaudeDs;
+        let args = launch_plan_for("git-coder", &git_coder).args.join(" ");
+        for tool in crate::team::git_write_tools() {
+            assert!(args.contains(&format!("--allowedTools {tool}")), "{args}");
+        }
+        for skill in ["coder", "reviewer"] {
+            let mut settings = Config::default().team.for_skill(skill, Path::new("/nonexistent"));
+            settings.harness = Harness::ClaudeDs;
+            let args = launch_plan_for(skill, &settings).args.join(" ");
+            for tool in crate::team::git_write_tools() {
+                assert!(args.contains(&format!("--disallowedTools {tool}")), "{skill}: {args}");
+            }
+        }
     }
 
     #[test]

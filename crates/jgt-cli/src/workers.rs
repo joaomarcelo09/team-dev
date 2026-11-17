@@ -26,7 +26,7 @@ use std::{
 
 #[derive(clap::Args)]
 pub struct WorkerArgs {
-    /// coder or reviewer.
+    /// coder, reviewer or git-coder.
     pub skill: String,
     /// Short task title, shown as the worker's chat title (`<skill> · <task>`).
     #[arg(long)]
@@ -939,11 +939,15 @@ mod tests {
         };
         let mut all = vec![
             session("r1", "c1", "reviewer", "active"),
+            session("g1", "c1", "git-coder", "active"),
             session("d1", "c1", "coder", "disconnected"),
             session("e1", "c1", "coder", "ended"),
             session("o1", "c2", "coder", "active"),
         ];
-        assert!(running_coder(&all, "c1", |_| true).is_none(), "reviewers, finished coders and other teams do not count");
+        assert!(
+            running_coder(&all, "c1", |_| true).is_none(),
+            "reviewers, git-coders, finished coders and other teams do not count"
+        );
         all.push(session("k1", "c1", "coder", "idle"));
         assert_eq!(running_coder(&all, "c1", |_| true).map(|s| s.id.as_str()), Some("k1"));
         assert!(running_coder(&all, "c1", |_| false).is_none(), "a dead process does not count");
@@ -1182,6 +1186,40 @@ mod tests {
         args.main_worktree = false;
         args.cwd = Some("/elsewhere".into());
         assert_eq!(task_worktree(&args, Some(&task)), None);
+    }
+
+    #[test]
+    fn a_git_coder_starts_in_its_tasks_worktree_on_its_own_settings() {
+        let args = WorkerArgs {
+            skill: "git-coder".into(),
+            task: "push it".into(),
+            brief_file: None,
+            cwd: None,
+            worktree: None,
+            main_worktree: false,
+            parent: None,
+            run: None,
+            task_id: Some("JGT-12".into()),
+            model: None,
+            effort: None,
+            brief: vec![],
+        };
+        let task = Task::new("/w", 12, "push it", jgt_core::TaskStatus::ToMerge);
+        // The CLI can start it, and it works in the task's worktree like a coder.
+        assert!(WORKER_SKILLS.contains(&args.skill.as_str()));
+        assert_eq!(task_worktree(&args, Some(&task)).as_deref(), Some("jgt-12"));
+        // It runs on the git-coder role's settings, not the coder's.
+        let config = Config::default();
+        let (settings, notes) = pick_settings(
+            config.team.for_skill_checked("git-coder", Path::new("/nonexistent")),
+            "git-coder",
+            None,
+            None,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(settings.describe("git-coder"), "git-coder · Claude Code · sonnet · low");
+        assert!(notes.is_empty(), "{notes:?}");
     }
 
     #[test]
