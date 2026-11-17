@@ -1150,6 +1150,41 @@ mod board {
     }
 
     #[test]
+    fn a_git_coder_worker_starts_and_finishes_on_the_card() {
+        let t = team();
+        let task = t.working("push it");
+        let git_coder = session(&t.hub, "git-coder", "git-coder", WS, Some(&t.coord.id));
+
+        // The Coordinator starts it: the card shows the git-coder as its current worker.
+        t.hub
+            .add_task_event(&task.id, None, &TaskEventRequest {
+                actor: t.coordinator(),
+                kind: TaskEventKind::WorkerStarted,
+                body: "git-coder started".into(),
+                meta: serde_json::json!({ "worker": git_coder.id.clone(), "skill": "git-coder" }),
+            })
+            .unwrap();
+        assert_eq!(t.get(&task).current_worker.as_deref(), Some(git_coder.id.as_str()));
+
+        // It is a worker, not a second Coordinator: it reads the Board but cannot change it.
+        assert!(git_coder.is_worker());
+        let mut req = PatchTaskRequest::new(as_session(&git_coder));
+        req.details = Some("x".into());
+        forbidden(t.hub.patch_task(&task.id, None, &req));
+
+        // Its own finish clears the card's current worker.
+        t.hub
+            .add_task_event(&task.id, None, &TaskEventRequest {
+                actor: as_session(&git_coder),
+                kind: TaskEventKind::WorkerFinished,
+                body: "git-coder finished".into(),
+                meta: serde_json::json!({ "worker": git_coder.id.clone(), "skill": "git-coder", "ok": true }),
+            })
+            .unwrap();
+        assert_eq!(t.get(&task).current_worker, None);
+    }
+
+    #[test]
     fn only_the_workspace_coordinator_acts_as_coordinator() {
         let t = team();
         let elsewhere = session(&t.hub, "coord2", jgt_core::COORDINATOR, "/tmp/jgt-board-test/other", None);
@@ -2311,7 +2346,7 @@ mod board {
         assert_eq!(msgs.len(), before + 1);
         let expected_msg = format!(
             "[jg-team-dev] Task {} \"stalled feature\" has sat in Working for 10 min with no worker running. \
-             Take the next step of the flow now (test_result → review → reviewer → review_result → Done → run the git steps yourself), \
+             Take the next step of the flow now (test_result → review → reviewer → review_result → Done → git-coder), \
              or tell the user what blocks it.",
             task.key
         );
@@ -3210,7 +3245,7 @@ mod board {
         let msgs = inbox(&t.hub, &t.coord);
         let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit")).expect("coordinator message");
         let expected = format!(
-            "[jg-team-dev] The user moved {} from Review to To push: their OK to commit. Branch: jgt/jgt-1. Run them yourself now.",
+            "[jg-team-dev] The user moved {} from Review to To push: their OK to commit. Branch: jgt/jgt-1. Run them with the git-coder now.",
             resp.task.key
         );
         assert_eq!(coord_msg.body, expected);
@@ -3227,7 +3262,7 @@ mod board {
         let msgs2 = inbox(&t.hub, &t.coord);
         let coord_msg2 = msgs2.iter().find(|m| m.body.contains("their OK to commit, push, open_pr, merge_pr")).expect("coordinator message");
         let expected2 = format!(
-            "[jg-team-dev] The user moved {} from Review to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-2. Run them yourself now.",
+            "[jg-team-dev] The user moved {} from Review to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-2. Run them with the git-coder now.",
             resp2.task.key
         );
         assert_eq!(coord_msg2.body, expected2);
@@ -3273,7 +3308,7 @@ mod board {
         let msgs = inbox(&t.hub, &t.coord);
         let coord_msg = msgs.iter().find(|m| m.body.contains("their OK to commit, push, open_pr, merge_pr")).expect("coordinator message");
         let expected = format!(
-            "[jg-team-dev] The user moved {} from To commit to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-1. Run them yourself now.",
+            "[jg-team-dev] The user moved {} from To commit to Done: their OK to commit, push, open_pr, merge_pr. Branch: jgt/jgt-1. Run them with the git-coder now.",
             resp.task.key
         );
         assert_eq!(coord_msg.body, expected);

@@ -74,6 +74,7 @@ const SKILLS: &[(&str, &str)] = &[
     ("coordinator", include_str!("../../../skills/coordinator/SKILL.md")),
     ("coder", include_str!("../../../skills/coder/SKILL.md")),
     ("reviewer", include_str!("../../../skills/reviewer/SKILL.md")),
+    ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),
 ];
 
 /// Writes the plugin (manifest + skills) into `dir`, replacing what an older version wrote.
@@ -672,6 +673,13 @@ mod tests {
         assert_eq!(meta["name"], PLUGIN_NAME);
         let skill = std::fs::read_to_string(dir.join("skills/coordinator/SKILL.md")).unwrap();
         assert!(skill.starts_with("---\nname: coordinator\n"));
+        // Every worker skill is bundled, the git-coder included: the plugin is what its harness
+        // reads, and OpenCode's agent files come from these.
+        for skill in jgt_core::team::WORKER_SKILLS {
+            let path = dir.join("skills").join(*skill).join("SKILL.md");
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            assert!(text.starts_with(&format!("---\nname: {skill}\n")), "{text}");
+        }
         // A skill an older version wrote is removed on the next write.
         std::fs::create_dir_all(dir.join("skills/old-role")).unwrap();
         write_plugin(&dir).unwrap();
@@ -729,7 +737,10 @@ mod tests {
         assert!(args.contains("--model opus --effort medium --permission-mode auto"));
         assert!(args.contains("--settings /data/claude/settings-coordinator.json --mcp-config /data/claude/mcp.json --strict-mcp-config"));
         assert!(args.contains("--setting-sources project,local --plugin-dir /data/claude/plugin"));
-        assert!(args.ends_with("-n coordinator · app"));
+        assert!(args.contains("-n coordinator · app"));
+        assert!(args.contains("--disallowedTools Bash(git commit*)"));
+        assert!(args.contains("--disallowedTools Bash(git -C * commit*)"));
+        assert!(args.ends_with("--disallowedTools Bash(gh*)"));
         assert_eq!(plan.cwd.as_deref(), Some(Path::new("/work/app")));
         assert_eq!(plan.env, vec![("JGT_ROLE".to_string(), "coordinator".to_string())]);
     }

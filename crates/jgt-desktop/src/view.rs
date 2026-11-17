@@ -534,6 +534,7 @@ pub const AGENT_ROLES: &[&str] = &[
     jgt_core::COORDINATOR,
     "coder",
     "reviewer",
+    "git-coder",
 ];
 
 pub(crate) fn agents_section(app: &App) -> Element<'_, Msg> {
@@ -2582,6 +2583,51 @@ mod tests {
         app.agents_locked = Some(TeamAgents { roles });
 
         assert!(app.agents_locked.is_some());
+        let _ = agents_section(&app);
+        let _ = settings(&app);
+        let _ = view(&app);
+    }
+
+    #[test]
+    fn test_settings_agents_git_coder_row_renders() {
+        use jgt_core::TeamAgents;
+
+        assert!(AGENT_ROLES.contains(&"git-coder"));
+        let (mut app, _) = App::new(None);
+        app.show_settings = true;
+        app.installed_harnesses = vec![Harness::ClaudeCode, Harness::Opencode];
+        app.agents = AGENT_ROLES
+            .iter()
+            .map(|&role| AgentRow {
+                role: role.to_string(),
+                harness: if role == "git-coder" { Harness::ClaudeCode } else { Harness::Opencode },
+                model: if role == "git-coder" { "sonnet".into() } else { "custom-model".into() },
+                effort: if role == "git-coder" { "low".into() } else { "high".into() },
+            })
+            .collect();
+
+        let git_coder = app.agents.iter().find(|a| a.role == "git-coder").unwrap();
+        assert_eq!(
+            (git_coder.harness, git_coder.model.as_str(), git_coder.effort.as_str()),
+            (Harness::ClaudeCode, "sonnet", "low")
+        );
+        // Its effort control uses the same per-harness levels as every other role.
+        assert!(jgt_core::harness::effort_levels(git_coder.harness).contains(&git_coder.effort.as_str()));
+        let _ = agents_section(&app);
+        let _ = settings(&app);
+
+        // Locked to a running team: the row comes from its saved agents.
+        app.agents.clear();
+        let mut roles = std::collections::BTreeMap::new();
+        roles.insert(
+            "git-coder".to_string(),
+            jgt_core::AgentSetting {
+                harness: Harness::ClaudeCode,
+                model: "sonnet".into(),
+                effort: "low".into(),
+            },
+        );
+        app.agents_locked = Some(TeamAgents { roles });
         let _ = agents_section(&app);
         let _ = settings(&app);
         let _ = view(&app);
