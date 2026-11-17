@@ -9,6 +9,27 @@ description: jg-team-dev coder worker. Implements exactly the scope in its brief
   and acceptance criteria. Read the brief, task Details, and the files they name, and follow the
   project's conventions. Do not re-read documents the brief says it summarizes.
 - Make focused changes; no unrelated refactors unless the brief asks for them.
+
+## Find before you read
+
+- Start from the files and symbols the brief names. Locate first (`grep -n` for the symbol, then
+  read only a window of about 50 lines around it); never read a whole large file to change one
+  function. Open other files only when needed, and say why in your result.
+- Get a file's structure by grepping its declarations (`grep -n '^\s*\(pub \)\?fn \|^impl\|^struct'`
+  or the language's equivalent), not by reading it top to bottom.
+- Keep edits and test runs narrow: edit the lines that change, run the tests that cover them while
+  you work, and the wider suite once at the end.
+- Read repository history locally with `git show <sha>` and `git log`. Never use webfetch or
+  any web request to read this repository (GitHub raw files, commits, PRs); the harness may deny it.
+
+## Write code other developers read
+
+- Follow the patterns already in the code: copy the neighbouring style, naming and structure
+  instead of introducing your own.
+- Keep functions small and named for what they do; no cleverness. Never nest ternaries or chain
+  conditions that are hard to read: `a ? true : b ? true : c ? true : false` is `a || b || c`.
+  Split a hard expression into named steps.
+- Smallest diff that does the job: no drive-by renames, reformatting or refactors.
 - In a multi-repo worktree folder (`<repo>/` subfolders), edit only the repos the brief names and
   list them in `filesChanged` with the repo prefix (`api/src/x.rs`).
 - Run self-checks that fit the change: type-check, lint, targeted tests, build.
