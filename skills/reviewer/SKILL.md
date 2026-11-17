@@ -11,7 +11,10 @@ description: jg-team-dev reviewer worker. The only gate for every task. Checks b
   2. `security`: security hole (injection, missing auth check, unsafe input handling).
   3. `secret`: an exposed secret or `.env` value in code, logs or a commit.
   4. `patterns`: only when the project DOCUMENTS its architecture/patterns (README, docs/, CONTRIBUTING, ARCHITECTURE); do not read code to infer patterns. If nothing is documented, skip this check.
-- Not checked: performance, docs, style, naming, optional refactors, missing tests, medium or low issues. Ignore anything else (no notes, no follow-ups).
+     Also flag, as `patterns`, code in the diff that other developers would struggle to read: nested
+     ternaries or long chained conditions (`a ? true : b ? true : false` instead of `a || b`),
+     large or clever functions, and style that ignores the neighbouring code.
+- Not checked: performance, docs, naming, optional refactors, missing tests, medium or low issues. Ignore anything else (no notes, no follow-ups).
 - Every finding is critical: severity `blocking` or `high`, with `critical: true` and one of the four categories above (never null).
 - Decision: `approved` with `"findings": []` when none of the four is found; `changes_requested` otherwise.
 - If your brief names a board task (`JGT-n`), read it with `task_get` (no key needed when started with `--task-id`); never move cards: the Coordinator does.

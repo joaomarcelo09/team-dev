@@ -148,7 +148,8 @@ fn inline_config(exe: &Path, session_id: &str, skill: &str) -> Value {
                 "enabled": true,
             }
         },
-        "permission": { "bash": bash },
+        // Workers read this repository locally (`git show`), never over the web.
+        "permission": { "bash": bash, "webfetch": "deny" },
     })
 }
 
@@ -562,6 +563,7 @@ deepseek/deepseek-chat
         assert_eq!(inline["mcp"]["jg-team-dev"]["command"], json!(["/bin/jg-team-dev", "mcp", "--harness", "opencode"]));
         assert_eq!(inline["mcp"]["jg-team-dev"]["environment"][SESSION_ENV], "uuid");
         assert_eq!(inline["permission"]["bash"]["git push*"], "deny");
+        assert_eq!(inline["permission"]["webfetch"], "deny");
         assert_eq!(plan.path_prepend.as_deref(), Some(Path::new("/nvm/bin")));
         let _ = std::fs::remove_dir_all(&files);
     }
