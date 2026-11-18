@@ -93,6 +93,26 @@ pub fn git_permission_args(skill: &str) -> Vec<String> {
     git_write_tools().into_iter().flat_map(|tool| [flag.to_string(), tool]).collect()
 }
 
+/// Claude Code built-in tools no team role uses. Each one still costs its schema in every turn
+/// (`Artifact` alone is ~15k tokens), so they are denied at launch. The Board, chat and git flow
+/// run through the hub and the git-coder instead (see the context audit, `.team/reports`).
+pub const UNUSED_CLAUDE_TOOLS: &[&str] =
+    &["Artifact", "AskUserQuestion", "Agent", "ScheduleWakeup", "ReportFindings", "Skill"];
+
+/// Tools only the Coordinator keeps: Claude Code's background isolation asks it to call
+/// `EnterWorktree`, while workers always start inside their task worktree.
+const WORKER_ONLY_DENIED_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
+
+/// `--disallowedTools` flags that drop the tools `skill` never uses from its prompt.
+pub fn unused_tool_args(skill: &str) -> Vec<String> {
+    let worker_only = if skill == COORDINATOR { &[][..] } else { WORKER_ONLY_DENIED_TOOLS };
+    UNUSED_CLAUDE_TOOLS
+        .iter()
+        .chain(worker_only)
+        .flat_map(|tool| ["--disallowedTools".to_string(), (*tool).to_string()])
+        .collect()
+}
+
 /// Antigravity's session settings that deny the git write steps and `gh` to a non-git-coder role,
 /// or `None` for the git-coder. Antigravity matches `command(...)` as a command prefix, so these
 /// cover `git commit -m …` but not options before the subcommand (`git -C <path> commit`): denying
@@ -120,6 +140,7 @@ pub fn coordinator_args(files: &Path, folder: &Path, config: &Config) -> Vec<Str
     let mut args =
         session_args_for_role(files, &format!("{COORDINATOR} · {name}"), &config.team.for_skill(COORDINATOR, folder), Some(COORDINATOR));
     args.extend(git_permission_args(COORDINATOR));
+    args.extend(unused_tool_args(COORDINATOR));
     args
 }
 
@@ -373,6 +394,18 @@ mod tests {
         let args = session_args(Path::new("/f"), "t", &settings);
         let tail = &args[args.len() - 6..];
         assert_eq!(tail, ["--allowedTools", "Bash(cargo test:*)", "--allowedTools", "Read", "--disallowedTools", "WebFetch"]);
+    }
+
+    #[test]
+    fn unused_tools_are_denied_and_only_the_coordinator_keeps_enter_worktree() {
+        let coder = unused_tool_args("coder");
+        assert!(coder.chunks(2).all(|c| c[0] == "--disallowedTools"));
+        for tool in ["Artifact", "Agent", "Skill", "EnterWorktree"] {
+            assert!(coder.contains(&tool.to_string()), "{tool}");
+        }
+        let coordinator = unused_tool_args(COORDINATOR);
+        assert!(coordinator.contains(&"Artifact".to_string()));
+        assert!(!coordinator.contains(&"EnterWorktree".to_string()));
     }
 
     #[test]
