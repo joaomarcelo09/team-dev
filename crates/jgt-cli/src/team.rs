@@ -740,7 +740,9 @@ mod tests {
         assert!(args.contains("-n coordinator · app"));
         assert!(args.contains("--disallowedTools Bash(git commit*)"));
         assert!(args.contains("--disallowedTools Bash(git -C * commit*)"));
-        assert!(args.ends_with("--disallowedTools Bash(gh*)"));
+        assert!(args.contains("--disallowedTools Bash(gh*)"));
+        assert!(args.ends_with("--disallowedTools Skill"));
+        assert!(!args.contains("EnterWorktree"));
         assert_eq!(plan.cwd.as_deref(), Some(Path::new("/work/app")));
         assert_eq!(plan.env, vec![("JGT_ROLE".to_string(), "coordinator".to_string())]);
     }

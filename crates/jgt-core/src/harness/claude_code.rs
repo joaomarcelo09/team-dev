@@ -79,6 +79,7 @@ impl ClaudeCode {
         }
         args.extend(session_args(&crate::team::files_dir(), &title, &settings));
         args.extend(crate::team::git_permission_args(&role));
+        args.extend(crate::team::unused_tool_args(&role));
         let mut env = vec![(ROLE_ENV.to_string(), role)];
         if let Some(parent) = &s.parent_id {
             env.push((PARENT_ENV.into(), parent.clone()));
@@ -122,6 +123,7 @@ impl HarnessAdapter for ClaudeCode {
         args.extend(["--session-id".into(), w.session_id.to_string(), "--output-format".into(), "json".into()]);
         args.extend(session_args(w.files, w.title, w.settings));
         args.extend(crate::team::git_permission_args(w.skill));
+        args.extend(crate::team::unused_tool_args(w.skill));
         Ok(LaunchPlan {
             program: w.program.clone(),
             args,
@@ -201,7 +203,7 @@ mod tests {
         let plan = ClaudeCode.worker(&w).unwrap();
         let args = plan.args.join(" ");
         assert!(args.starts_with("-p /jg-team-dev:reviewer check it --session-id uuid --output-format json --model opus --effort medium"), "{args}");
-        assert!(args.ends_with("--disallowedTools Bash(gh*)"), "{args}");
+        assert!(args.contains("--disallowedTools Bash(gh*)") && args.ends_with("--disallowedTools ExitWorktree"), "{args}");
         assert!(args.contains("--plugin-dir /f/plugin -n reviewer · x"), "{args}");
         assert_eq!((plan.cwd.as_deref(), plan.path_prepend, plan.env.len()), (Some(Path::new("/w")), None, 1));
     }
