@@ -77,6 +77,14 @@ const SKILLS: &[(&str, &str)] = &[
     ("git-coder", include_str!("../../../skills/git-coder/SKILL.md")),
 ];
 
+/// Files a skill reads on demand, written next to its `SKILL.md` at start.
+const SKILL_EXTRAS: &[(&str, &str, &str)] = &[
+    ("coordinator", "git.md", include_str!("../../../skills/coordinator/git.md")),
+    ("coordinator", "reset.md", include_str!("../../../skills/coordinator/reset.md")),
+    ("coordinator", "briefs.md", include_str!("../../../skills/coordinator/briefs.md")),
+    ("coordinator", "usage-limit.md", include_str!("../../../skills/coordinator/usage-limit.md")),
+];
+
 /// Writes the plugin (manifest + skills) into `dir`, replacing what an older version wrote.
 pub fn write_plugin(dir: &Path) -> Result<()> {
     let manifest = dir.join(".claude-plugin");
@@ -92,11 +100,32 @@ pub fn write_plugin(dir: &Path) -> Result<()> {
         std::fs::create_dir_all(&skill)?;
         write_atomic(&skill.join("SKILL.md"), text)?;
     }
+    for (skill, file, text) in SKILL_EXTRAS {
+        let path = dir.join("skills").join(*skill).join(*file);
+        write_atomic(&path, text)?;
+    }
     // A skill an older version wrote but this one no longer has (an old role) goes.
     for entry in std::fs::read_dir(dir.join("skills"))?.flatten() {
         let name = entry.file_name();
         if entry.path().is_dir() && !SKILLS.iter().any(|(n, _)| name.to_str() == Some(*n)) {
             let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    // A file inside a skill folder that this version does not bundle goes too.
+    for (name, _) in SKILLS {
+        let skill = dir.join("skills").join(name);
+        for entry in std::fs::read_dir(&skill)?.flatten() {
+            let file_name = entry.file_name();
+            let Some(file) = file_name.to_str() else { continue };
+            // Leave a concurrent writer's `write_atomic` temp file alone.
+            if file.contains(".tmp-") {
+                continue;
+            }
+            let bundled =
+                file == "SKILL.md" || SKILL_EXTRAS.iter().any(|(s, f, _)| s == name && *f == file);
+            if entry.path().is_file() && !bundled {
+                let _ = std::fs::remove_file(entry.path());
+            }
         }
     }
     Ok(())
@@ -680,10 +709,17 @@ mod tests {
             let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
             assert!(text.starts_with(&format!("---\nname: {skill}\n")), "{text}");
         }
-        // A skill an older version wrote is removed on the next write.
+        // Every file a skill reads on demand is written next to its SKILL.md.
+        for (skill, file, _) in SKILL_EXTRAS {
+            let path = dir.join("skills").join(*skill).join(*file);
+            assert!(path.is_file(), "{} was not written", path.display());
+        }
+        // A skill or extra file an older version wrote is removed on the next write.
         std::fs::create_dir_all(dir.join("skills/old-role")).unwrap();
+        std::fs::write(dir.join("skills/coordinator/workflow.md"), "old").unwrap();
         write_plugin(&dir).unwrap();
         assert!(!dir.join("skills/old-role").exists());
+        assert!(!dir.join("skills/coordinator/workflow.md").exists());
         assert!(dir.join("skills/reviewer/SKILL.md").is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
