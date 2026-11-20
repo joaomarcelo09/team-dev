@@ -4,10 +4,9 @@
 use crate::settings;
 use anyhow::{Context, Result, bail};
 use jgt_core::{
-    COORDINATOR, Harness, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, Task, TaskStatus, TeamAgents, procs,
+    COORDINATOR, Harness, HubClient, RETIRED, ReconnectMode, Session, SessionStatus, TeamAgents, procs,
     short_id,
-    api::{EndRequest, HealthResponse, PatchSessionRequest, SessionsResponse, TasksResponse},
-    client::encode_query,
+    api::{EndRequest, HealthResponse, PatchSessionRequest, SessionsResponse},
     config::Config,
     launch::{self, LaunchPlan},
     paths,
@@ -483,43 +482,15 @@ pub async fn claim_coordinator() -> Result<()> {
     Ok(())
 }
 
-/// Cards listed per column in the handover note; the Board holds the rest.
-const HANDOVER_CARDS: usize = 15;
-
-/// The first prompt's tail for a Coordinator that takes over after a reset: the summary, the open
-/// Backlog and On Queue cards, and the cards waiting for a decision (`tasks`: the folder's Board).
-pub fn handover_note(summary: Option<&Path>, tasks: &[Task]) -> String {
+/// The first prompt's tail for a Coordinator that takes over after a reset: the summary file and a
+/// pointer to the Board, which the new Coordinator reads itself with `task_list`.
+pub fn handover_note(summary: Option<&Path>) -> String {
     let summary = summary.map(|p| format!(" Its summary of the last topic is `{}`.", p.display())).unwrap_or_default();
-    let open = |t: &&Task| !t.archived;
-    let card = |t: &Task| format!("{} {}", t.key, t.title.trim());
-    let mut board = String::new();
-    for status in [TaskStatus::Backlog, TaskStatus::OnQueue] {
-        let mut column: Vec<&Task> = tasks.iter().filter(open).filter(|t| t.status == status).collect();
-        if column.is_empty() {
-            continue;
-        }
-        column.sort_by_key(|t| (t.position, t.number));
-        let more = column.len().saturating_sub(HANDOVER_CARDS);
-        let mut list: Vec<String> = column.iter().take(HANDOVER_CARDS).map(|t| card(t)).collect();
-        if more > 0 {
-            list.push(format!("{more} more"));
-        }
-        board.push_str(&format!(" {}: {}.", status.label(), list.join("; ")));
-    }
-    let decisions: Vec<String> = tasks
-        .iter()
-        .filter(open)
-        .filter_map(|t| t.waiting.as_ref().map(|w| format!("{} ({})", card(t), w.reason.trim())))
-        .take(HANDOVER_CARDS)
-        .collect();
-    if !decisions.is_empty() {
-        board.push_str(&format!(" Pending decisions: {}.", decisions.join("; ")));
-    }
-    let board = if board.is_empty() { " The Board has no open Backlog or On Queue cards.".to_string() } else { board };
     format!(
         "You take over from the previous Coordinator of this folder, which reset (after a topic change, or because \
-         its context passed its reset limit) to start with a fresh context.{summary}{board} \
-         Earlier task summaries are in `.team/tasks/`; read the Board with `task_list`. Greet the user as the fresh \
+         its context passed its reset limit) to start with a fresh context.{summary} \
+         Earlier task summaries are in `.team/tasks/`; read the Board with `task_list` (open Backlog and On Queue \
+         cards, and cards waiting for a decision). Greet the user as the fresh \
          Coordinator and say in one line which summary you can pick up from."
     )
 }
@@ -553,13 +524,7 @@ pub async fn reset(summary: Option<PathBuf>) -> Result<()> {
     let files = prepare_files()?;
     let config = Config::load();
     let claude = launch::find_program("claude", config.commands.claude.as_deref()).map_err(anyhow::Error::msg)?;
-    // The Board for the note; without the hub's answer the note still points at the Board.
-    let tasks = client
-        .get::<TasksResponse>(&format!("/v1/tasks?workspace={}", encode_query(&folder.to_string_lossy())))
-        .await
-        .map(|r| r.tasks)
-        .unwrap_or_default();
-    let note = handover_note(summary.as_deref(), &tasks);
+    let note = handover_note(summary.as_deref());
     let plan = coordinator_plan(claude.clone(), &folder, &files, &config, Some(&note));
     let output = tokio::task::spawn_blocking(move || launch::spawn(&plan)).await?.map_err(anyhow::Error::msg)?;
 
@@ -726,41 +691,19 @@ mod tests {
 
     #[test]
     fn handover_points_at_the_summary() {
-        let note = handover_note(Some(Path::new(".team/tasks/task-1-css.md")), &[]);
+        let note = handover_note(Some(Path::new(".team/tasks/task-1-css.md")));
         assert!(note.contains("`.team/tasks/task-1-css.md`"));
         assert!(note.contains("Earlier task summaries are in `.team/tasks/`"));
-        assert!(note.contains("no open Backlog or On Queue cards"));
         let config = Config::default();
         let plan = coordinator_plan(PathBuf::from("claude"), Path::new("/w"), Path::new("/d"), &config, Some("Hi."));
         assert_eq!(plan.args[1], "/jg-team-dev:coordinator Hi.");
     }
 
     #[test]
-    fn handover_lists_open_cards_and_pending_decisions() {
-        let mut queued = Task::new("/w", 2, "Queue worker", TaskStatus::OnQueue);
-        queued.waiting = Some(jgt_core::Waiting {
-            kind: jgt_core::WaitingKind::Question,
-            reason: "which queue backend?".into(),
-            question_id: None,
-            since: 0,
-            until: None,
-        });
-        let mut archived = Task::new("/w", 4, "Old idea", TaskStatus::Backlog);
-        archived.archived = true;
-        let tasks = [
-            Task::new("/w", 1, "CSS tweaks", TaskStatus::Backlog),
-            queued,
-            Task::new("/w", 3, "Shipped", TaskStatus::Done),
-            archived,
-        ];
-        let note = handover_note(None, &tasks);
-        assert!(note.contains(" Backlog: JGT-1 CSS tweaks."), "{note}");
-        assert!(note.contains(" On Queue: JGT-2 Queue worker."), "{note}");
-        assert!(note.contains("Pending decisions: JGT-2 Queue worker (which queue backend?)."), "{note}");
-        assert!(!note.contains("JGT-3") && !note.contains("JGT-4"), "{note}");
-
-        let many: Vec<Task> = (1..=20).map(|n| Task::new("/w", n, "t", TaskStatus::Backlog)).collect();
-        assert!(handover_note(None, &many).contains("; 5 more."));
+    fn handover_leaves_the_board_to_task_list() {
+        let note = handover_note(None);
+        assert!(note.contains("read the Board with `task_list`"), "{note}");
+        assert!(!note.contains("Backlog:") && !note.contains("On Queue:"), "{note}");
     }
 
     #[test]
