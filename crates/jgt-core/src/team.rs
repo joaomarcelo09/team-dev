@@ -103,12 +103,29 @@ pub const UNUSED_CLAUDE_TOOLS: &[&str] =
 /// `EnterWorktree`, while workers always start inside their task worktree.
 const WORKER_ONLY_DENIED_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
 
+/// jg-team-dev MCP tools only the Coordinator uses (the Board, inbox and chat title). Workers keep
+/// `chat_status`, `chat_send`, `chat_notify`, `task_get` and `chat_ask` (a blocked worker may ask).
+const WORKER_DENIED_MCP_TOOLS: &[&str] = &[
+    "mcp__jg-team-dev__chat_inbox",
+    "mcp__jg-team-dev__chat_wait",
+    "mcp__jg-team-dev__chat_set_title",
+    "mcp__jg-team-dev__task_list",
+    "mcp__jg-team-dev__task_update",
+    "mcp__jg-team-dev__task_move",
+    "mcp__jg-team-dev__task_create",
+    "mcp__jg-team-dev__task_log",
+];
+
 /// `--disallowedTools` flags that drop the tools `skill` never uses from its prompt.
 pub fn unused_tool_args(skill: &str) -> Vec<String> {
-    let worker_only = if skill == COORDINATOR { &[][..] } else { WORKER_ONLY_DENIED_TOOLS };
+    let worker_only: Vec<&str> = if skill == COORDINATOR {
+        Vec::new()
+    } else {
+        WORKER_ONLY_DENIED_TOOLS.iter().chain(WORKER_DENIED_MCP_TOOLS).copied().collect()
+    };
     UNUSED_CLAUDE_TOOLS
         .iter()
-        .chain(worker_only)
+        .chain(&worker_only)
         .flat_map(|tool| ["--disallowedTools".to_string(), (*tool).to_string()])
         .collect()
 }
@@ -406,6 +423,18 @@ mod tests {
         let coordinator = unused_tool_args(COORDINATOR);
         assert!(coordinator.contains(&"Artifact".to_string()));
         assert!(!coordinator.contains(&"EnterWorktree".to_string()));
+    }
+
+    #[test]
+    fn workers_lose_the_coordinator_only_mcp_tools() {
+        let coder = unused_tool_args("coder");
+        for tool in ["task_update", "task_move", "task_list", "chat_wait", "chat_inbox"] {
+            assert!(coder.contains(&format!("mcp__jg-team-dev__{tool}")), "{tool}");
+        }
+        for tool in ["chat_status", "chat_send", "chat_notify", "chat_ask", "task_get"] {
+            assert!(!coder.contains(&format!("mcp__jg-team-dev__{tool}")), "{tool}");
+        }
+        assert!(!unused_tool_args(COORDINATOR).iter().any(|t| t.starts_with("mcp__jg-team-dev__")));
     }
 
     #[test]

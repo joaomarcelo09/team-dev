@@ -203,7 +203,7 @@ mod tests {
         let plan = ClaudeCode.worker(&w).unwrap();
         let args = plan.args.join(" ");
         assert!(args.starts_with("-p /jg-team-dev:reviewer check it --session-id uuid --output-format json --model opus --effort medium"), "{args}");
-        assert!(args.contains("--disallowedTools Bash(gh*)") && args.ends_with("--disallowedTools ExitWorktree"), "{args}");
+        assert!(args.contains("--disallowedTools Bash(gh*)") && args.contains("--disallowedTools ExitWorktree") && args.contains("--disallowedTools mcp__jg-team-dev__task_move"), "{args}");
         assert!(args.contains("--plugin-dir /f/plugin -n reviewer · x"), "{args}");
         assert_eq!((plan.cwd.as_deref(), plan.path_prepend, plan.env.len()), (Some(Path::new("/w")), None, 1));
     }
