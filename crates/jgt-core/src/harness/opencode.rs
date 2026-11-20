@@ -126,6 +126,18 @@ fn agent(skill: &str) -> String {
     format!("jgt-{skill}")
 }
 
+/// The most agentic steps (model turns) an OpenCode worker may take. At the cap OpenCode stops
+/// tool use and the worker reports what it has, which the Coordinator treats as incomplete work
+/// and hands to a fresh worker. Set well above a normal task (one coder ran 179 turns on a task
+/// that needed none of that history) so a real piece of work is not cut short.
+fn max_steps(skill: &str) -> u32 {
+    match skill {
+        "coder" => 200,
+        "reviewer" => 100,
+        _ => 60,
+    }
+}
+
 /// What `OPENCODE_CONFIG_CONTENT` adds for a worker: our MCP server, told the worker's id, and
 /// deny rules for the git commands only the git-coder may run (PRD Q8: no routing, `--auto`).
 fn inline_config(exe: &Path, session_id: &str, skill: &str) -> Value {
@@ -150,6 +162,9 @@ fn inline_config(exe: &Path, session_id: &str, skill: &str) -> Value {
         },
         // Workers read this repository locally (`git show`), never over the web.
         "permission": { "bash": bash, "webfetch": "deny" },
+        // Compact the context as it fills, and cap the steps (see `max_steps`).
+        "compaction": { "auto": true },
+        "agent": { agent(skill): { "steps": max_steps(skill) } },
     })
 }
 
@@ -564,6 +579,8 @@ deepseek/deepseek-chat
         assert_eq!(inline["mcp"]["jg-team-dev"]["environment"][SESSION_ENV], "uuid");
         assert_eq!(inline["permission"]["bash"]["git push*"], "deny");
         assert_eq!(inline["permission"]["webfetch"], "deny");
+        assert_eq!(inline["compaction"]["auto"], true);
+        assert_eq!(inline["agent"]["jgt-reviewer"]["steps"], 100);
         assert_eq!(plan.path_prepend.as_deref(), Some(Path::new("/nvm/bin")));
         let _ = std::fs::remove_dir_all(&files);
     }
