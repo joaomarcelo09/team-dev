@@ -56,6 +56,9 @@ pub fn claude_settings_for_role(exe: &Path, role: Option<&str>) -> Value {
         // Sessions run with `--setting-sources project,local`, so the user's own attribution
         // settings are never read; turn commit/PR attribution off for every team session.
         "attribution": { "commit": "", "pr": "", "sessionUrl": false },
+        // A background session is otherwise isolated into `.claude/worktrees/<name>`, which nests
+        // the team's `.team/worktrees/<key>` inside it and blocks edits in the project checkout.
+        "worktree": { "bgIsolation": "none" },
     })
 }
 
@@ -108,6 +111,14 @@ mod tests {
         let exe = Path::new("/usr/bin/jg-team-dev");
         for s in [claude_settings(exe), claude_settings_for_role(exe, Some("coordinator"))] {
             assert_eq!(s["attribution"], json!({ "commit": "", "pr": "", "sessionUrl": false }));
+        }
+    }
+
+    #[test]
+    fn settings_turn_background_worktree_isolation_off() {
+        let exe = Path::new("/usr/bin/jg-team-dev");
+        for s in [claude_settings(exe), claude_settings_for_role(exe, Some("coordinator"))] {
+            assert_eq!(s["worktree"], json!({ "bgIsolation": "none" }));
         }
     }
 
