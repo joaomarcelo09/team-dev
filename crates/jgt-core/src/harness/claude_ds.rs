@@ -167,7 +167,7 @@ mod tests {
         assert!(!plan.args.contains(&"--model".to_string()), "{args}");
         assert!(args.contains("--setting-sources user,project,local"), "{args}");
         assert!(args.contains("--plugin-dir /f/plugin -n coder · x"), "{args}");
-        assert!(args.contains("--disallowedTools Bash(gh*)") && args.ends_with("--disallowedTools ExitWorktree"), "{args}");
+        assert!(args.contains("--disallowedTools Bash(gh*)") && args.contains("--disallowedTools ExitWorktree") && args.contains("--disallowedTools mcp__jg-team-dev__task_move"), "{args}");
         assert!(plan.env.iter().any(|(k, v)| k == CONFIG_DIR_ENV && !v.is_empty()), "{:?}", plan.env);
         assert!(plan.env.contains(&(ROLE_ENV.into(), "coder".into())));
         assert_eq!(plan.env_remove, ["ANTHROPIC_API_KEY"]);
