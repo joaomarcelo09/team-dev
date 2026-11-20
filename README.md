@@ -244,9 +244,10 @@ e.g. DeepSeek) applies; jg-team-dev never reads it. It shows in **Settings** onl
 exists. Its one model, `deepseek`, passes no `--model` (the dir's `ANTHROPIC_MODEL` decides); any
 other model name is passed as is. Workers only: the Coordinator stays on Claude Code.
 
-The Coordinator compacts its context at `compact_window = 120000` tokens unless set under
-`[team.skills.coordinator]` (`0` leaves it to Claude Code): it lives for days, and every step
-re-reads its whole context. Any Claude Code role takes `compact_window` (100000 to 1000000).
+The Coordinator's context is managed by the reset below; Claude's auto-compact is only a hard
+safety net at `compact_window = 1000000` tokens (the top of the range) unless set under
+`[team.skills.coordinator]` (`0` leaves it to Claude Code). Any Claude Code role takes
+`compact_window` (100000 to 1000000).
 Before that, at `reset_window = 80000` tokens (`[team.skills.coordinator]`, `0` turns it off), its
 Stop hook tells it to reset to a fresh Coordinator at the next safe point (no card in progress or
 in a git column, no worker running): it writes a summary into `.team/tasks/` and runs

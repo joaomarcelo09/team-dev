@@ -88,7 +88,8 @@ pub struct SkillSettings {
     pub disallowed_tools: Option<Vec<String>>,
     /// Context size in tokens at which Claude Code compacts the session (`autoCompactWindow`,
     /// 100000 to 1000000); 0 leaves it to Claude Code. The Coordinator defaults to
-    /// [`COORDINATOR_COMPACT_WINDOW`]: it lives for days, and every step re-reads its whole context.
+    /// [`COORDINATOR_COMPACT_WINDOW`], the top of the range: compaction is only a hard safety net,
+    /// the `reset_window` reset manages its context.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compact_window: Option<u64>,
     /// Coordinator only: context size in tokens past which its Stop hook tells it to reset to a
@@ -116,8 +117,11 @@ pub struct FallbackSettings {
     pub effort: Option<String>,
 }
 
-/// Default `compact_window` of the Coordinator.
-pub const COORDINATOR_COMPACT_WINDOW: u64 = 120_000;
+/// Default `compact_window` of the Coordinator: the top of Claude Code's range, so that Claude's
+/// auto-compact fires only as a hard safety net and the JG reset ([`COORDINATOR_RESET_WINDOW`])
+/// is the one context manager. This is the documented ceiling: a Coordinator that never reaches a
+/// safe point to reset keeps growing until here, then Claude compacts it.
+pub const COORDINATOR_COMPACT_WINDOW: u64 = 1_000_000;
 
 /// Default `reset_window` of the Coordinator: the context size at which it is told to reset.
 /// It must stay below [`COORDINATOR_COMPACT_WINDOW`]: the reset comes first, at a safe point, and
@@ -892,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn the_coordinator_compacts_early_unless_told_otherwise() {
+    fn the_coordinator_compacts_last_unless_told_otherwise() {
         let none = ProjectTeam::default();
         let team = Config::default().team;
         assert_eq!(team.resolve("coordinator", &none).0.compact_window, Some(COORDINATOR_COMPACT_WINDOW));
@@ -929,10 +933,10 @@ mod tests {
         assert_eq!(set.team.resolve(COORDINATOR, &project.team).0.reset_window, Some(70_000));
 
         // A reset window at or above the compact window is kept, with a warning.
-        let late: Config = toml::from_str("[team.skills.coordinator]\nreset_window = 150000\n").unwrap();
+        let late: Config = toml::from_str("[team.skills.coordinator]\nreset_window = 1000000\n").unwrap();
         let (coordinator, warnings) = late.team.resolve(COORDINATOR, &none);
-        assert_eq!(coordinator.reset_window, Some(150_000));
-        assert!(warnings.iter().any(|w| w.contains("reset_window 150000")), "{warnings:?}");
+        assert_eq!(coordinator.reset_window, Some(1_000_000));
+        assert!(warnings.iter().any(|w| w.contains("reset_window 1000000")), "{warnings:?}");
     }
 
     #[test]
