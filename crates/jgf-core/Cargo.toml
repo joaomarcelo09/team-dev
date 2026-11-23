@@ -1,0 +1,12 @@
+[package]
+name = "jgf-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dark Factory (core): separate from the stable jg-team-dev app"
+
+[dependencies]
+directories.workspace = true
+
+[dev-dependencies]
+toml.workspace = true

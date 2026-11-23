@@ -1,0 +1,10 @@
+[package]
+name = "jgf-hub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Dark Factory (hub): separate from the stable jg-team-dev app"
+
+[dependencies]
+jgf-core.workspace = true
+
