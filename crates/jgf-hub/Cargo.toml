@@ -7,4 +7,7 @@ description = "Dark Factory (hub): separate from the stable jg-team-dev app"
 
 [dependencies]
 jgf-core.workspace = true
-
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
