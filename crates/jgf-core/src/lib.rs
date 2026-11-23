@@ -9,6 +9,7 @@ pub mod lab;
 pub mod paths;
 pub mod project;
 pub mod registry;
+pub mod roles;
 pub mod secrets;
 pub mod spec;
 
@@ -18,5 +19,6 @@ pub use audit::{
 pub use error::ModelError;
 pub use lab::{GithubAction, GithubGrant, LabConfig};
 pub use project::{EnvProfile, Project, ProjectId, ProjectStage, RepoSpec, RunRecipe};
+pub use roles::{Effort, FactoryRole, Harness, RoleConfig, RoleError, RoleSettings, RunOverride};
 pub use secrets::{FileSecretStore, Secret, SecretKey, SecretScope, SecretStore, env_for_project};
 pub use spec::{LintIssue, Spec, SpecSection, freeze_spec, lint_spec, parse_spec, verify_spec};
