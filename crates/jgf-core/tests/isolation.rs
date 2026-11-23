@@ -24,21 +24,33 @@ fn stable_crates_do_not_depend_on_dark_factory() {
     let mut checked = 0;
     for entry in fs::read_dir(&crates).expect("crates dir") {
         let path = entry.expect("entry").path();
-        let stable = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("jgt-"));
+        let stable = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("jgt-"));
         if !stable {
             continue;
         }
         let manifest = fs::read_to_string(path.join("Cargo.toml")).expect("manifest");
         let found = forbidden_dependencies(&manifest);
-        assert!(found.is_empty(), "{} depends on Dark Factory crates: {found:?}", path.display());
+        assert!(
+            found.is_empty(),
+            "{} depends on Dark Factory crates: {found:?}",
+            path.display()
+        );
         checked += 1;
     }
-    assert!(checked > 0, "no stable crate found: the guard checked nothing");
+    assert!(
+        checked > 0,
+        "no stable crate found: the guard checked nothing"
+    );
 }
 
 #[test]
 fn guard_detects_a_forbidden_dependency() {
     let manifest = "[package]\nname = \"x\"\n[dependencies]\njgf-core = { path = \"../jgf-core\" }\nserde = \"1\"\n";
-    assert_eq!(forbidden_dependencies(manifest), vec!["jgf-core".to_string()]);
+    assert_eq!(
+        forbidden_dependencies(manifest),
+        vec!["jgf-core".to_string()]
+    );
     assert!(forbidden_dependencies("[dependencies]\nserde = \"1\"\n").is_empty());
 }

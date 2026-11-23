@@ -7,6 +7,9 @@ description = "Dark Factory (core): separate from the stable jg-team-dev app"
 
 [dependencies]
 directories.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
