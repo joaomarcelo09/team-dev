@@ -20,6 +20,7 @@ use nix::unistd::{
 
 use crate::error::{Result, SandboxError};
 use crate::exec::{ExecOutput, ExecRequest};
+use crate::namespace::scope;
 use crate::namespace::util::{self, NamespaceFds};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -91,6 +92,9 @@ fn validate_request(request: &ExecRequest) -> Result<()> {
         return Err(SandboxError::ExecFailed {
             reason: "argv must not be empty".to_string(),
         });
+    }
+    if let Some(scope) = &request.scope {
+        scope.validate()?;
     }
     if !request.cwd.is_absolute() {
         return Err(SandboxError::ExecFailed {
@@ -694,6 +698,12 @@ fn worker_setup(
     status_w: &OwnedFd,
 ) -> Result<()> {
     join_sandbox(mount, ipc, uts, net)?;
+    if let Some(scope) = &request.scope {
+        scope::enter_scope(scope)?;
+        if !request.env.contains_key("HOME") {
+            scope::create_scoped_home()?;
+        }
+    }
 
     // A fresh session detaches the command from the caller's job control and
     // its controlling terminal; the timeout kill still reaches the group because
@@ -706,8 +716,8 @@ fn worker_setup(
     dup2_stdout(stdout_w.as_fd()).map_err(|source| SandboxError::nix("redirect stdout", source))?;
     dup2_stderr(stderr_w.as_fd()).map_err(|source| SandboxError::nix("redirect stderr", source))?;
 
-    chdir(&request.cwd)
-        .map_err(|source| SandboxError::nix(format!("chdir {}", request.cwd.display()), source))?;
+    let cwd = request.effective_cwd();
+    chdir(&cwd).map_err(|source| SandboxError::nix(format!("chdir {}", cwd.display()), source))?;
 
     let (program, argv, env) = prepare_exec(request)?;
     util::drop_all_privileges()?;

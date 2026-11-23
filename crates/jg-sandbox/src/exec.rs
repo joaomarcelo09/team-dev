@@ -1,8 +1,10 @@
 //! A single command run inside a sandbox.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use crate::scope::{ExecScope, SCOPED_HOME, WORKSPACE};
 
 /// Default `PATH` given to commands when the request does not override it.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
@@ -24,6 +26,8 @@ pub struct ExecRequest {
     pub stdin: Option<Vec<u8>>,
     /// Optional wall-clock limit after which the command is killed.
     pub timeout: Option<Duration>,
+    /// Optional project scope; `None` runs lab-wide, as before.
+    pub scope: Option<ExecScope>,
 }
 
 impl ExecRequest {
@@ -35,6 +39,7 @@ impl ExecRequest {
             cwd: PathBuf::from("/"),
             stdin: None,
             timeout: None,
+            scope: None,
         }
     }
 
@@ -62,11 +67,31 @@ impl ExecRequest {
         self
     }
 
+    /// Restrict the command to one project scope.
+    pub fn with_scope(mut self, scope: ExecScope) -> Self {
+        self.scope = Some(scope);
+        self
+    }
+
+    /// The working directory the command starts in: `/workspace` for a scoped
+    /// request that left the default `/`, otherwise the requested one.
+    pub fn effective_cwd(&self) -> PathBuf {
+        if self.scope.is_some() && self.cwd == Path::new("/") {
+            return PathBuf::from(WORKSPACE);
+        }
+        self.cwd.clone()
+    }
+
     /// The clean environment sent to the command: safe defaults plus the request.
     pub fn resolved_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         env.insert("PATH".to_string(), DEFAULT_PATH.to_string());
-        env.insert("HOME".to_string(), DEFAULT_HOME.to_string());
+        let home = if self.scope.is_some() {
+            SCOPED_HOME
+        } else {
+            DEFAULT_HOME
+        };
+        env.insert("HOME".to_string(), home.to_string());
         env.insert("LANG".to_string(), DEFAULT_LANG.to_string());
         env.extend(self.env.clone());
         env
@@ -107,6 +132,7 @@ impl ExecOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scope::ScopeAccess;
 
     #[test]
     fn request_env_overrides_defaults() {
@@ -116,6 +142,28 @@ mod tests {
         let env = req.resolved_env();
         assert_eq!(env.get("PATH").map(String::as_str), Some("/lab/bin"));
         assert_eq!(env.get("CUSTOM").map(String::as_str), Some("yes"));
+        assert_eq!(env.get("HOME").map(String::as_str), Some(DEFAULT_HOME));
+    }
+
+    #[test]
+    fn scoped_request_defaults_to_workspace_cwd_and_tmp_home() {
+        let scope = ExecScope::new(ScopeAccess::ReadOnly, "/lab/a");
+        let req = ExecRequest::new(vec!["true".to_string()]).with_scope(scope);
+        assert_eq!(req.effective_cwd(), Path::new(WORKSPACE));
+        let env = req.resolved_env();
+        assert_eq!(env.get("HOME").map(String::as_str), Some(SCOPED_HOME));
+
+        let req = req.with_cwd("/tmp").with_env("HOME", "/tmp/mine");
+        assert_eq!(req.effective_cwd(), Path::new("/tmp"));
+        let env = req.resolved_env();
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/tmp/mine"));
+    }
+
+    #[test]
+    fn unscoped_request_keeps_cwd_and_home() {
+        let req = ExecRequest::new(vec!["true".to_string()]);
+        assert_eq!(req.effective_cwd(), Path::new("/"));
+        let env = req.resolved_env();
         assert_eq!(env.get("HOME").map(String::as_str), Some(DEFAULT_HOME));
     }
 }

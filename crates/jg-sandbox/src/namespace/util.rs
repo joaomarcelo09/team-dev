@@ -1,11 +1,14 @@
 //! Small process, pipe and namespace helpers shared by the backend.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nix::fcntl::{OFlag, open};
+use nix::mount::{MsFlags, mount};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use nix::sys::stat::Mode;
+use nix::sys::statvfs::{FsFlags, statvfs};
 use nix::unistd::{close, read, write};
 
 use crate::error::{Result, SandboxError};
@@ -401,4 +404,170 @@ pub(crate) fn exit_now(code: i32) -> ! {
 /// Sleep briefly, used by the persistent init.
 pub(crate) fn idle_pause() {
     std::thread::sleep(Duration::from_millis(200));
+}
+
+pub(crate) fn make_mounts_private() -> Result<()> {
+    mount(
+        None::<&str>,
+        "/",
+        None::<&str>,
+        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+        None::<&str>,
+    )
+    .map_err(|source| SandboxError::nix("make / a private mount", source))
+}
+
+/// Mount a fresh procfs; it shows the pid namespace of the calling process.
+pub(crate) fn mount_proc(target: &Path) -> Result<()> {
+    mount(
+        Some("proc"),
+        target,
+        Some("proc"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+        None::<&str>,
+    )
+    .map_err(|source| SandboxError::nix("mount /proc", source))
+}
+
+pub(crate) fn mount_tmpfs(target: &Path, options: &str) -> Result<()> {
+    mount(
+        Some("tmpfs"),
+        target,
+        Some("tmpfs"),
+        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
+        Some(options),
+    )
+    .map_err(|source| SandboxError::nix(format!("mount tmpfs at {}", target.display()), source))
+}
+
+pub(crate) fn remount_read_only(mount_point: &Path) -> Result<()> {
+    mount(
+        None::<&Path>,
+        mount_point,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
+        None::<&str>,
+    )
+    .map_err(|source| {
+        SandboxError::nix(
+            format!("remount {} read-only", mount_point.display()),
+            source,
+        )
+    })
+}
+
+/// Remount `mount_point` read-only and keep its other flags (`nosuid`, `nodev`,
+/// `noexec`, atime). In an unprivileged user namespace those flags can be locked
+/// on a mount inherited from the host, and a remount that drops them is refused.
+pub(crate) fn remount_read_only_keeping_flags(mount_point: &Path) -> Result<()> {
+    let current = statvfs(mount_point)
+        .map_err(|source| SandboxError::nix(format!("statvfs {}", mount_point.display()), source))?
+        .flags();
+    let kept = [
+        (FsFlags::ST_NOSUID, MsFlags::MS_NOSUID),
+        (FsFlags::ST_NODEV, MsFlags::MS_NODEV),
+        (FsFlags::ST_NOEXEC, MsFlags::MS_NOEXEC),
+        (FsFlags::ST_NOATIME, MsFlags::MS_NOATIME),
+        (FsFlags::ST_NODIRATIME, MsFlags::MS_NODIRATIME),
+        (FsFlags::ST_RELATIME, MsFlags::MS_RELATIME),
+    ]
+    .into_iter()
+    .filter(|(fs_flag, _)| current.contains(*fs_flag))
+    .fold(MsFlags::empty(), |all, (_, mount_flag)| all | mount_flag);
+    mount(
+        None::<&Path>,
+        mount_point,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY | kept,
+        None::<&str>,
+    )
+    .map_err(|source| {
+        SandboxError::nix(
+            format!("remount {} read-only", mount_point.display()),
+            source,
+        )
+    })
+}
+
+/// Fail if any mount at or below a read-only bind is still writable.
+pub(crate) fn verify_read_only_tree(destination: &Path) -> Result<()> {
+    let mut found_top = false;
+    for entry in mount_entries()? {
+        if entry.mount_point != destination && !entry.mount_point.starts_with(destination) {
+            continue;
+        }
+        if entry.writable {
+            return Err(SandboxError::invalid(format!(
+                "{} is writable below read-only bind {}",
+                entry.mount_point.display(),
+                destination.display()
+            )));
+        }
+        if entry.mount_point == destination {
+            found_top = true;
+        }
+    }
+    if !found_top {
+        return Err(SandboxError::invalid(format!(
+            "{} is not a mount point after the bind",
+            destination.display()
+        )));
+    }
+    Ok(())
+}
+
+struct MountEntry {
+    mount_point: PathBuf,
+    writable: bool,
+}
+
+fn mount_entries() -> Result<Vec<MountEntry>> {
+    let text = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|source| SandboxError::io("/proc/self/mountinfo", source))?;
+    let mut entries = Vec::new();
+    for line in text.lines() {
+        // `mount ID parent major:minor root mount-point options ...`.
+        let fields: Vec<&str> = line.split(' ').collect();
+        if fields.len() < 6 {
+            continue;
+        }
+        entries.push(MountEntry {
+            mount_point: PathBuf::from(unescape_mount_path(fields[4])),
+            writable: fields[5].split(',').any(|option| option == "rw"),
+        });
+    }
+    Ok(entries)
+}
+
+fn unescape_mount_path(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+pub(crate) fn verify_read_only(path: &Path) -> Result<()> {
+    let flags = statvfs(path)
+        .map_err(|source| SandboxError::nix(format!("statvfs {}", path.display()), source))?
+        .flags();
+    if !flags.contains(FsFlags::ST_RDONLY) {
+        return Err(SandboxError::invalid(format!(
+            "{} was not mounted read-only",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A single-level bind, used for read-only binds (see `rootfs::bind_read_only`).
+pub(crate) fn bind_non_recursive(source: &Path, destination: &Path) -> Result<()> {
+    nix::mount::mount(
+        Some(source),
+        destination,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|source| SandboxError::nix(format!("bind mount {}", destination.display()), source))
 }

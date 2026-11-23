@@ -4,10 +4,13 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
-use nix::sys::statvfs::{FsFlags, statvfs};
 use nix::unistd::pivot_root;
 
 use crate::error::{Result, SandboxError};
+use crate::namespace::util::{
+    bind_non_recursive, make_mounts_private, mount_proc, mount_tmpfs, remount_read_only,
+    verify_read_only, verify_read_only_tree,
+};
 use crate::spec::SandboxSpec;
 
 const DEVICE_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
@@ -49,39 +52,6 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
     pivot_into(&root)?;
     create_dir(Path::new("/lab/home"))?;
     Ok(())
-}
-
-fn make_mounts_private() -> Result<()> {
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_REC | MsFlags::MS_PRIVATE,
-        None::<&str>,
-    )
-    .map_err(|source| SandboxError::nix("make / a private mount", source))
-}
-
-fn mount_tmpfs(target: &Path, options: &str) -> Result<()> {
-    mount(
-        Some("tmpfs"),
-        target,
-        Some("tmpfs"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-        Some(options),
-    )
-    .map_err(|source| SandboxError::nix(format!("mount tmpfs at {}", target.display()), source))
-}
-
-fn mount_proc(target: &Path) -> Result<()> {
-    mount(
-        Some("proc"),
-        target,
-        Some("proc"),
-        MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
-        None::<&str>,
-    )
-    .map_err(|source| SandboxError::nix("mount /proc", source))
 }
 
 fn mount_dev(target: &Path) -> Result<()> {
@@ -130,93 +100,6 @@ fn bind_read_only(source: &Path, root: &Path) -> Result<()> {
     verify_read_only_tree(&destination)
 }
 
-fn remount_read_only(mount_point: &Path) -> Result<()> {
-    mount(
-        None::<&Path>,
-        mount_point,
-        None::<&str>,
-        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_RDONLY,
-        None::<&str>,
-    )
-    .map_err(|source| {
-        SandboxError::nix(
-            format!("remount {} read-only", mount_point.display()),
-            source,
-        )
-    })
-}
-
-/// Fail if any mount at or below a read-only bind is still writable.
-fn verify_read_only_tree(destination: &Path) -> Result<()> {
-    let mut found_top = false;
-    for entry in mount_entries()? {
-        if entry.mount_point != destination && !entry.mount_point.starts_with(destination) {
-            continue;
-        }
-        if entry.writable {
-            return Err(SandboxError::invalid(format!(
-                "{} is writable below read-only bind {}",
-                entry.mount_point.display(),
-                destination.display()
-            )));
-        }
-        if entry.mount_point == destination {
-            found_top = true;
-        }
-    }
-    if !found_top {
-        return Err(SandboxError::invalid(format!(
-            "{} is not a mount point after the bind",
-            destination.display()
-        )));
-    }
-    Ok(())
-}
-
-struct MountEntry {
-    mount_point: PathBuf,
-    writable: bool,
-}
-
-fn mount_entries() -> Result<Vec<MountEntry>> {
-    let text = std::fs::read_to_string("/proc/self/mountinfo")
-        .map_err(|source| SandboxError::io("/proc/self/mountinfo", source))?;
-    let mut entries = Vec::new();
-    for line in text.lines() {
-        // `mount ID parent major:minor root mount-point options ...`.
-        let fields: Vec<&str> = line.split(' ').collect();
-        if fields.len() < 6 {
-            continue;
-        }
-        entries.push(MountEntry {
-            mount_point: PathBuf::from(unescape_mount_path(fields[4])),
-            writable: fields[5].split(',').any(|option| option == "rw"),
-        });
-    }
-    Ok(entries)
-}
-
-fn unescape_mount_path(field: &str) -> String {
-    field
-        .replace("\\040", " ")
-        .replace("\\011", "\t")
-        .replace("\\012", "\n")
-        .replace("\\134", "\\")
-}
-
-fn verify_read_only(path: &Path) -> Result<()> {
-    let flags = statvfs(path)
-        .map_err(|source| SandboxError::nix(format!("statvfs {}", path.display()), source))?
-        .flags();
-    if !flags.contains(FsFlags::ST_RDONLY) {
-        return Err(SandboxError::invalid(format!(
-            "{} was not mounted read-only",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
 /// A recursive bind, used for the read-write lab so its nested mounts stay visible.
 fn bind_recursive(source: &Path, destination: &Path) -> Result<()> {
     nix::mount::mount(
@@ -224,18 +107,6 @@ fn bind_recursive(source: &Path, destination: &Path) -> Result<()> {
         destination,
         None::<&str>,
         MsFlags::MS_BIND | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|source| SandboxError::nix(format!("bind mount {}", destination.display()), source))
-}
-
-/// A single-level bind, used for read-only binds (see `bind_read_only`).
-fn bind_non_recursive(source: &Path, destination: &Path) -> Result<()> {
-    nix::mount::mount(
-        Some(source),
-        destination,
-        None::<&str>,
-        MsFlags::MS_BIND,
         None::<&str>,
     )
     .map_err(|source| SandboxError::nix(format!("bind mount {}", destination.display()), source))
