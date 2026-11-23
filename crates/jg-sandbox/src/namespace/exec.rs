@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -75,19 +75,60 @@ impl Pipes {
 }
 
 /// Run `request` inside the sandbox whose init is `init_pid`.
-pub(crate) fn run(init_pid: i32, request: &ExecRequest) -> Result<ExecOutput> {
-    validate_request(request)?;
+///
+/// When `lab` is set, the exec worker joins the matching cgroup before doing any
+/// work so the whole command tree is accounted to the lab limits: the lab's
+/// init child for a lab-wide exec, or the project cgroup for a scoped exec with
+/// a project. A project or project limit on a lab without a cgroup is an error
+/// before anything runs. A scope's private `/tmp` cap may not exceed
+/// `lab_tmp_bytes`, the sandbox's `/tmp` cap.
+pub(crate) fn run(
+    init_pid: i32,
+    lab: Option<&Path>,
+    lab_tmp_bytes: u64,
+    request: &ExecRequest,
+) -> Result<ExecOutput> {
+    validate_request(request, lab_tmp_bytes)?;
+    let cgroup = resolve_cgroup(lab, request)?;
     let namespaces = NamespaceFds::open(init_pid)?;
     let pipes = Pipes::new()?;
 
     let fork_result = util::fork_process()?;
     match fork_result {
         ForkResult::Parent { child } => run_parent(child, request, pipes),
-        ForkResult::Child => child_exec(request, namespaces, pipes),
+        ForkResult::Child => child_exec(request, namespaces, pipes, cgroup.as_deref()),
     }
 }
 
-fn validate_request(request: &ExecRequest) -> Result<()> {
+/// Pick the cgroup the exec worker must join, creating and limiting a project
+/// cgroup when the request asks for one. Never falls back to an unlimited run.
+fn resolve_cgroup(lab: Option<&Path>, request: &ExecRequest) -> Result<Option<PathBuf>> {
+    let project = request
+        .scope
+        .as_ref()
+        .and_then(|scope| scope.project.as_deref());
+    let limits = request.scope.as_ref().and_then(|scope| scope.limits);
+
+    match (project, limits) {
+        (Some(project), limits) => {
+            let Some(lab) = lab else {
+                return Err(SandboxError::ExecFailed {
+                    reason: format!(
+                        "project {project:?} needs a lab cgroup, but the sandbox has none"
+                    ),
+                });
+            };
+            let limits = limits.unwrap_or_default();
+            crate::cgroup::ensure_project(lab, project, &limits).map(Some)
+        }
+        (None, Some(_)) => Err(SandboxError::ExecFailed {
+            reason: "project limits require a project name".to_string(),
+        }),
+        (None, None) => Ok(lab.map(crate::cgroup::member_path)),
+    }
+}
+
+fn validate_request(request: &ExecRequest, lab_tmp_bytes: u64) -> Result<()> {
     if request.argv.is_empty() || request.argv[0].is_empty() {
         return Err(SandboxError::ExecFailed {
             reason: "argv must not be empty".to_string(),
@@ -95,6 +136,7 @@ fn validate_request(request: &ExecRequest) -> Result<()> {
     }
     if let Some(scope) = &request.scope {
         scope.validate()?;
+        scope.validate_tmp_within_lab(lab_tmp_bytes)?;
     }
     if !request.cwd.is_absolute() {
         return Err(SandboxError::ExecFailed {
@@ -318,7 +360,12 @@ fn join_reader(
     }
 }
 
-fn child_exec(request: &ExecRequest, namespaces: NamespaceFds, pipes: Pipes) -> ! {
+fn child_exec(
+    request: &ExecRequest,
+    namespaces: NamespaceFds,
+    pipes: Pipes,
+    cgroup: Option<&Path>,
+) -> ! {
     let Pipes {
         stdin_r,
         stdin_w,
@@ -339,6 +386,16 @@ fn child_exec(request: &ExecRequest, namespaces: NamespaceFds, pipes: Pipes) -> 
     drop(status_r);
     drop(result_r);
     drop(pid_r);
+
+    // Join the resolved cgroup (the lab init child or a project cgroup) while
+    // still in the host namespace, so the sandbox user namespace switch below
+    // cannot change the accounting target.
+    if let Some(path) = cgroup
+        && let Err(error) = crate::cgroup::add_pid(path, getpid().as_raw())
+    {
+        report_worker_error(&status_w, &error);
+        util::exit_now(127)
+    }
 
     let NamespaceFds {
         user,

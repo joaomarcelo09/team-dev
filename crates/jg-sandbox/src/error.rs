@@ -91,6 +91,15 @@ pub enum SandboxError {
         /// Timeout that elapsed.
         seconds: u64,
     },
+
+    /// A cgroup operation failed.
+    #[error("cgroup error at {}: {reason}", path.display())]
+    Cgroup {
+        /// Cgroup directory involved in the failed operation.
+        path: PathBuf,
+        /// Human-readable reason.
+        reason: String,
+    },
 }
 
 impl SandboxError {
@@ -120,6 +129,14 @@ impl SandboxError {
     /// A verification failure.
     pub(crate) fn not_verified(reason: impl Into<String>) -> Self {
         Self::NotVerified {
+            reason: reason.into(),
+        }
+    }
+
+    /// A cgroup operation failure.
+    pub(crate) fn cgroup(path: impl Into<PathBuf>, reason: impl Into<String>) -> Self {
+        Self::Cgroup {
+            path: path.into(),
             reason: reason.into(),
         }
     }

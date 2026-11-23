@@ -1,7 +1,9 @@
 //! Shared helpers for the jg-sandbox integration tests.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use jg_sandbox::{
@@ -43,6 +45,70 @@ pub fn fixture() -> LabFixture {
     std::fs::create_dir_all(&lab).expect("lab dir");
     let spec = SandboxSpec::new(temp.path().join("state"), lab);
     LabFixture { temp, spec }
+}
+
+/// Marker env var: the test body is already running in a re-executed child.
+const MARKER_ENV: &str = "JG_CGROUP_TEST_MARKER";
+
+/// Cgroup limits need the caller to be inside a delegated cgroup; when the test
+/// binary runs in a plain session scope, re-run this single test under a
+/// transient user scope so the kernel allows moving processes into the lab
+/// cgroup. Returns false only when delegation is truly unavailable.
+pub fn ensure_delegated(test_name: &str) -> bool {
+    // This is the re-executed child: record that the harness ran, then require
+    // a delegated cgroup from here on.
+    if let Some(marker) = std::env::var_os(MARKER_ENV) {
+        let _ = fs::write(marker, "started");
+        assert!(
+            current_cgroup_writable(),
+            "cgroup test {test_name} started without a delegated cgroup"
+        );
+        return true;
+    }
+
+    if current_cgroup_writable() {
+        return true;
+    }
+
+    let marker = std::env::temp_dir().join(format!(
+        "jg-cgroup-reexec-{}-{test_name}",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&marker);
+    let exe = std::env::current_exe().expect("test binary path");
+    let status = Command::new("systemd-run")
+        .args(["--user", "--scope", "--collect", "--quiet", "--"])
+        .arg(&exe)
+        .args(["--exact", test_name, "--nocapture"])
+        .env(MARKER_ENV, &marker)
+        .status();
+    let started = marker.exists();
+    let _ = fs::remove_file(&marker);
+
+    match status {
+        Ok(status) if started && status.success() => false,
+        Ok(status) if started => panic!("delegated cgroup test {test_name} failed: {status}"),
+        _ => {
+            eprintln!(
+                "skipping cgroup test {test_name}: cgroup delegation is unavailable to this process"
+            );
+            false
+        }
+    }
+}
+
+fn current_cgroup_writable() -> bool {
+    let Ok(text) = fs::read_to_string("/proc/self/cgroup") else {
+        return false;
+    };
+    let Some(relative) = text.lines().find_map(|line| line.strip_prefix("0::")) else {
+        return false;
+    };
+    let dir = Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+    fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("cgroup.procs"))
+        .is_ok()
 }
 
 /// Create a sandbox, or return `None` when the host cannot run unprivileged namespaces.
