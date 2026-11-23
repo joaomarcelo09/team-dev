@@ -45,6 +45,32 @@ pub enum ModelError {
     #[error("could not serialize model: {0}")]
     Serialize(#[from] toml::ser::Error),
 
+    /// A value could not be converted to or from JSON.
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    /// An audit event field does not follow the field rules.
+    #[error("invalid audit field {field}: {reason}")]
+    InvalidAuditField {
+        /// Name of the field.
+        field: &'static str,
+        /// Why the value is rejected.
+        reason: String,
+    },
+
+    /// An audit log path is a symlink or another non-regular file.
+    #[error("refusing unsafe audit log path {}", .0.display())]
+    UnsafeAuditPath(PathBuf),
+
+    /// An audit log is damaged and cannot be appended to or verified.
+    #[error("audit log at {} is corrupt: {detail}", .path.display())]
+    AuditCorrupt {
+        /// Path of the log.
+        path: PathBuf,
+        /// What is wrong.
+        detail: String,
+    },
+
     /// A specification did not pass intake linting.
     #[error("spec at {} failed lint with {} issue(s)", .path.display(), .issues.len())]
     InvalidSpec {
