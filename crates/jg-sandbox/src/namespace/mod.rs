@@ -16,6 +16,7 @@ use crate::state::{self, StateFile};
 mod exec;
 mod init;
 mod rootfs;
+mod scope;
 mod util;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);

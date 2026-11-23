@@ -14,6 +14,7 @@ pub mod error;
 pub mod exec;
 pub mod handle;
 pub mod namespace;
+pub mod scope;
 pub mod spec;
 mod state;
 
@@ -22,4 +23,5 @@ pub use error::{Result, SandboxError};
 pub use exec::{ExecOutput, ExecRequest};
 pub use handle::{NamespaceIds, SandboxHandle, Verified};
 pub use namespace::NamespaceBackend;
+pub use scope::{ExecScope, ScopeAccess};
 pub use spec::{DEFAULT_HOSTNAME, SandboxSpec, default_ro_binds};
