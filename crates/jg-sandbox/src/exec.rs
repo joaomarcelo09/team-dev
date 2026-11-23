@@ -83,7 +83,15 @@ impl ExecRequest {
     }
 
     /// The clean environment sent to the command: safe defaults plus the request.
-    pub fn resolved_env(&self) -> BTreeMap<String, String> {
+    ///
+    /// With an egress port, the HTTP proxy variables point at the in-sandbox
+    /// bridge. With a hub socket, `JG_HUB_SOCKET` names the in-sandbox socket.
+    /// The request environment still overrides every default.
+    pub fn resolved_env(
+        &self,
+        egress_port: Option<u16>,
+        hub_socket: Option<&Path>,
+    ) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         env.insert("PATH".to_string(), DEFAULT_PATH.to_string());
         let home = if self.scope.is_some() {
@@ -93,6 +101,26 @@ impl ExecRequest {
         };
         env.insert("HOME".to_string(), home.to_string());
         env.insert("LANG".to_string(), DEFAULT_LANG.to_string());
+        if let Some(port) = egress_port {
+            let proxy = format!("http://127.0.0.1:{port}");
+            for key in [
+                "HTTP_PROXY",
+                "HTTPS_PROXY",
+                "ALL_PROXY",
+                "http_proxy",
+                "https_proxy",
+                "all_proxy",
+            ] {
+                env.insert(key.to_string(), proxy.clone());
+            }
+            env.insert("NO_PROXY".to_string(), "localhost,127.0.0.1".to_string());
+        }
+        if hub_socket.is_some() {
+            env.insert(
+                "JG_HUB_SOCKET".to_string(),
+                crate::namespace::HUB_SOCKET_PATH.to_string(),
+            );
+        }
         env.extend(self.env.clone());
         env
     }
@@ -139,10 +167,59 @@ mod tests {
         let req = ExecRequest::new(vec!["echo".to_string()])
             .with_env("PATH", "/lab/bin")
             .with_env("CUSTOM", "yes");
-        let env = req.resolved_env();
+        let env = req.resolved_env(None, None);
         assert_eq!(env.get("PATH").map(String::as_str), Some("/lab/bin"));
         assert_eq!(env.get("CUSTOM").map(String::as_str), Some("yes"));
         assert_eq!(env.get("HOME").map(String::as_str), Some(DEFAULT_HOME));
+        assert!(!env.contains_key("HTTP_PROXY"));
+    }
+
+    #[test]
+    fn egress_port_adds_proxy_env_but_request_wins() {
+        let req = ExecRequest::new(vec!["true".to_string()]);
+        let env = req.resolved_env(Some(3128), None);
+        let proxy = Some("http://127.0.0.1:3128");
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(env.get(key).map(String::as_str), proxy, "{key}");
+        }
+        assert_eq!(
+            env.get("NO_PROXY").map(String::as_str),
+            Some("localhost,127.0.0.1")
+        );
+
+        let req = req.with_env("HTTPS_PROXY", "http://request");
+        let env = req.resolved_env(Some(3128), None);
+        assert_eq!(
+            env.get("HTTPS_PROXY").map(String::as_str),
+            Some("http://request")
+        );
+    }
+
+    #[test]
+    fn hub_socket_adds_env_but_request_wins() {
+        let req = ExecRequest::new(vec!["true".to_string()]);
+        let env = req.resolved_env(None, Some(Path::new("/tmp/hub.sock")));
+        assert_eq!(
+            env.get("JG_HUB_SOCKET").map(String::as_str),
+            Some("/run/jg/hub.sock")
+        );
+
+        let env = req.resolved_env(None, None);
+        assert!(!env.contains_key("JG_HUB_SOCKET"));
+
+        let req = req.with_env("JG_HUB_SOCKET", "/request/hub.sock");
+        let env = req.resolved_env(None, Some(Path::new("/tmp/hub.sock")));
+        assert_eq!(
+            env.get("JG_HUB_SOCKET").map(String::as_str),
+            Some("/request/hub.sock")
+        );
     }
 
     #[test]
@@ -150,12 +227,12 @@ mod tests {
         let scope = ExecScope::new(ScopeAccess::ReadOnly, "/lab/a");
         let req = ExecRequest::new(vec!["true".to_string()]).with_scope(scope);
         assert_eq!(req.effective_cwd(), Path::new(WORKSPACE));
-        let env = req.resolved_env();
+        let env = req.resolved_env(None, None);
         assert_eq!(env.get("HOME").map(String::as_str), Some(SCOPED_HOME));
 
         let req = req.with_cwd("/tmp").with_env("HOME", "/tmp/mine");
         assert_eq!(req.effective_cwd(), Path::new("/tmp"));
-        let env = req.resolved_env();
+        let env = req.resolved_env(None, None);
         assert_eq!(env.get("HOME").map(String::as_str), Some("/tmp/mine"));
     }
 
@@ -163,7 +240,7 @@ mod tests {
     fn unscoped_request_keeps_cwd_and_home() {
         let req = ExecRequest::new(vec!["true".to_string()]);
         assert_eq!(req.effective_cwd(), Path::new("/"));
-        let env = req.resolved_env();
+        let env = req.resolved_env(None, None);
         assert_eq!(env.get("HOME").map(String::as_str), Some(DEFAULT_HOME));
     }
 }

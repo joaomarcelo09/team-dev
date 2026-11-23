@@ -14,6 +14,7 @@ use crate::handle::{NamespaceIds, SandboxHandle, Verified};
 use crate::spec::SandboxSpec;
 use crate::state::{self, StateFile};
 
+mod bridge;
 mod exec;
 mod init;
 mod rootfs;
@@ -21,6 +22,12 @@ mod scope;
 mod util;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Where the host egress proxy socket is exposed inside the sandbox.
+pub(crate) const EGRESS_SOCKET_PATH: &str = "/run/jg/egress.sock";
+
+/// Where the hub shim socket is exposed inside the sandbox.
+pub(crate) const HUB_SOCKET_PATH: &str = "/run/jg/hub.sock";
 
 /// A backend built on Linux user, mount, pid, ipc, uts and net namespaces.
 #[derive(Debug, Default, Clone, Copy)]
@@ -69,6 +76,8 @@ impl Backend for NamespaceBackend {
             saved.pid,
             saved.cgroup.as_deref(),
             saved.spec.disk.tmp_bytes,
+            saved.spec.egress.as_ref().map(|egress| egress.port),
+            saved.spec.hub_socket.as_deref(),
             request,
         )
     }

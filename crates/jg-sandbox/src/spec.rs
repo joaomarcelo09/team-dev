@@ -18,6 +18,45 @@ pub const DEFAULT_ROOT_DISK_BYTES: u64 = 512 * 1024 * 1024;
 /// Default size of the sandbox `/tmp` tmpfs (1 GiB).
 pub const DEFAULT_TMP_DISK_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Default loopback port the in-sandbox egress bridge listens on.
+pub const DEFAULT_EGRESS_PORT: u16 = 3128;
+
+/// Host-side egress proxy reachable from inside the sandbox.
+///
+/// The caller starts an [`crate::egress::EgressProxy`] on `proxy_socket` and
+/// keeps it alive; the sandbox only bind-mounts that socket and forwards
+/// `127.0.0.1:<port>` connections to it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EgressSpec {
+    /// Host unix socket path of a running egress proxy.
+    pub proxy_socket: PathBuf,
+    /// Loopback TCP port served by the in-sandbox bridge.
+    #[serde(default = "default_egress_port")]
+    pub port: u16,
+}
+
+impl EgressSpec {
+    /// An egress spec for `proxy_socket` on the default bridge port.
+    pub fn new(proxy_socket: impl Into<PathBuf>) -> Self {
+        Self {
+            proxy_socket: proxy_socket.into(),
+            port: DEFAULT_EGRESS_PORT,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        validate_socket(&self.proxy_socket, "egress proxy socket")?;
+        if self.port == 0 {
+            return Err(SandboxError::invalid("egress port must not be zero"));
+        }
+        Ok(())
+    }
+}
+
+fn default_egress_port() -> u16 {
+    DEFAULT_EGRESS_PORT
+}
+
 /// Size caps for the two tmpfs mounts of a sandbox.
 ///
 /// The defaults keep the sizes of earlier releases, so a state file written
@@ -82,6 +121,18 @@ pub struct SandboxSpec {
     /// Delegated cgroup v2 parent; discovered when absent.
     #[serde(default)]
     pub cgroup_parent: Option<PathBuf>,
+    /// Host egress proxy exposed through the in-sandbox bridge.
+    ///
+    /// `None` keeps the original behaviour: no network and no proxy
+    /// environment. The caller owns the proxy's lifetime.
+    #[serde(default)]
+    pub egress: Option<EgressSpec>,
+    /// Host unix socket of the hub shim, exposed at `/run/jg/hub.sock`.
+    ///
+    /// `None` keeps the original behaviour: no hub socket and no
+    /// `JG_HUB_SOCKET` environment. The caller owns the socket's lifetime.
+    #[serde(default)]
+    pub hub_socket: Option<PathBuf>,
 }
 
 impl SandboxSpec {
@@ -96,6 +147,8 @@ impl SandboxSpec {
             limits: None,
             disk: DiskLimits::default(),
             cgroup_parent: None,
+            egress: None,
+            hub_socket: None,
         }
     }
 
@@ -136,23 +189,15 @@ impl SandboxSpec {
         }
 
         for path in &self.allowed_sockets {
-            validate_path(path, "allowed socket")?;
-            let meta = std::fs::symlink_metadata(path).map_err(|source| {
-                if source.kind() == std::io::ErrorKind::NotFound {
-                    SandboxError::invalid(format!(
-                        "allowed socket {} does not exist",
-                        path.display()
-                    ))
-                } else {
-                    SandboxError::io(path, source)
-                }
-            })?;
-            if !meta.file_type().is_socket() {
-                return Err(SandboxError::invalid(format!(
-                    "allowed socket {} is not a unix socket",
-                    path.display()
-                )));
-            }
+            validate_socket(path, "allowed socket")?;
+        }
+
+        if let Some(egress) = &self.egress {
+            egress.validate()?;
+        }
+
+        if let Some(hub_socket) = &self.hub_socket {
+            validate_socket(hub_socket, "hub socket")?;
         }
 
         if let Some(limits) = &self.limits {
@@ -232,6 +277,24 @@ fn validate_path(path: &Path, what: &str) -> Result<()> {
     if path.components().any(|part| part == Component::ParentDir) {
         return Err(SandboxError::invalid(format!(
             "{what} {} contains ..",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_socket(path: &Path, what: &str) -> Result<()> {
+    validate_path(path, what)?;
+    let meta = std::fs::symlink_metadata(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            SandboxError::invalid(format!("{what} {} does not exist", path.display()))
+        } else {
+            SandboxError::io(path, source)
+        }
+    })?;
+    if !meta.file_type().is_socket() {
+        return Err(SandboxError::invalid(format!(
+            "{what} {} is not a unix socket",
             path.display()
         )));
     }
@@ -330,6 +393,74 @@ mod tests {
         assert_eq!(spec.limits, None);
         assert_eq!(spec.disk, DiskLimits::default());
         assert_eq!(spec.cgroup_parent, None);
+        assert_eq!(spec.egress, None);
+        assert_eq!(spec.hub_socket, None);
+    }
+
+    #[test]
+    fn hub_socket_must_be_a_unix_socket() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab = temp.path().join("lab");
+        std::fs::create_dir_all(&lab).expect("lab dir");
+        let regular = temp.path().join("regular");
+        std::fs::write(&regular, b"not a socket").expect("write file");
+
+        let mut spec = SandboxSpec::new(temp.path().join("state"), &lab);
+        spec.ro_binds.clear();
+        spec.hub_socket = Some(temp.path().join("missing.sock"));
+        assert!(spec.validate().is_err());
+
+        spec.hub_socket = Some(regular);
+        assert!(spec.validate().is_err());
+
+        spec.hub_socket = Some(PathBuf::from("relative.sock"));
+        assert!(spec.validate().is_err());
+
+        spec.hub_socket = None;
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn egress_port_defaults_to_3128() {
+        let json = r#"{ "proxy_socket": "/tmp/x/egress.sock" }"#;
+        let spec: EgressSpec = serde_json::from_str(json).expect("egress spec loads");
+        assert_eq!(spec.port, DEFAULT_EGRESS_PORT);
+        assert_eq!(spec.port, 3128);
+    }
+
+    #[test]
+    fn egress_proxy_socket_must_be_a_unix_socket() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab = temp.path().join("lab");
+        std::fs::create_dir_all(&lab).expect("lab dir");
+        let regular = temp.path().join("regular");
+        std::fs::write(&regular, b"not a socket").expect("write file");
+
+        let mut spec = SandboxSpec::new(temp.path().join("state"), &lab);
+        spec.egress = Some(EgressSpec::new(temp.path().join("missing.sock")));
+        assert!(spec.validate().is_err());
+
+        spec.egress = Some(EgressSpec::new(regular));
+        assert!(spec.validate().is_err());
+
+        spec.egress = Some(EgressSpec::new("relative.sock"));
+        assert!(spec.validate().is_err());
+    }
+
+    #[test]
+    fn egress_port_zero_is_rejected() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab = temp.path().join("lab");
+        std::fs::create_dir_all(&lab).expect("lab dir");
+        let socket = temp.path().join("egress.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind socket");
+
+        let mut spec = SandboxSpec::new(temp.path().join("state"), &lab);
+        spec.egress = Some(EgressSpec {
+            proxy_socket: socket,
+            port: 0,
+        });
+        assert!(spec.validate().is_err());
     }
 
     #[test]

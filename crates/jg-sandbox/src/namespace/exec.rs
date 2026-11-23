@@ -86,6 +86,8 @@ pub(crate) fn run(
     init_pid: i32,
     lab: Option<&Path>,
     lab_tmp_bytes: u64,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
     request: &ExecRequest,
 ) -> Result<ExecOutput> {
     validate_request(request, lab_tmp_bytes)?;
@@ -96,7 +98,14 @@ pub(crate) fn run(
     let fork_result = util::fork_process()?;
     match fork_result {
         ForkResult::Parent { child } => run_parent(child, request, pipes),
-        ForkResult::Child => child_exec(request, namespaces, pipes, cgroup.as_deref()),
+        ForkResult::Child => child_exec(
+            request,
+            namespaces,
+            pipes,
+            cgroup.as_deref(),
+            egress_port,
+            hub_socket,
+        ),
     }
 }
 
@@ -365,6 +374,8 @@ fn child_exec(
     namespaces: NamespaceFds,
     pipes: Pipes,
     cgroup: Option<&Path>,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
 ) -> ! {
     let Pipes {
         stdin_r,
@@ -432,7 +443,18 @@ fn child_exec(
             drop(pid);
             drop(pid_w);
             supervisor_exec(
-                request, mount, ipc, uts, net, stdin_r, stdout_w, stderr_w, status_w, result_w,
+                request,
+                mount,
+                ipc,
+                uts,
+                net,
+                stdin_r,
+                stdout_w,
+                stderr_w,
+                status_w,
+                result_w,
+                egress_port,
+                hub_socket,
             )
         }
         ForkResult::Parent { child } => {
@@ -478,6 +500,8 @@ fn supervisor_exec(
     stderr_w: OwnedFd,
     status_w: OwnedFd,
     result_w: OwnedFd,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
 ) -> ! {
     // Join the sandbox filesystem view before creating the nested PID
     // namespace, so the whole exec shares the sandbox mounts and devices.
@@ -516,7 +540,18 @@ fn supervisor_exec(
 
     match fork_result {
         ForkResult::Child => nested_init_exec(
-            request, mount, ipc, uts, net, stdin_r, stdout_w, stderr_w, status_w, result_w,
+            request,
+            mount,
+            ipc,
+            uts,
+            net,
+            stdin_r,
+            stdout_w,
+            stderr_w,
+            status_w,
+            result_w,
+            egress_port,
+            hub_socket,
         ),
         ForkResult::Parent { child } => {
             drop(mount);
@@ -587,6 +622,8 @@ fn nested_init_exec(
     stderr_w: OwnedFd,
     status_w: OwnedFd,
     result_w: OwnedFd,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
 ) -> ! {
     // If the supervisor dies (for example the host backstop kills it), this
     // init must die too, so the kernel tears the nested namespace down.
@@ -610,7 +647,17 @@ fn nested_init_exec(
         ForkResult::Child => {
             drop(result_w);
             worker_exec(
-                request, mount, ipc, uts, net, stdin_r, stdout_w, stderr_w, status_w,
+                request,
+                mount,
+                ipc,
+                uts,
+                net,
+                stdin_r,
+                stdout_w,
+                stderr_w,
+                status_w,
+                egress_port,
+                hub_socket,
             )
         }
         ForkResult::Parent { child } => {
@@ -715,9 +762,21 @@ fn worker_exec(
     stdout_w: OwnedFd,
     stderr_w: OwnedFd,
     status_w: OwnedFd,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
 ) -> ! {
     match worker_setup(
-        request, &mount, &ipc, &uts, &net, &stdin_r, &stdout_w, &stderr_w, &status_w,
+        request,
+        &mount,
+        &ipc,
+        &uts,
+        &net,
+        &stdin_r,
+        &stdout_w,
+        &stderr_w,
+        &status_w,
+        egress_port,
+        hub_socket,
     ) {
         Ok(()) => util::exit_now(127),
         Err(error) => {
@@ -753,6 +812,8 @@ fn worker_setup(
     stdout_w: &OwnedFd,
     stderr_w: &OwnedFd,
     status_w: &OwnedFd,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
 ) -> Result<()> {
     join_sandbox(mount, ipc, uts, net)?;
     if let Some(scope) = &request.scope {
@@ -776,7 +837,7 @@ fn worker_setup(
     let cwd = request.effective_cwd();
     chdir(&cwd).map_err(|source| SandboxError::nix(format!("chdir {}", cwd.display()), source))?;
 
-    let (program, argv, env) = prepare_exec(request)?;
+    let (program, argv, env) = prepare_exec(request, egress_port, hub_socket)?;
     util::drop_all_privileges()?;
     // Only the stdio dups and the close-on-exec status pipe may survive here.
     util::close_inherited_fds(status_w.as_fd());
@@ -788,8 +849,12 @@ fn worker_setup(
     }
 }
 
-fn prepare_exec(request: &ExecRequest) -> Result<(CString, Vec<CString>, Vec<CString>)> {
-    let env = request.resolved_env();
+fn prepare_exec(
+    request: &ExecRequest,
+    egress_port: Option<u16>,
+    hub_socket: Option<&Path>,
+) -> Result<(CString, Vec<CString>, Vec<CString>)> {
+    let env = request.resolved_env(egress_port, hub_socket);
     let program = resolve_program(&request.argv[0], env.get("PATH").map(String::as_str))?;
     let program = c_string(&program)?;
     let argv = request
