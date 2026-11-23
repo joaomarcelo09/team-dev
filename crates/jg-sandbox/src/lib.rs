@@ -11,6 +11,7 @@
 
 pub mod backend;
 mod cgroup;
+pub mod egress;
 pub mod error;
 pub mod exec;
 pub mod handle;
@@ -20,9 +21,16 @@ pub mod spec;
 mod state;
 
 pub use backend::{Backend, FullAllowPermit, authorize_full_allow};
+pub use egress::{
+    AddressClass, Connector, EgressEvent, EgressPolicy, EgressProxy, Resolver, SystemResolver,
+    TcpConnector, classify_address,
+};
 pub use error::{Result, SandboxError};
 pub use exec::{ExecOutput, ExecRequest};
 pub use handle::{NamespaceIds, SandboxHandle, Verified};
 pub use namespace::NamespaceBackend;
 pub use scope::{DEFAULT_SCOPED_TMP_BYTES, ExecScope, ProjectLimits, ScopeAccess};
-pub use spec::{DEFAULT_HOSTNAME, DiskLimits, LabLimits, SandboxSpec, default_ro_binds};
+pub use spec::{
+    DEFAULT_EGRESS_PORT, DEFAULT_HOSTNAME, DiskLimits, EgressSpec, LabLimits, SandboxSpec,
+    default_ro_binds,
+};

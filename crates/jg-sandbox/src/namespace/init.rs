@@ -9,6 +9,7 @@ use nix::sys::wait::waitpid;
 use nix::unistd::{ForkResult, Pid, sethostname};
 
 use crate::error::{Result, SandboxError};
+use crate::namespace::bridge;
 use crate::namespace::rootfs;
 use crate::namespace::util;
 use crate::spec::SandboxSpec;
@@ -198,7 +199,7 @@ fn init_process(spec: &SandboxSpec, ready: &OwnedFd) -> ! {
     };
     let _ = util::write_all(ready.as_fd(), format!("PID {pid}\n").as_bytes());
 
-    match rootfs::setup_rootfs(spec).and_then(|()| util::drop_all_privileges()) {
+    match setup(spec) {
         Ok(()) => {
             let _ = util::write_all(ready.as_fd(), b"OK\n");
             init_loop()
@@ -208,6 +209,22 @@ fn init_process(spec: &SandboxSpec, ready: &OwnedFd) -> ! {
             util::exit_now(1)
         }
     }
+}
+
+/// Build the sandbox world, wiring egress before readiness is reported.
+///
+/// Egress failures happen here, before `create` returns, so a sandbox that
+/// asked for egress never comes up without its loopback bridge.
+fn setup(spec: &SandboxSpec) -> Result<()> {
+    rootfs::setup_rootfs(spec)?;
+    if spec.egress.is_some() {
+        bridge::bring_up_loopback()?;
+    }
+    util::drop_all_privileges()?;
+    if let Some(egress) = &spec.egress {
+        bridge::spawn(egress.port)?;
+    }
+    Ok(())
 }
 
 fn init_loop() -> ! {

@@ -11,6 +11,7 @@ use crate::namespace::util::{
     bind_non_recursive, make_mounts_private, mount_proc, mount_tmpfs, remount_read_only,
     verify_read_only, verify_read_only_tree,
 };
+use crate::namespace::{EGRESS_SOCKET_PATH, HUB_SOCKET_PATH};
 use crate::spec::SandboxSpec;
 
 const DEVICE_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
@@ -48,8 +49,24 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
     create_usr_symlinks(&root)?;
     write_etc(&root, spec)?;
 
+    let mut sockets = Vec::new();
     for socket in &spec.allowed_sockets {
-        bind_socket(socket, &root)?;
+        sockets.push((socket.as_path(), root.join(strip_root(socket))));
+    }
+    if let Some(hub_socket) = &spec.hub_socket {
+        sockets.push((
+            hub_socket.as_path(),
+            root.join(strip_root(Path::new(HUB_SOCKET_PATH))),
+        ));
+    }
+    if let Some(egress) = &spec.egress {
+        sockets.push((
+            egress.proxy_socket.as_path(),
+            root.join(strip_root(Path::new(EGRESS_SOCKET_PATH))),
+        ));
+    }
+    for (socket, destination) in sockets {
+        bind_socket(socket, &destination)?;
     }
 
     pivot_into(&root)?;
@@ -119,15 +136,14 @@ fn bind_rw(source: &Path, destination: &Path) -> Result<()> {
     bind_recursive(source, destination)
 }
 
-fn bind_socket(socket: &Path, root: &Path) -> Result<()> {
-    let destination = root.join(strip_root(socket));
+fn bind_socket(socket: &Path, destination: &Path) -> Result<()> {
     if let Some(parent) = destination.parent() {
         create_dir(parent)?;
     }
-    std::fs::File::create(&destination).map_err(|source| SandboxError::io(&destination, source))?;
+    std::fs::File::create(destination).map_err(|source| SandboxError::io(destination, source))?;
     nix::mount::mount(
         Some(socket),
-        destination.as_path(),
+        destination,
         None::<&str>,
         MsFlags::MS_BIND,
         None::<&str>,
