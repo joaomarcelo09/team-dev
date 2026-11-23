@@ -43,3 +43,5 @@ sha2 = "0.10"
 # Native folder picker through the desktop portal (no GTK).
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 libc = "0.2"
+nix = { version = "0.31", features = ["fs", "hostname", "mount", "poll", "sched", "signal", "user"] }
+tempfile = "3"
