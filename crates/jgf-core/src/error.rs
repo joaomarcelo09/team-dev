@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::spec::LintIssue;
+
 /// Errors produced while validating, loading or saving Dark Factory data.
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -42,6 +44,34 @@ pub enum ModelError {
     /// A model could not be serialized to TOML.
     #[error("could not serialize model: {0}")]
     Serialize(#[from] toml::ser::Error),
+
+    /// A specification did not pass intake linting.
+    #[error("spec at {} failed lint with {} issue(s)", .path.display(), .issues.len())]
+    InvalidSpec {
+        /// Path of the rejected source.
+        path: PathBuf,
+        /// All issues found by the linter.
+        issues: Vec<LintIssue>,
+    },
+
+    /// A project already has a frozen specification, which is never replaced.
+    #[error("spec at {} is already frozen", .0.display())]
+    SpecAlreadyFrozen(PathBuf),
+
+    /// A project has no frozen specification hash to verify against.
+    #[error("spec at {} has no frozen hash", .0.display())]
+    MissingSpecHash(PathBuf),
+
+    /// A frozen specification no longer matches its stored hash.
+    #[error("spec hash mismatch at {}: expected {expected}, got {actual}", .path.display())]
+    SpecHashMismatch {
+        /// Path of the frozen specification.
+        path: PathBuf,
+        /// Hash stored in the project.
+        expected: String,
+        /// Hash computed from the file.
+        actual: String,
+    },
 }
 
 impl ModelError {
