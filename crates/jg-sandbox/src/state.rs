@@ -23,6 +23,9 @@ pub(crate) struct StateFile {
     pub spec: SandboxSpec,
     /// Namespace inode ids at creation time.
     pub namespaces: NamespaceIds,
+    /// Host path of the sandbox cgroup, when limits were requested.
+    #[serde(default)]
+    pub cgroup: Option<PathBuf>,
 }
 
 pub(crate) fn state_path(state_dir: &Path) -> PathBuf {
@@ -109,6 +112,15 @@ pub(crate) fn verify_state(state: &StateFile) -> Result<Verified> {
         return Err(SandboxError::not_verified(
             "namespace ids do not match the recorded sandbox state",
         ));
+    }
+    if let Some(cgroup) = &state.cgroup
+        && !crate::cgroup::pid_inside(cgroup, state.pid)
+    {
+        return Err(SandboxError::not_verified(format!(
+            "init process {} is not in the recorded cgroup {}",
+            state.pid,
+            cgroup.display()
+        )));
     }
     Ok(Verified::new(state.pid, namespaces))
 }

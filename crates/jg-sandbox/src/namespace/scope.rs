@@ -43,7 +43,7 @@ pub(crate) fn enter_scope(scope: &ExecScope) -> Result<()> {
         util::verify_read_only_tree(workspace)?;
     }
     cover_lab(&git_mounts, scope.access)?;
-    mount_private_tmp()
+    mount_private_tmp(scope)
 }
 
 /// Create the default `HOME` of a scoped exec on its private `/tmp`.
@@ -203,6 +203,7 @@ fn mount_git(git: &GitMount, access: ScopeAccess) -> Result<()> {
 }
 
 /// Give the exec its own empty `/tmp`, so nothing is shared with other execs.
-fn mount_private_tmp() -> Result<()> {
-    util::mount_tmpfs(Path::new(TMP_DIR), "mode=1777,size=256m")
+fn mount_private_tmp(scope: &ExecScope) -> Result<()> {
+    let options = format!("mode=1777,size={}", scope.effective_tmp_bytes());
+    util::mount_tmpfs(Path::new(TMP_DIR), &options)
 }

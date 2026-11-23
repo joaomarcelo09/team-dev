@@ -10,6 +10,7 @@
 //! Dark Factory crates.
 
 pub mod backend;
+mod cgroup;
 pub mod error;
 pub mod exec;
 pub mod handle;
@@ -23,5 +24,5 @@ pub use error::{Result, SandboxError};
 pub use exec::{ExecOutput, ExecRequest};
 pub use handle::{NamespaceIds, SandboxHandle, Verified};
 pub use namespace::NamespaceBackend;
-pub use scope::{ExecScope, ScopeAccess};
-pub use spec::{DEFAULT_HOSTNAME, SandboxSpec, default_ro_binds};
+pub use scope::{DEFAULT_SCOPED_TMP_BYTES, ExecScope, ProjectLimits, ScopeAccess};
+pub use spec::{DEFAULT_HOSTNAME, DiskLimits, LabLimits, SandboxSpec, default_ro_binds};

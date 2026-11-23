@@ -23,7 +23,7 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
     let root = crate::state::rootfs_path(&spec.state_dir);
 
     make_mounts_private()?;
-    mount_tmpfs(&root, "mode=0755,size=512m")?;
+    mount_tmpfs(&root, &format!("mode=0755,size={}", spec.disk.root_bytes))?;
 
     for dir in ["usr", "etc", "proc", "dev", "tmp", "lab"] {
         create_dir(root.join(dir))?;
@@ -31,7 +31,10 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
 
     // Mounted before the allowed sockets and binds so that those can shadow
     // paths below them without being hidden by a later mount.
-    mount_tmpfs(&root.join("tmp"), "mode=1777,size=1g")?;
+    mount_tmpfs(
+        &root.join("tmp"),
+        &format!("mode=1777,size={}", spec.disk.tmp_bytes),
+    )?;
     mount_proc(&root.join("proc"))?;
     mount_dev(&root.join("dev"))?;
 

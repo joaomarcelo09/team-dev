@@ -48,16 +48,26 @@ fn ns_inode(pid: i32, name: &str) -> Result<u64> {
 pub struct SandboxHandle {
     spec: SandboxSpec,
     init_pid: i32,
+    cgroup: Option<PathBuf>,
 }
 
 impl SandboxHandle {
-    pub(crate) fn new(spec: SandboxSpec, init_pid: i32) -> Self {
-        Self { spec, init_pid }
+    pub(crate) fn new(spec: SandboxSpec, init_pid: i32, cgroup: Option<PathBuf>) -> Self {
+        Self {
+            spec,
+            init_pid,
+            cgroup,
+        }
     }
 
     /// Host pid of the sandbox init (pid 1 of the sandbox PID namespace).
     pub fn init_pid(&self) -> i32 {
         self.init_pid
+    }
+
+    /// Host cgroup v2 directory of this sandbox, when limits were requested.
+    pub fn cgroup_path(&self) -> Option<&Path> {
+        self.cgroup.as_deref()
     }
 
     /// The host directory holding this sandbox's state.
