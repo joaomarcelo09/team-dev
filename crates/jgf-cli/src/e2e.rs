@@ -34,6 +34,7 @@ use jgf_hub::{
 use thiserror::Error;
 
 use crate::coder::{ClaudeCoderRunner, CoderRequest, CoderRun, CoderRunner, FakeCoderRunner};
+use crate::lab_world::EndOfLifePolicy;
 use crate::reviewer::{
     ClaudeReviewerRunner, FakeReviewerRunner, ReviewDecision, ReviewRequest, ReviewRun,
     ReviewerRunner,
@@ -92,6 +93,8 @@ const MAX_TITLE_CHARS: usize = 60;
 const SANDBOX_AUDIT_NOTE: &str = "real Claude children run in a jg-sandbox world; work tree writable except .git is read-only; scratch HOME holds only Claude credentials; no host secrets or direct network; Claude API egress is allowlisted";
 /// Parent directory of the disposable jg-sandbox states.
 const E2E_SANDBOX_DIR: &str = "e2e-sandboxes";
+/// E2E runs destroy their sandbox at every terminal outcome.
+const E2E_SANDBOX_POLICY: EndOfLifePolicy = EndOfLifePolicy::DestroyOnKill;
 /// Directory that holds the CI watcher state of a run.
 const CI_WATCH_DIR: &str = "ci-watch";
 /// CI watcher directory of dry runs, kept apart from the real fix-cycle counters.
@@ -583,9 +586,12 @@ pub fn run(config: &E2eConfig) -> RunOutcome {
             ClaudeSandbox::scratch_dir(&run_lab_dir(&config)).display(),
         );
         let store = FileSecretStore::new(&config.state_dir);
-        let sandbox = std::sync::Arc::new(ClaudeSandbox::new(
+        let sandbox = std::sync::Arc::new(ClaudeSandbox::new_with_audit(
             config.state_dir.join(E2E_SANDBOX_DIR).join(&config.lab),
             "claude",
+            config.state_dir.clone(),
+            config.lab.clone(),
+            E2E_SANDBOX_POLICY,
         ));
         run_prepared_sandboxed(
             &config,
@@ -637,7 +643,7 @@ where
     R: ReviewerRunner + ?Sized,
     K: KillSwitch,
 {
-    run_prepared_with_cleanup(config, backend, store, coder, reviewer, kill, None, || {
+    run_prepared_with_cleanup(config, backend, store, coder, reviewer, kill, None, |_| {
         Ok(())
     })
 }
@@ -666,7 +672,7 @@ where
         reviewer,
         kill,
         Some(sandbox),
-        || sandbox.destroy(),
+        |outcome| sandbox.finish(outcome),
     )
 }
 
@@ -687,7 +693,7 @@ where
     C: CoderRunner + ?Sized,
     R: ReviewerRunner + ?Sized,
     K: KillSwitch,
-    F: FnOnce() -> Result<(), String>,
+    F: FnOnce(&RunOutcome) -> Result<(), String>,
 {
     let progress = Progress::default();
     let mut outcome = match deliver(
@@ -698,7 +704,7 @@ where
         Err(E2eError::Killed) => RunOutcome::Killed,
         Err(error) => RunOutcome::failed(error.to_string()),
     };
-    if let Err(error) = cleanup() {
+    if let Err(error) = cleanup(&outcome) {
         outcome = RunOutcome::failed(format!("jg-sandbox cleanup failed: {error}"));
     }
     let outcome = redact_outcome_email(outcome, config);
@@ -2921,6 +2927,8 @@ mod tests {
     use jgf_hub::BackendOp;
     use tempfile::TempDir;
 
+    use crate::lab_world::{LabWorld, RunEnd};
+
     use super::*;
 
     fn fixture_dir() -> PathBuf {
@@ -3017,7 +3025,7 @@ mod tests {
             reviewer,
             kill,
             None,
-            || {
+            |_| {
                 cleaned.set(true);
                 Ok(())
             },
@@ -3085,6 +3093,59 @@ mod tests {
             run_prepared_with_test_cleanup(&cfg, &backend, &coder, &reviewer, &kill, &cleaned);
         assert_eq!(outcome, RunOutcome::Killed);
         assert!(cleaned.get());
+    }
+
+    #[test]
+    fn failed_sandboxed_run_destroys_world_and_scratch_home() {
+        let root = TempDir::new().expect("temp dir");
+        let config = start_run(&config(&root)).expect("start test run");
+        let sandbox_root = root.path().join("sandbox");
+        let state_dir = sandbox_root.join("state");
+        let lab_dir = sandbox_root.join("lab");
+        let work_tree = lab_dir.join(LAB_WORK_DIR);
+        let scratch_home = lab_dir.join(LAB_SCRATCH_DIR);
+        fs::create_dir_all(&state_dir).expect("sandbox state");
+        fs::create_dir_all(&work_tree).expect("sandbox work tree");
+        fs::create_dir_all(&scratch_home).expect("sandbox scratch home");
+
+        let world = LabWorld::new(
+            &state_dir,
+            &config.state_dir,
+            config.lab.clone(),
+            E2E_SANDBOX_POLICY,
+        );
+        world
+            .create(&lab_dir, &work_tree, &scratch_home, |_| Ok(()))
+            .expect("create sandbox world");
+
+        let cleanup_state_dir = state_dir.clone();
+        let cleanup_scratch_home = scratch_home.clone();
+        let outcome = run_prepared_with_cleanup(
+            &config,
+            &ci_backend(&config, [CiState::Green]),
+            &MemorySecretStore::dry_run(),
+            &FakeCoderRunner::new(crate::coder::FakeCoderBehavior::Fail),
+            &FakeReviewerRunner::approving(),
+            &NoKillSwitch,
+            None,
+            |outcome| {
+                let run_end = match outcome {
+                    RunOutcome::Delivered => RunEnd::Success,
+                    RunOutcome::Killed => RunEnd::Killed,
+                    RunOutcome::Failed { .. } | RunOutcome::BudgetExhausted => RunEnd::Failure,
+                };
+                world.finish(run_end, || {
+                    fs::remove_dir_all(&cleanup_state_dir).map_err(|error| error.to_string())?;
+                    fs::remove_dir_all(&cleanup_scratch_home).map_err(|error| error.to_string())?;
+                    Ok(())
+                })
+            },
+        );
+
+        assert!(matches!(outcome, RunOutcome::Failed { .. }));
+        assert_eq!(world.status(), crate::lab_world::WorldStatus::Destroyed);
+        assert!(!state_dir.exists());
+        assert!(!scratch_home.exists());
     }
 
     #[test]
