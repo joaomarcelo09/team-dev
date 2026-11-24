@@ -6,6 +6,7 @@ use std::{
 };
 
 use jgf_core::{AuditKind, AuditLog};
+use jgf_hub::ShimAuditEvent;
 
 const LAB_WORK_DIR: &str = "work";
 
@@ -370,6 +371,10 @@ impl LabWorld {
         role: &str,
     ) -> Result<(), String> {
         self.audit_tagged(Some(project), Some(worker), &format!("role_start:{role}"))
+    }
+
+    pub(crate) fn record_hub_event(&self, event: &ShimAuditEvent) -> Result<(), String> {
+        self.audit(&event.audit_summary())
     }
 
     fn audit_tagged(

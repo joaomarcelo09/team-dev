@@ -31,10 +31,10 @@
 //! notion: the router sets `wakes` from the message kind, never from the
 //! sender, and routine worker results never reach the Lab inbox.
 //!
-//! Audit wiring belongs to the lab runtime, which is not part of this module:
-//! refusals are returned as typed errors instead of being written to the audit
-//! log. Likewise this module only holds [`CoordinatorConfig`] data; running
-//! Coordinators inside the lab sandbox comes later.
+//! The [`crate::shim`] module exposes this router over a host-owned unix socket
+//! for sandboxed roles. It binds each launch to a host-issued token, returns
+//! typed refusals, and emits token-free send/refusal events for runtime audit
+//! callbacks. The lab runtime owns the callback and the launch-token lifetime.
 
 use std::{
     fmt,
