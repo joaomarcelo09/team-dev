@@ -9,15 +9,14 @@ use nix::unistd::pivot_root;
 use crate::error::{Result, SandboxError};
 use crate::namespace::util::{
     bind_non_recursive, make_mounts_private, mount_proc, mount_tmpfs, remount_read_only,
-    verify_read_only, verify_read_only_tree,
+    remount_read_only_keeping_flags, verify_read_only, verify_read_only_tree,
 };
 use crate::namespace::{EGRESS_SOCKET_PATH, HUB_SOCKET_PATH};
+use crate::namespace::{SANDBOX_GID, SANDBOX_UID};
 use crate::spec::SandboxSpec;
 
 const DEVICE_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
 const USR_SYMLINKS: [&str; 4] = ["bin", "sbin", "lib", "lib64"];
-const ETC_PASSWD: &str = "root:x:0:0:root:/lab/home:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
-const ETC_GROUP: &str = "root:x:0:\nnogroup:x:65534:\n";
 
 /// Mount the fresh root, populate it, and pivot into it. Runs as sandbox pid 1.
 pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
@@ -46,6 +45,7 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
     }
 
     bind_rw(&spec.lab_dir, &root.join("lab"))?;
+    bind_lab_read_only(&spec.lab_dir, &spec.lab_ro_binds, &root)?;
     create_usr_symlinks(&root)?;
     write_etc(&root, spec)?;
 
@@ -105,7 +105,16 @@ fn mount_dev(target: &Path) -> Result<()> {
 
 fn bind_read_only(source: &Path, root: &Path) -> Result<()> {
     let destination = root.join(strip_root(source));
-    create_dir(&destination)?;
+    let metadata = std::fs::metadata(source).map_err(|error| SandboxError::io(source, error))?;
+    if metadata.is_dir() {
+        create_dir(&destination)?;
+    } else {
+        if let Some(parent) = destination.parent() {
+            create_dir(parent)?;
+        }
+        std::fs::File::create(&destination)
+            .map_err(|error| SandboxError::io(&destination, error))?;
+    }
     // A non-recursive bind on purpose: a recursive bind also copies the source
     // submounts, and in an unprivileged user namespace those copies are locked
     // and cannot be remounted read-only. A non-recursive bind exposes no
@@ -134,6 +143,32 @@ fn bind_recursive(source: &Path, destination: &Path) -> Result<()> {
 
 fn bind_rw(source: &Path, destination: &Path) -> Result<()> {
     bind_recursive(source, destination)
+}
+
+fn bind_lab_read_only(lab_dir: &Path, binds: &[PathBuf], root: &Path) -> Result<()> {
+    let lab_dir =
+        std::fs::canonicalize(lab_dir).map_err(|source| SandboxError::io(lab_dir, source))?;
+    let mut binds = binds.to_vec();
+    binds.sort_by_key(|path| path.components().count());
+    for source in binds {
+        let source =
+            std::fs::canonicalize(&source).map_err(|error| SandboxError::io(&source, error))?;
+        let relative = source.strip_prefix(&lab_dir).map_err(|_| {
+            SandboxError::invalid(format!(
+                "read-only lab bind {} is outside {}",
+                source.display(),
+                lab_dir.display()
+            ))
+        })?;
+        let destination = root.join("lab").join(relative);
+        bind_non_recursive(&source, &destination)?;
+        let destination = std::fs::canonicalize(&destination)
+            .map_err(|error| SandboxError::io(&destination, error))?;
+        remount_read_only_keeping_flags(&destination)?;
+        verify_read_only(&destination)?;
+        verify_read_only_tree(&destination)?;
+    }
+    Ok(())
 }
 
 fn bind_socket(socket: &Path, destination: &Path) -> Result<()> {
@@ -168,9 +203,13 @@ fn create_usr_symlinks(root: &Path) -> Result<()> {
 
 fn write_etc(root: &Path, spec: &SandboxSpec) -> Result<()> {
     let etc = root.join("etc");
+    let passwd = format!(
+        "root:x:0:0:root:/lab/home:/bin/sh\nsandbox:x:{SANDBOX_UID}:{SANDBOX_GID}:sandbox:/lab/home:/bin/sh\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+    );
+    let group = format!("root:x:0:\nsandbox:x:{SANDBOX_GID}:\nnogroup:x:65534:\n");
     let files = [
-        ("passwd", ETC_PASSWD.to_string()),
-        ("group", ETC_GROUP.to_string()),
+        ("passwd", passwd),
+        ("group", group),
         ("hostname", format!("{}\n", spec.hostname)),
     ];
     for (name, contents) in files {

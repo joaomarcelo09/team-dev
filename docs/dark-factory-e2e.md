@@ -10,9 +10,13 @@ branch, with the audit log and the kill switch.
 2. The runner creates a private GitHub repository (`jgf-e2e-toy-<timestamp>`) through the broker,
    pushes `main` and `develop` from the fixture, and refuses to start when the fixture has no
    `.github/workflows/*.yml` at its root.
-3. The coder (`claude -p`) works on `jgt/e2e-toy-<n>` inside `bwrap`: the work tree is writable except
-   `.git`, system directories are read-only, there is a scratch HOME with only the Claude
-   credentials file, and the network is open. Moving it into `jg-sandbox` is a follow-up.
+3. The coder (`claude -p`) works on `jgt/e2e-toy-<n>` inside one `jg-sandbox` world shared with the
+   reviewer. The per-run lab contains sibling `work/` and `scratch/` directories; only the task
+   work tree, required read-only runtime paths, and the single Claude credentials file are exposed.
+   The work tree is writable except for read-only `.git`, and the scratch HOME contains only Claude
+   credentials. Direct networking is disabled; the host egress
+   proxy allows only `api.anthropic.com:443` for Claude API traffic. The world and scratch HOME are
+   destroyed when the run ends.
 4. The runner commits as `Dark Factory` with a `Co-authored-by` trailer for the operator (read from the
    global git config; `--co-author` and `--no-co-author` override it), pushes the task branch and opens a
    PR into `develop`.

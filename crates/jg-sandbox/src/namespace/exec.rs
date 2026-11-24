@@ -15,13 +15,15 @@ use nix::sched::{CloneFlags, setns, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{
-    ForkResult, Pid, chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, getpid, getppid, setsid,
+    ForkResult, Gid, Pid, Uid, chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, getpid,
+    getppid, setgid, setsid, setuid,
 };
 
 use crate::error::{Result, SandboxError};
 use crate::exec::{ExecOutput, ExecRequest};
 use crate::namespace::scope;
 use crate::namespace::util::{self, NamespaceFds};
+use crate::namespace::{SANDBOX_GID, SANDBOX_UID};
 
 const START_TIMEOUT: Duration = Duration::from_secs(10);
 const KILL_GRACE: Duration = Duration::from_secs(5);
@@ -952,6 +954,7 @@ fn worker_setup(
     chdir(&cwd).map_err(|source| SandboxError::nix(format!("chdir {}", cwd.display()), source))?;
 
     let (program, argv, env) = prepare_exec(request, egress_port, hub_socket)?;
+    set_exec_identity()?;
     util::drop_all_privileges()?;
     // Only the stdio dups and the close-on-exec status pipe may survive here.
     util::close_inherited_fds(status_w.as_fd());
@@ -961,6 +964,12 @@ fn worker_setup(
             reason: format!("execve {}: {source}", program.to_string_lossy()),
         }),
     }
+}
+
+fn set_exec_identity() -> Result<()> {
+    setgid(Gid::from_raw(SANDBOX_GID))
+        .map_err(|source| SandboxError::nix("set exec gid", source))?;
+    setuid(Uid::from_raw(SANDBOX_UID)).map_err(|source| SandboxError::nix("set exec uid", source))
 }
 
 fn prepare_exec(

@@ -38,6 +38,7 @@ use crate::reviewer::{
     ClaudeReviewerRunner, FakeReviewerRunner, ReviewDecision, ReviewRequest, ReviewRun,
     ReviewerRunner,
 };
+use crate::sandbox::ClaudeSandbox;
 
 /// Default branch the toy repository starts from.
 pub const DEFAULT_BRANCH: &str = "main";
@@ -55,8 +56,16 @@ const SETUP_COMMIT: &str = "feat: add toy notes fixture";
 const BROKER_DIR: &str = "broker";
 /// Broker state directory of dry runs, kept apart so they never spend the real daily caps.
 const DRY_RUN_BROKER_DIR: &str = "broker-dry-run";
-/// Directory that holds the scratch work tree of each run.
+/// Directory for run-control files such as the kill switch and latest-run pointer.
 const RUNS_DIR: &str = "e2e";
+/// Directory that holds each run's sandbox lab.
+const E2E_LABS_DIR: &str = "e2e-labs";
+/// Work-tree directory inside a run lab.
+const LAB_WORK_DIR: &str = "work";
+/// Claude scratch-home directory inside a run lab.
+const LAB_SCRATCH_DIR: &str = "scratch";
+/// Legacy Claude scratch path inside a work tree, excluded from host commits.
+const LEGACY_CLAUDE_SCRATCH_PATH: &str = ".jgf-claude-home";
 /// Name of the kill-switch file inside [`RUNS_DIR`].
 pub const KILL_FILE: &str = "KILL";
 /// Name of the file, inside [`RUNS_DIR`], that points at the lab of the latest run.
@@ -79,8 +88,10 @@ const BOARD_DIR: &str = "board";
 const FIXTURE_ENV: &str = "JGF_E2E_FIXTURE";
 /// Longest title (and commit summary) the planner takes from the spec.
 const MAX_TITLE_CHARS: usize = 60;
-/// Filesystem/network boundary used by real Claude children; full jg-sandbox remains a follow-up.
-const BWRAP_AUDIT_NOTE: &str = "real Claude children use bwrap filesystem isolation; work tree writable except .git is read-only; dry-run fakes spawn no child; network open; Claude auth only; full jg-sandbox is a follow-up";
+/// Filesystem/network boundary used by real Claude children.
+const SANDBOX_AUDIT_NOTE: &str = "real Claude children run in a jg-sandbox world; work tree writable except .git is read-only; scratch HOME holds only Claude credentials; no host secrets or direct network; Claude API egress is allowlisted";
+/// Parent directory of the disposable jg-sandbox states.
+const E2E_SANDBOX_DIR: &str = "e2e-sandboxes";
 /// Directory that holds the CI watcher state of a run.
 const CI_WATCH_DIR: &str = "ci-watch";
 /// CI watcher directory of dry runs, kept apart from the real fix-cycle counters.
@@ -493,6 +504,14 @@ pub enum E2eError {
     #[error("reviewer failed: {0}")]
     Review(String),
 
+    /// The isolated Claude world could not be created, used or destroyed.
+    #[error("jg-sandbox failed: {0}")]
+    Sandbox(String),
+
+    /// A legacy Claude scratch path was already staged by another operation.
+    #[error("refusing to commit: staged content exists under the legacy Claude scratch path")]
+    LegacyScratchStaged,
+
     /// The CI watcher refused a result or failed to persist its state.
     #[error(transparent)]
     Ci(#[from] CiError),
@@ -548,7 +567,8 @@ pub fn run(config: &E2eConfig) -> RunOutcome {
     };
     let kill = FileKillSwitch::new(&config.state_dir);
     if config.dry_run {
-        let backend = DryRunBackend::new(work_dir(&config), [CiState::Failed, CiState::Green]);
+        let backend =
+            DryRunBackend::new(config.state_dir.clone(), [CiState::Failed, CiState::Green]);
         run_prepared(
             &config,
             &backend,
@@ -559,17 +579,22 @@ pub fn run(config: &E2eConfig) -> RunOutcome {
         )
     } else {
         println!(
-            "coder/reviewer filesystem isolated via bwrap (host filesystem is not visible except for the listed binds: task work tree is writable except .git, which is read-only; scratch is writable; system directories and the Claude credentials file are read-only; /tmp is a fresh tmpfs; /proc and /dev are fresh views); network is open, so Claude can still reach whatever the network allows with Claude auth only. Full jg-sandbox is a follow-up. Scratch HOME: {}",
-            scratch_dir(&config).display(),
+            "coder/reviewer run in jg-sandbox (work tree writable except .git; scratch HOME contains only Claude credentials; system/runtime paths read-only; no direct network; Claude API egress allowlisted). Scratch HOME: {}",
+            ClaudeSandbox::scratch_dir(&run_lab_dir(&config)).display(),
         );
         let store = FileSecretStore::new(&config.state_dir);
-        run_prepared(
+        let sandbox = std::sync::Arc::new(ClaudeSandbox::new(
+            config.state_dir.join(E2E_SANDBOX_DIR).join(&config.lab),
+            "claude",
+        ));
+        run_prepared_sandboxed(
             &config,
             &GhCliBackend::new(work_dir(&config)),
             &store,
-            &ClaudeCoderRunner::new(),
-            &ClaudeReviewerRunner::new(),
+            &ClaudeCoderRunner::in_sandbox(std::sync::Arc::clone(&sandbox)),
+            &ClaudeReviewerRunner::in_sandbox(std::sync::Arc::clone(&sandbox)),
             &kill,
+            &sandbox,
         )
     }
 }
@@ -612,13 +637,70 @@ where
     R: ReviewerRunner + ?Sized,
     K: KillSwitch,
 {
+    run_prepared_with_cleanup(config, backend, store, coder, reviewer, kill, None, || {
+        Ok(())
+    })
+}
+
+fn run_prepared_sandboxed<B, S, C, R, K>(
+    config: &E2eConfig,
+    backend: &B,
+    store: &S,
+    coder: &C,
+    reviewer: &R,
+    kill: &K,
+    sandbox: &ClaudeSandbox,
+) -> RunOutcome
+where
+    B: GithubBackend + ?Sized,
+    S: SecretStore + ?Sized,
+    C: CoderRunner + ?Sized,
+    R: ReviewerRunner + ?Sized,
+    K: KillSwitch,
+{
+    run_prepared_with_cleanup(
+        config,
+        backend,
+        store,
+        coder,
+        reviewer,
+        kill,
+        Some(sandbox),
+        || sandbox.destroy(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_prepared_with_cleanup<B, S, C, R, K, F>(
+    config: &E2eConfig,
+    backend: &B,
+    store: &S,
+    coder: &C,
+    reviewer: &R,
+    kill: &K,
+    sandbox: Option<&ClaudeSandbox>,
+    cleanup: F,
+) -> RunOutcome
+where
+    B: GithubBackend + ?Sized,
+    S: SecretStore + ?Sized,
+    C: CoderRunner + ?Sized,
+    R: ReviewerRunner + ?Sized,
+    K: KillSwitch,
+    F: FnOnce() -> Result<(), String>,
+{
     let progress = Progress::default();
-    let outcome = match deliver(config, backend, store, coder, reviewer, kill, &progress) {
+    let mut outcome = match deliver(
+        config, backend, store, coder, reviewer, kill, &progress, sandbox,
+    ) {
         Ok(()) => RunOutcome::Delivered,
         Err(E2eError::Budget(_)) => RunOutcome::budget_exhausted(),
         Err(E2eError::Killed) => RunOutcome::Killed,
         Err(error) => RunOutcome::failed(error.to_string()),
     };
+    if let Err(error) = cleanup() {
+        outcome = RunOutcome::failed(format!("jg-sandbox cleanup failed: {error}"));
+    }
     let outcome = redact_outcome_email(outcome, config);
     if let Err(error) = record_outcome(config, &outcome, progress.current()) {
         return RunOutcome::failed(format!("could not record the run outcome: {error}"));
@@ -763,20 +845,52 @@ fn audit_push_cap(audit: &AuditLog, max_pushes_per_day: u32) -> Result<(), E2eEr
 fn clean_old_scratch(config: &E2eConfig) -> Result<(), E2eError> {
     let root = config.state_dir.join(SCRATCH_DIR);
     let entries = match fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(entries) => Some(entries),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(io_error(&root, error)),
     };
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = entry.map_err(|error| io_error(&root, error))?;
+            let lab_name = entry.file_name();
+            let lab = lab_name.to_string_lossy();
+            if lab != config.lab && is_scratch_lab(&lab) {
+                let file_type = entry
+                    .file_type()
+                    .map_err(|error| io_error(entry.path(), error))?;
+                if file_type.is_dir() {
+                    fs::remove_dir_all(entry.path())
+                        .map_err(|error| io_error(entry.path(), error))?;
+                }
+            }
+        }
+    }
+
+    let labs = config.state_dir.join(E2E_LABS_DIR);
+    let entries = match fs::read_dir(&labs) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(io_error(&labs, error)),
+    };
     for entry in entries {
-        let entry = entry.map_err(|error| io_error(&root, error))?;
+        let entry = entry.map_err(|error| io_error(&labs, error))?;
         let lab_name = entry.file_name();
         let lab = lab_name.to_string_lossy();
         if lab != config.lab && is_scratch_lab(&lab) {
             let file_type = entry
                 .file_type()
                 .map_err(|error| io_error(entry.path(), error))?;
-            if file_type.is_dir() {
-                fs::remove_dir_all(entry.path()).map_err(|error| io_error(entry.path(), error))?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let scratch = entry.path().join(LAB_SCRATCH_DIR);
+            match fs::symlink_metadata(&scratch) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    fs::remove_dir_all(&scratch).map_err(|error| io_error(&scratch, error))?;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(io_error(&scratch, error)),
             }
         }
     }
@@ -971,7 +1085,7 @@ fn flow_rank(event: &AuditEvent, intake_seen: bool) -> Option<usize> {
             match (first, second) {
                 (Some("jgf"), Some("spec")) => Some(1),
                 (Some("jgf"), Some("plan")) => Some(2),
-                (Some("bwrap"), _) => Some(if event.worker.as_deref() == Some("reviewer") {
+                (Some("jg-sandbox"), _) => Some(if event.worker.as_deref() == Some("reviewer") {
                     9
                 } else {
                     4
@@ -1065,14 +1179,30 @@ fn check_for_tokens(state_dir: &Path, events: &[AuditEvent], problems: &mut Vec<
     }
 }
 
+/// Per-run lab directory of `config`.
+fn run_lab_dir(config: &E2eConfig) -> PathBuf {
+    let lab = if config.lab == E2E_LAB {
+        latest_run_lab(&config.state_dir)
+    } else {
+        config.lab.clone()
+    };
+    config.state_dir.join(E2E_LABS_DIR).join(lab)
+}
+
 /// Scratch work tree of `config`.
 pub fn work_dir(config: &E2eConfig) -> PathBuf {
-    config.state_dir.join(RUNS_DIR).join(&config.repo)
+    run_lab_dir(config).join(LAB_WORK_DIR)
 }
 
 /// Scratch home of the coder and reviewer children of this run.
 fn scratch_dir(config: &E2eConfig) -> PathBuf {
     config.state_dir.join(SCRATCH_DIR).join(&config.lab)
+}
+
+fn child_scratch_dir(config: &E2eConfig, sandbox: Option<&ClaudeSandbox>) -> PathBuf {
+    sandbox
+        .map(|_| ClaudeSandbox::scratch_dir(&run_lab_dir(config)))
+        .unwrap_or_else(|| scratch_dir(config))
 }
 
 fn broker_dir(config: &E2eConfig) -> PathBuf {
@@ -1125,6 +1255,7 @@ pub fn default_fixture_dir() -> Result<PathBuf, E2eError> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn deliver<B, S, C, R, K>(
     config: &E2eConfig,
     backend: &B,
@@ -1133,6 +1264,7 @@ fn deliver<B, S, C, R, K>(
     reviewer: &R,
     kill: &K,
     progress: &Progress,
+    sandbox: Option<&ClaudeSandbox>,
 ) -> Result<(), E2eError>
 where
     B: GithubBackend + ?Sized,
@@ -1167,7 +1299,7 @@ where
 
     fs::create_dir_all(work_dir(config)).map_err(|source| io_error(work_dir(config), source))?;
 
-    setup(config, &broker, &audit, backend, store)?;
+    setup(config, &broker, &audit, backend, store, sandbox)?;
 
     begin_step(progress, kill, Step::Intake)?;
     let (project, spec) = intake(config, &audit)?;
@@ -1188,7 +1320,7 @@ where
         state_dir: config.state_dir.clone(),
         prompt,
         work_dir: work_dir(config),
-        scratch_dir: scratch_dir(config),
+        scratch_dir: child_scratch_dir(config, sandbox),
         timeout: config.coder_timeout,
         max_turns: config.max_coder_turns,
         max_budget_usd: config.max_coder_budget_usd,
@@ -1206,7 +1338,7 @@ where
 
     watch_pr(
         config, &broker, &audit, backend, store, coder, reviewer, kill, progress, &project, &spec,
-        &plan, task, &card.key, &branch, started,
+        &plan, task, &card.key, &branch, started, sandbox,
     )
 }
 
@@ -1229,6 +1361,7 @@ fn watch_pr<B, S, C, R, K>(
     card_key: &str,
     branch: &str,
     started: Instant,
+    sandbox: Option<&ClaudeSandbox>,
 ) -> Result<(), E2eError>
 where
     B: GithubBackend + ?Sized,
@@ -1295,7 +1428,7 @@ where
                         audit_fix_cycle(audit, cycle, &log_path)?;
                         fix_with_coder(
                             config, audit, coder, broker, backend, store, project, spec, plan,
-                            task, branch, &log_path, "CI", kill, progress,
+                            task, branch, &log_path, "CI", kill, progress, sandbox,
                         )?;
                     }
                     Decision::Escalate => {
@@ -1315,7 +1448,7 @@ where
                     begin_step(progress, kill, Step::Review)?;
                     move_card(config, card_key, Column::Review, "CI is green")?;
                     let review = run_reviewer(
-                        config, audit, reviewer, project, spec, plan, task, branch, kill,
+                        config, audit, reviewer, project, spec, plan, task, branch, kill, sandbox,
                     )?;
                     reviewed_sha = Some(sha.clone());
                     if review.decision != ReviewDecision::Approved {
@@ -1336,6 +1469,7 @@ where
                                 fix_with_coder(
                                     config, audit, coder, broker, backend, store, project, spec,
                                     plan, task, branch, &log_path, "review", kill, progress,
+                                    sandbox,
                                 )?;
                                 continue;
                             }
@@ -1454,18 +1588,19 @@ fn run_reviewer<R, K>(
     task: &PlannedTask,
     branch: &str,
     kill: &K,
+    sandbox: Option<&ClaudeSandbox>,
 ) -> Result<ReviewRun, E2eError>
 where
     R: ReviewerRunner + ?Sized,
     K: KillSwitch,
 {
     enforce_git_safety(audit, &work_dir(config))?;
-    audit_bwrap_decision(audit, "reviewer")?;
+    audit_sandbox_decision(audit, "reviewer")?;
     let request = ReviewRequest {
         state_dir: config.state_dir.clone(),
         prompt: reviewer_prompt(project, spec, plan, task, branch),
         work_dir: work_dir(config),
-        scratch_dir: scratch_dir(config),
+        scratch_dir: child_scratch_dir(config, sandbox),
         timeout: config.reviewer_timeout,
         max_turns: config.max_reviewer_turns,
         max_budget_usd: config.max_reviewer_budget_usd,
@@ -1543,6 +1678,7 @@ fn fix_with_coder<B, S, C, K>(
     source: &str,
     kill: &K,
     progress: &Progress,
+    sandbox: Option<&ClaudeSandbox>,
 ) -> Result<(), E2eError>
 where
     B: GithubBackend + ?Sized,
@@ -1554,7 +1690,7 @@ where
         state_dir: config.state_dir.clone(),
         prompt: fix_prompt(project, spec, plan, task, branch, log_path, source),
         work_dir: work_dir(config),
-        scratch_dir: scratch_dir(config),
+        scratch_dir: child_scratch_dir(config, sandbox),
         timeout: config.coder_timeout,
         max_turns: config.max_coder_turns,
         max_budget_usd: config.max_coder_budget_usd,
@@ -1692,6 +1828,7 @@ fn setup<B, S>(
     audit: &AuditLog,
     backend: &B,
     store: &S,
+    sandbox: Option<&ClaudeSandbox>,
 ) -> Result<(), E2eError>
 where
     B: GithubBackend + ?Sized,
@@ -1699,6 +1836,11 @@ where
 {
     prepare_work_tree(config, audit)?;
     validate_root_workflows(&work_dir(config))?;
+    if let Some(sandbox) = sandbox {
+        sandbox
+            .create(&run_lab_dir(config), &work_dir(config))
+            .map_err(E2eError::Sandbox)?;
+    }
     create_repository(broker, config, backend, store)?;
     push_setup_branch(
         broker,
@@ -1864,7 +2006,7 @@ where
     K: KillSwitch,
 {
     enforce_git_safety(audit, &request.work_dir)?;
-    audit_bwrap_decision(audit, "coder")?;
+    audit_sandbox_decision(audit, "coder")?;
     let run = coder.run_with_kill(request, kill);
     let safety = enforce_git_safety(audit, &request.work_dir);
     audit_coder_run(audit, &run, &request.command())?;
@@ -1893,16 +2035,16 @@ fn enforce_git_safety(audit: &AuditLog, work: &Path) -> Result<(), E2eError> {
     Ok(())
 }
 
-/// Records the filesystem isolation and open-network decision for a Claude child.
-fn audit_bwrap_decision(audit: &AuditLog, worker: &str) -> Result<(), E2eError> {
+/// Records the filesystem and network isolation decision for a Claude child.
+fn audit_sandbox_decision(audit: &AuditLog, worker: &str) -> Result<(), E2eError> {
     audit.append(
         Some(E2E_PROJECT),
         Some(worker),
         AuditKind::command(
             vec![
-                "bwrap".to_string(),
+                "jg-sandbox".to_string(),
                 "filesystem-isolation".to_string(),
-                BWRAP_AUDIT_NOTE.to_string(),
+                SANDBOX_AUDIT_NOTE.to_string(),
             ],
             None,
             None,
@@ -1961,7 +2103,22 @@ fn commit_message(config: &E2eConfig, summary: &str) -> Result<String, E2eError>
 
 fn commit(config: &E2eConfig, audit: &AuditLog, message: &str) -> Result<(), E2eError> {
     let work = work_dir(config);
-    git(&work, audit, &["add", "-A"])?;
+    let scratch_exclusion = format!(":(exclude){LEGACY_CLAUDE_SCRATCH_PATH}");
+    git(&work, audit, &["add", "-A", "--", ".", &scratch_exclusion])?;
+    let staged_scratch = git_capture(
+        &work,
+        audit,
+        &[
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            LEGACY_CLAUDE_SCRATCH_PATH,
+        ],
+    )?;
+    if !staged_scratch.is_empty() {
+        return Err(E2eError::LegacyScratchStaged);
+    }
     git(
         &work,
         audit,
@@ -2674,19 +2831,19 @@ impl SecretStore for MemorySecretStore {
 /// `headSha` is the real HEAD of the work tree, so the CI parser accepts it.
 struct DryRunBackend {
     inner: FakeBackend,
-    work_dir: PathBuf,
+    state_dir: PathBuf,
     ci: Mutex<VecDeque<Option<CiState>>>,
 }
 
 impl DryRunBackend {
-    fn new(work_dir: PathBuf, ci: impl IntoIterator<Item = CiState>) -> Self {
-        Self::with_runs(work_dir, ci.into_iter().map(Some))
+    fn new(state_dir: PathBuf, ci: impl IntoIterator<Item = CiState>) -> Self {
+        Self::with_runs(state_dir, ci.into_iter().map(Some))
     }
 
-    fn with_runs(work_dir: PathBuf, ci: impl IntoIterator<Item = Option<CiState>>) -> Self {
+    fn with_runs(state_dir: PathBuf, ci: impl IntoIterator<Item = Option<CiState>>) -> Self {
         Self {
             inner: FakeBackend::new(),
-            work_dir,
+            state_dir,
             ci: Mutex::new(ci.into_iter().collect()),
         }
     }
@@ -2709,7 +2866,12 @@ impl GithubBackend for DryRunBackend {
     fn run(&self, op: &BackendOp, token: &Secret) -> Result<BackendOutput, BackendError> {
         let output = self.inner.run(op, token)?;
         if let BackendOp::ReadCiStatus { .. } = op {
-            let sha = head_sha_of(&self.work_dir).map_err(|error| BackendError::Failed {
+            let work_dir = self
+                .state_dir
+                .join(E2E_LABS_DIR)
+                .join(latest_run_lab(&self.state_dir))
+                .join(LAB_WORK_DIR);
+            let sha = head_sha_of(&work_dir).map_err(|error| BackendError::Failed {
                 program: "git".to_string(),
                 status: "failed".to_string(),
                 stdout: String::new(),
@@ -2781,27 +2943,39 @@ mod tests {
             .expect("open the latest run's audit log")
     }
 
-    /// A fake host home holding a placeholder credentials file the tests never read.
-    fn fake_home(root: &Path) -> PathBuf {
-        let home = root.join("host-home");
-        fs::create_dir_all(home.join(".claude")).expect("host claude dir");
+    fn legacy_scratch_config(root: &TempDir) -> E2eConfig {
+        let fixture = root.path().join("legacy-scratch-fixture");
+        fs::create_dir_all(fixture.join(".github/workflows")).expect("fixture workflows");
         fs::write(
-            home.join(".claude").join(".credentials.json"),
-            b"placeholder",
+            fixture.join(".gitignore"),
+            "!*\n!.jgf-claude-home/\n!SPEC.md\n!.github/\n!.github/workflows/\n!.github/workflows/test.yml\n",
         )
-        .expect("fake credentials");
-        home
+        .expect("fixture gitignore");
+        fs::write(fixture.join("SPEC.md"), "# Test spec\n").expect("fixture spec");
+        fs::write(
+            fixture.join(".github/workflows/test.yml"),
+            "name: test\non: push\n",
+        )
+        .expect("fixture workflow");
+        let mut config = E2eConfig::new(
+            "acme",
+            "jgf-e2e-legacy-scratch-test",
+            root.path().join("state"),
+            fixture,
+        );
+        config.disable_co_author();
+        config
     }
 
     fn ci_backend(config: &E2eConfig, ci: impl IntoIterator<Item = CiState>) -> DryRunBackend {
-        DryRunBackend::new(work_dir(config), ci)
+        DryRunBackend::new(config.state_dir.clone(), ci)
     }
 
     fn ci_backend_with_runs(
         config: &E2eConfig,
         ci: impl IntoIterator<Item = Option<CiState>>,
     ) -> DryRunBackend {
-        DryRunBackend::with_runs(work_dir(config), ci)
+        DryRunBackend::with_runs(config.state_dir.clone(), ci)
     }
 
     fn run_dry<B, C, R>(config: &E2eConfig, backend: &B, coder: &C, reviewer: &R) -> RunOutcome
@@ -2820,6 +2994,99 @@ mod tests {
         )
     }
 
+    fn run_prepared_with_test_cleanup<B, C, R, K>(
+        config: &E2eConfig,
+        backend: &B,
+        coder: &C,
+        reviewer: &R,
+        kill: &K,
+        cleaned: &std::cell::Cell<bool>,
+    ) -> RunOutcome
+    where
+        B: GithubBackend + ?Sized,
+        C: CoderRunner + ?Sized,
+        R: ReviewerRunner + ?Sized,
+        K: KillSwitch,
+    {
+        let config = start_run(config).expect("start test run");
+        run_prepared_with_cleanup(
+            &config,
+            backend,
+            &MemorySecretStore::dry_run(),
+            coder,
+            reviewer,
+            kill,
+            None,
+            || {
+                cleaned.set(true);
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn sandbox_cleanup_runs_for_every_terminal_outcome() {
+        let root = TempDir::new().expect("delivered temp dir");
+        let cfg = config(&root);
+        let backend = ci_backend(&cfg, [CiState::Green]);
+        let cleaned = std::cell::Cell::new(false);
+        let outcome = run_prepared_with_test_cleanup(
+            &cfg,
+            &backend,
+            &FakeCoderRunner::editing(),
+            &FakeReviewerRunner::approving(),
+            &NoKillSwitch,
+            &cleaned,
+        );
+        assert_eq!(outcome, RunOutcome::Delivered);
+        assert!(cleaned.get());
+
+        let root = TempDir::new().expect("failed temp dir");
+        let cfg = config(&root);
+        let backend = ci_backend(&cfg, [CiState::Green]);
+        let cleaned = std::cell::Cell::new(false);
+        let outcome = run_prepared_with_test_cleanup(
+            &cfg,
+            &backend,
+            &FakeCoderRunner::new(crate::coder::FakeCoderBehavior::Fail),
+            &FakeReviewerRunner::approving(),
+            &NoKillSwitch,
+            &cleaned,
+        );
+        assert!(matches!(outcome, RunOutcome::Failed { .. }));
+        assert!(cleaned.get());
+
+        let root = TempDir::new().expect("budget temp dir");
+        let cfg = config(&root);
+        let backend = ci_backend(&cfg, [CiState::Green]);
+        let cleaned = std::cell::Cell::new(false);
+        let outcome = run_prepared_with_test_cleanup(
+            &cfg,
+            &backend,
+            &FakeCoderRunner::new(crate::coder::FakeCoderBehavior::BudgetExhausted),
+            &FakeReviewerRunner::approving(),
+            &NoKillSwitch,
+            &cleaned,
+        );
+        assert_eq!(outcome, RunOutcome::BudgetExhausted);
+        assert!(cleaned.get());
+
+        let root = TempDir::new().expect("killed temp dir");
+        let cfg = config(&root);
+        let backend = KillingBackend {
+            inner: ci_backend(&cfg, [CiState::Pending]),
+            kill_path: kill_file(&cfg.state_dir),
+        };
+        let coder = FakeCoderRunner::editing();
+        let reviewer = FakeReviewerRunner::approving();
+        let kill = FileKillSwitch::new(&cfg.state_dir);
+        let cleaned = std::cell::Cell::new(false);
+        let outcome =
+            run_prepared_with_test_cleanup(&cfg, &backend, &coder, &reviewer, &kill, &cleaned);
+        assert_eq!(outcome, RunOutcome::Killed);
+        assert!(cleaned.get());
+    }
+
     #[test]
     fn default_push_cap_is_one_thousand() {
         let root = TempDir::new().expect("temp dir");
@@ -2831,6 +3098,27 @@ mod tests {
     struct KillingBackend {
         inner: DryRunBackend,
         kill_path: PathBuf,
+    }
+
+    struct WaitingCoder {
+        started_path: PathBuf,
+    }
+
+    impl CoderRunner for WaitingCoder {
+        fn run(&self, _request: &CoderRequest) -> CoderRun {
+            CoderRun::default()
+        }
+
+        fn run_with_kill(&self, _request: &CoderRequest, kill: &dyn KillSwitch) -> CoderRun {
+            fs::write(&self.started_path, "started").expect("mark coder started");
+            while !kill.killed() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            CoderRun {
+                killed: true,
+                ..CoderRun::default()
+            }
+        }
     }
 
     #[derive(Clone, Copy)]
@@ -3098,24 +3386,26 @@ mod tests {
                 "command:jgf:plan",
                 "board:on_queue",
                 "command:git:checkout",
-                "command:bwrap:filesystem-isolation",
+                "command:jg-sandbox:filesystem-isolation",
                 "command:claude:-p",
                 "command:git:add",
+                "command:git:diff",
                 "command:git:commit",
                 "github:push_task_branch",
                 "github:open_pr",
                 "github:read_ci_status",
                 "ci:failed",
                 "command:ci-fix:cycle",
-                "command:bwrap:filesystem-isolation",
+                "command:jg-sandbox:filesystem-isolation",
                 "command:claude:-p",
                 "command:git:add",
+                "command:git:diff",
                 "command:git:commit",
                 "github:push_task_branch",
                 "github:read_ci_status",
                 "ci:green",
                 "board:review",
-                "command:bwrap:filesystem-isolation",
+                "command:jg-sandbox:filesystem-isolation",
                 "command:claude:-p",
                 "command:review:approved",
                 "command:merge-decision:allowed",
@@ -3141,6 +3431,84 @@ mod tests {
         assert!(branch_exists(&work, "develop"));
         assert!(branch_exists(&work, "jgt/e2e-toy-1"));
         assert!(work.join(crate::coder::FAKE_EDIT_FILE).is_file());
+    }
+
+    #[test]
+    fn sandbox_work_and_scratch_are_siblings_in_the_per_run_lab() {
+        let root = TempDir::new().expect("temp dir");
+        let mut config = config(&root);
+        config.lab = "e2e-00000000000000000001".to_string();
+        let sandbox = ClaudeSandbox::new(root.path().join("sandbox"), "claude");
+        let lab = run_lab_dir(&config);
+        let work = work_dir(&config);
+        let scratch = child_scratch_dir(&config, Some(&sandbox));
+
+        assert_eq!(work, lab.join(LAB_WORK_DIR));
+        assert_eq!(scratch, lab.join(LAB_SCRATCH_DIR));
+        assert_eq!(work.parent(), Some(lab.as_path()));
+        assert_eq!(scratch.parent(), Some(lab.as_path()));
+        assert!(!scratch.starts_with(&work));
+    }
+
+    #[test]
+    fn commit_excludes_legacy_scratch_reincluded_by_fixture_gitignore() {
+        let root = TempDir::new().expect("temp dir");
+        let config = legacy_scratch_config(&root);
+        let audit = AuditLog::open(&config.state_dir, &config.lab).expect("audit log");
+        let work = work_dir(&config);
+        prepare_work_tree(&config, &audit).expect("prepare fixture repo");
+        fs::create_dir_all(work.join(LEGACY_CLAUDE_SCRATCH_PATH)).expect("legacy scratch");
+        fs::write(
+            work.join(LEGACY_CLAUDE_SCRATCH_PATH).join("session.json"),
+            "placeholder session",
+        )
+        .expect("placeholder session");
+        fs::write(work.join("change.txt"), "intended change\n").expect("intended change");
+        git(&work, &audit, &["add", "-f", "change.txt"]).expect("stage intended change");
+
+        commit(&config, &audit, "feat: test scratch exclusion").expect("commit intended change");
+
+        let committed = git_capture(&work, &audit, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .expect("list committed paths");
+        assert!(committed.lines().any(|path| path == "change.txt"));
+        assert!(
+            !committed
+                .lines()
+                .any(|path| path.starts_with(".jgf-claude-home")),
+            "legacy scratch content must not be committed: {committed}"
+        );
+    }
+
+    #[test]
+    fn commit_fails_closed_when_legacy_scratch_content_is_already_staged() {
+        let root = TempDir::new().expect("temp dir");
+        let config = legacy_scratch_config(&root);
+        let audit = AuditLog::open(&config.state_dir, &config.lab).expect("audit log");
+        let work = work_dir(&config);
+        prepare_work_tree(&config, &audit).expect("prepare fixture repo");
+        fs::create_dir_all(work.join(LEGACY_CLAUDE_SCRATCH_PATH)).expect("legacy scratch");
+        fs::write(
+            work.join(LEGACY_CLAUDE_SCRATCH_PATH).join("session.json"),
+            "placeholder session",
+        )
+        .expect("placeholder session");
+        git(
+            &work,
+            &audit,
+            &["add", "-f", ".jgf-claude-home/session.json"],
+        )
+        .expect("stage legacy scratch content");
+
+        let error = commit(&config, &audit, "feat: must not commit scratch")
+            .expect_err("staged scratch must block commit");
+
+        assert!(
+            matches!(error, E2eError::LegacyScratchStaged),
+            "unexpected error: {error}"
+        );
+        let committed = git_capture(&work, &audit, &["ls-tree", "-r", "--name-only", "HEAD"])
+            .expect("list committed paths");
+        assert!(!committed.contains(".jgf-claude-home"));
     }
 
     #[test]
@@ -3289,7 +3657,6 @@ mod tests {
         ] {
             let root = TempDir::new().expect("temp dir");
             let config = config(&root);
-            let work = work_dir(&config);
             let marker = root.path().join("host-script-ran");
             let backend = ci_backend(&config, [CiState::Green]);
             let coder = GitAttackCoder {
@@ -3299,6 +3666,7 @@ mod tests {
             let reviewer = FakeReviewerRunner::approving();
 
             let outcome = run_dry(&config, &backend, &coder, &reviewer);
+            let work = work_dir(&config);
 
             assert!(!marker.exists(), "child-controlled git script ran");
             if matches!(attack, GitAttack::Commondir) {
@@ -3358,11 +3726,11 @@ mod tests {
         );
 
         let config = config(&root);
-        let work = work_dir(&config);
         let backend = ci_backend(&config, [CiState::Green]);
         let reviewer = FakeReviewerRunner::approving();
 
         let outcome = run_dry(&config, &backend, &DeleteGitCoder, &reviewer);
+        let work = work_dir(&config);
 
         let reason = match outcome {
             RunOutcome::Failed { reason } => reason,
@@ -3808,7 +4176,7 @@ mod tests {
                 "github:read_ci_status",
                 "ci:green",
                 "board:review",
-                "command:bwrap:filesystem-isolation",
+                "command:jg-sandbox:filesystem-isolation",
                 "command:claude:-p",
                 "command:review:approved",
                 "command:merge-decision:allowed",
@@ -3888,15 +4256,34 @@ mod tests {
         let old_run = scratch.join("e2e-00000000000000000001");
         let old_base = scratch.join(E2E_LAB);
         let unrelated = scratch.join("keep-me");
+        let old_sandbox_lab = config
+            .state_dir
+            .join(E2E_LABS_DIR)
+            .join("e2e-00000000000000000002");
+        let old_sandbox_scratch = old_sandbox_lab.join(LAB_SCRATCH_DIR);
+        let old_sandbox_work = old_sandbox_lab.join(LAB_WORK_DIR);
+        let external_lab = root.path().join("external-lab");
+        let external_scratch = external_lab.join(LAB_SCRATCH_DIR);
+        let linked_lab = config
+            .state_dir
+            .join(E2E_LABS_DIR)
+            .join("e2e-00000000000000000003");
         fs::create_dir_all(&old_run).expect("old run scratch");
         fs::create_dir_all(&old_base).expect("old base scratch");
         fs::create_dir_all(&unrelated).expect("unrelated scratch directory");
+        fs::create_dir_all(&old_sandbox_scratch).expect("old sandbox scratch");
+        fs::create_dir_all(&old_sandbox_work).expect("old sandbox work tree");
+        fs::create_dir_all(&external_scratch).expect("external scratch");
+        std::os::unix::fs::symlink(&external_lab, &linked_lab).expect("linked run lab");
 
         start_run(&config).expect("start new run");
 
         assert!(!old_run.exists());
         assert!(!old_base.exists());
         assert!(unrelated.is_dir());
+        assert!(!old_sandbox_scratch.exists());
+        assert!(old_sandbox_work.is_dir());
+        assert!(external_scratch.is_dir());
     }
 
     #[test]
@@ -3920,28 +4307,16 @@ mod tests {
     }
 
     #[test]
-    fn a_kill_mid_coder_interrupts_the_child_and_keeps_the_run() {
+    fn a_kill_mid_coder_stops_the_runner_and_keeps_the_run() {
         let root = TempDir::new().expect("temp dir");
         let config = config(&root);
         let kill_path = kill_file(&config.state_dir);
-        let work_tree = work_dir(&config);
-        let started_path = work_tree.join("coder.started");
-        let descendant_path = work_tree.join("coder-descendant.txt");
-        let fake_bin = TempDir::new().expect("fake binary directory");
-        let script = fake_bin.path().join("fake-claude");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ntouch '{}'\n(while :; do echo x >> '{}'; sleep 0.01; done) &\nwait\n",
-                started_path.display(),
-                descendant_path.display()
-            ),
-        )
-        .expect("write fake coder");
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("make executable");
+        let started_path = root.path().join("coder.started");
 
         let backend = ci_backend(&config, [CiState::Green]);
-        let coder = ClaudeCoderRunner::with_binary_and_home(&script, fake_home(root.path()));
+        let coder = WaitingCoder {
+            started_path: started_path.clone(),
+        };
         let reviewer = FakeReviewerRunner::approving();
         let kill = FileKillSwitch::new(&config.state_dir);
 
@@ -3958,7 +4333,8 @@ mod tests {
         });
 
         assert_eq!(outcome, RunOutcome::Killed);
-        assert!(work_dir(&config).is_dir(), "the work tree is kept");
+        let work_tree = work_dir(&config);
+        assert!(work_tree.is_dir(), "the work tree is kept");
         assert!(board_dir(&config).is_dir(), "the Board is kept");
         let log = audit_log(&config);
         let events = log.read_all().expect("read audit log");
@@ -3969,16 +4345,6 @@ mod tests {
                 .iter()
                 .any(|call| matches!(call.op, BackendOp::OpenPr { .. })),
             "the run stops before the pull request"
-        );
-
-        let child_output = fs::read(&descendant_path).expect("descendant wrote output");
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            fs::read(&descendant_path)
-                .expect("descendant output remains")
-                .len(),
-            child_output.len(),
-            "the coder child process group was killed"
         );
         let report = verify_run(&config.state_dir);
         assert!(report.ok(), "{:?}", report.problems);

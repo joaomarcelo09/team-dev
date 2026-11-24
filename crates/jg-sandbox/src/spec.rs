@@ -108,6 +108,13 @@ pub struct SandboxSpec {
     pub lab_dir: PathBuf,
     /// Host paths bind-mounted read-only at the same path inside the sandbox.
     pub ro_binds: Vec<PathBuf>,
+    /// Directories inside the read-write lab that are over-mounted read-only
+    /// at their `/lab`-relative path.
+    ///
+    /// These paths must be real directories contained by `lab_dir`. They are
+    /// useful for protecting metadata such as a work tree's `.git` directory.
+    #[serde(default)]
+    pub lab_ro_binds: Vec<PathBuf>,
     /// Host unix socket paths bind-mounted inside (hub shim, broker later).
     pub allowed_sockets: Vec<PathBuf>,
     /// Hostname of the sandbox UTS namespace.
@@ -142,6 +149,7 @@ impl SandboxSpec {
             state_dir: state_dir.into(),
             lab_dir: lab_dir.into(),
             ro_binds: default_ro_binds(),
+            lab_ro_binds: Vec::new(),
             allowed_sockets: Vec::new(),
             hostname: DEFAULT_HOSTNAME.to_string(),
             limits: None,
@@ -180,9 +188,41 @@ impl SandboxSpec {
             if path_is_root(path) {
                 return Err(SandboxError::invalid("read-only bind must not be /"));
             }
-            if !path.exists() {
+            let metadata = std::fs::metadata(path).map_err(|source| {
+                if source.kind() == std::io::ErrorKind::NotFound {
+                    SandboxError::invalid(format!(
+                        "read-only bind {} does not exist",
+                        path.display()
+                    ))
+                } else {
+                    SandboxError::io(path, source)
+                }
+            })?;
+            if !metadata.is_dir() && !metadata.is_file() {
                 return Err(SandboxError::invalid(format!(
-                    "read-only bind {} does not exist",
+                    "read-only bind {} must be a file or directory",
+                    path.display()
+                )));
+            }
+        }
+
+        let canonical_lab = std::fs::canonicalize(&self.lab_dir)
+            .map_err(|source| SandboxError::io(&self.lab_dir, source))?;
+        for path in &self.lab_ro_binds {
+            validate_path(path, "read-only lab bind")?;
+            let metadata =
+                std::fs::symlink_metadata(path).map_err(|source| SandboxError::io(path, source))?;
+            if !metadata.is_dir() || metadata.file_type().is_symlink() {
+                return Err(SandboxError::invalid(format!(
+                    "read-only lab bind {} must be a plain directory",
+                    path.display()
+                )));
+            }
+            let canonical_path =
+                std::fs::canonicalize(path).map_err(|source| SandboxError::io(path, source))?;
+            if canonical_path == canonical_lab || !canonical_path.starts_with(&canonical_lab) {
+                return Err(SandboxError::invalid(format!(
+                    "read-only lab bind {} must be inside the lab dir",
                     path.display()
                 )));
             }
@@ -395,6 +435,29 @@ mod tests {
         assert_eq!(spec.cgroup_parent, None);
         assert_eq!(spec.egress, None);
         assert_eq!(spec.hub_socket, None);
+        assert!(spec.lab_ro_binds.is_empty());
+    }
+
+    #[test]
+    fn read_only_lab_binds_must_be_real_directories_inside_the_lab() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab = temp.path().join("lab");
+        let git = lab.join("repo/.git");
+        std::fs::create_dir_all(&git).expect("git dir");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).expect("outside dir");
+
+        let mut spec = SandboxSpec::new(temp.path().join("state"), &lab);
+        spec.lab_ro_binds.push(git.clone());
+        assert!(spec.validate().is_ok());
+
+        spec.lab_ro_binds = vec![outside];
+        assert!(spec.validate().is_err());
+
+        let symlink = lab.join("repo/git-link");
+        std::os::unix::fs::symlink(&git, &symlink).expect("git symlink");
+        spec.lab_ro_binds = vec![symlink];
+        assert!(spec.validate().is_err());
     }
 
     #[test]
