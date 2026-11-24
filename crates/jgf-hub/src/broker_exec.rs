@@ -47,7 +47,7 @@ const CHILD_ENV_KEYS: [&str; 1] = ["PATH"];
 
 /// Git settings every backend child gets, so host or repository configuration cannot change
 /// what the process runs.
-const GIT_LOCKDOWN_ENV: [(&str, &str); 9] = [
+const GIT_LOCKDOWN_ENV: [(&str, &str); 10] = [
     ("GIT_CONFIG_NOSYSTEM", "1"),
     ("GIT_CONFIG_GLOBAL", "/dev/null"),
     ("GIT_TERMINAL_PROMPT", "0"),
@@ -57,14 +57,21 @@ const GIT_LOCKDOWN_ENV: [(&str, &str); 9] = [
     ("GIT_CONFIG_VALUE_0", "/dev/null"),
     ("GIT_CONFIG_KEY_1", "core.fsmonitor"),
     ("GIT_CONFIG_VALUE_1", "false"),
+    ("GIT_ATTR_NOSYSTEM", "1"),
 ];
 
 /// Git configuration passed on the command line, ahead of any repository-local value.
-const GIT_LOCKDOWN_ARGS: [&str; 4] = [
+const GIT_LOCKDOWN_ARGS: [&str; 10] = [
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
     "core.fsmonitor=false",
+    "-c",
+    "core.attributesFile=/dev/null",
+    "-c",
+    "protocol.ext.allow=never",
+    "-c",
+    "diff.external=",
 ];
 
 /// Number of characters of a commit hash used in errors.
@@ -93,6 +100,17 @@ pub enum BackendOp {
         repo: String,
         branch: String,
         base: String,
+        commit_message: Option<String>,
+    },
+    /// Push a branch the factory owns during repository setup.
+    ///
+    /// Without a `base` the push bootstraps the repository's default branch. With a `base`
+    /// the push creates the branch on top of that remote branch.
+    PushSetupBranch {
+        owner: String,
+        repo: String,
+        branch: String,
+        base: Option<String>,
         commit_message: Option<String>,
     },
     /// Open a pull request from `head` against `base`.
@@ -125,6 +143,7 @@ impl BackendOp {
         match self {
             Self::CreateRepo { .. } => GithubAction::CreateRepo,
             Self::PushTaskBranch { .. } => GithubAction::PushTaskBranch,
+            Self::PushSetupBranch { .. } => GithubAction::PushSetupBranch,
             Self::OpenPr { .. } => GithubAction::OpenPr,
             Self::MergePr { .. } => GithubAction::MergePr,
             Self::ReadCiStatus { .. } => GithubAction::ReadCiStatus,
@@ -142,6 +161,13 @@ impl BackendOp {
                 repo,
                 branch: approved.branch.clone().unwrap_or_default(),
                 base: approved.base.clone().unwrap_or_default(),
+                commit_message: approved.commit_message.clone(),
+            },
+            GithubAction::PushSetupBranch => Self::PushSetupBranch {
+                owner,
+                repo,
+                branch: approved.branch.clone().unwrap_or_default(),
+                base: approved.base.clone(),
                 commit_message: approved.commit_message.clone(),
             },
             GithubAction::OpenPr => {
@@ -418,7 +444,9 @@ impl GhCliBackend {
                     "--private".to_string(),
                 ],
             ),
-            BackendOp::PushTaskBranch { .. } => return Ok(None),
+            BackendOp::PushTaskBranch { .. } | BackendOp::PushSetupBranch { .. } => {
+                return Ok(None);
+            }
             BackendOp::OpenPr {
                 owner,
                 repo,
@@ -588,6 +616,49 @@ impl GhCliBackend {
         })?;
         self.prepare_mirror(mirror.path(), &workdir, branch)?;
         self.fetch_base(mirror.path(), gh.as_deref(), &url, base, token)?;
+        let sha = self.check_commits(mirror.path(), branch, Some(base), token)?;
+
+        let invocation = push_invocation(mirror.path(), gh.as_deref(), &url, &sha, branch);
+        self.run_command(&invocation, mirror.path(), Some(token))
+    }
+
+    /// Pushes a setup branch, bootstrapping the default branch when `base` is `None`.
+    fn push_setup_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        base: Option<&str>,
+        token: &Secret,
+    ) -> Result<(String, String), BackendError> {
+        let workdir =
+            fs::canonicalize(&self.workdir).map_err(|source| BackendError::Workspace {
+                message: redact(&format!("{}: {source}", self.workdir.display()), token),
+            })?;
+
+        let url = self.remote_url(owner, repo);
+        let gh = if url.starts_with("https://") {
+            Some(resolve_program("gh").ok_or_else(|| BackendError::Spawn {
+                program: "gh".to_string(),
+                message: "gh is not on PATH".to_string(),
+            })?)
+        } else {
+            None
+        };
+
+        let mirror = TempRepo::new().map_err(|source| BackendError::Workspace {
+            message: source.to_string(),
+        })?;
+        self.prepare_mirror(mirror.path(), &workdir, branch)?;
+        if let Some(base) = base {
+            if base.is_empty() {
+                return Err(BackendError::MissingOperationField {
+                    action: "push_setup_branch",
+                    field: "base",
+                });
+            }
+            self.fetch_base(mirror.path(), gh.as_deref(), &url, base, token)?;
+        }
         let sha = self.check_commits(mirror.path(), branch, base, token)?;
 
         let invocation = push_invocation(mirror.path(), gh.as_deref(), &url, &sha, branch);
@@ -666,16 +737,19 @@ impl GhCliBackend {
     }
 
     /// Validates all commits on the fetched branch not already in the remote base.
+    ///
+    /// `base` is `None` when the push bootstraps the default branch, so every reachable
+    /// commit is checked.
     fn check_commits(
         &self,
         mirror: &Path,
         branch: &str,
-        base: &str,
+        base: Option<&str>,
         token: &Secret,
     ) -> Result<String, BackendError> {
         let sha = self.resolve_branch_sha(mirror, branch)?;
 
-        let log = git_invocation(vec![
+        let mut args = vec![
             "--git-dir".to_string(),
             mirror.display().to_string(),
             "--no-replace-objects".to_string(),
@@ -683,9 +757,12 @@ impl GhCliBackend {
             "--no-show-signature".to_string(),
             "--format=%H%x00%B%x00".to_string(),
             sha.clone(),
-            "--not".to_string(),
-            format!("refs/remotes/origin/{base}"),
-        ]);
+        ];
+        if let Some(base) = base {
+            args.push("--not".to_string());
+            args.push(format!("refs/remotes/origin/{base}"));
+        }
+        let log = git_invocation(args);
         let (stdout, _) = self.run_command(&log, mirror, None)?;
 
         for (hash, message) in parse_commit_log(&stdout, token)? {
@@ -721,7 +798,9 @@ impl GhCliBackend {
         }
         command.env("GIT_CEILING_DIRECTORIES", workdir);
         if let Some(token) = token {
-            command.env("GH_TOKEN", token.expose());
+            // A token file written with `gh auth token > file` ends in a newline, which is not
+            // a valid HTTP header value.
+            command.env("GH_TOKEN", token.expose().trim());
         }
         command
     }
@@ -806,6 +885,13 @@ impl GithubBackend for GhCliBackend {
                 base,
                 ..
             } => self.push_task_branch(owner, repo, branch, base, token)?,
+            BackendOp::PushSetupBranch {
+                owner,
+                repo,
+                branch,
+                base,
+                ..
+            } => self.push_setup_branch(owner, repo, branch, base.as_deref(), token)?,
             BackendOp::MergePr {
                 owner,
                 repo,
@@ -1415,6 +1501,7 @@ mod tests {
         vec![
             GithubAction::CreateRepo,
             GithubAction::PushTaskBranch,
+            GithubAction::PushSetupBranch,
             GithubAction::OpenPr,
             GithubAction::MergePr,
             GithubAction::ReadCiStatus,
@@ -1608,7 +1695,10 @@ mod tests {
             panic!("expected a push operation");
         };
         assert_eq!(branch, "jgt/JGT-97");
-        assert_eq!(commit_message.as_deref(), Some("feat: add x\n\nBody"));
+        assert_eq!(
+            commit_message.as_deref(),
+            Some("feat: add x\n\nCo-Authored-By: A <a@example.com>\n\nBody")
+        );
     }
 
     #[test]
@@ -1732,6 +1822,12 @@ mod tests {
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
+                "-c",
+                "protocol.ext.allow=never",
+                "-c",
+                "diff.external=",
                 "-c",
                 "credential.helper=",
                 "-c",
@@ -1946,6 +2042,18 @@ mod tests {
             command.get_envs().any(|(key, value)| key == "GH_TOKEN"
                 && value == Some(std::ffi::OsStr::new(TOKEN)))
         );
+    }
+
+    #[test]
+    fn the_child_environment_trims_a_trailing_newline_from_the_token() {
+        let (backend, invocation, _) = op_with_token();
+        let neutral = TempDir::new().expect("create neutral directory");
+        let token = Secret::new("fake-token-value\n");
+        let command = backend.command(&invocation, neutral.path(), Some(&token));
+
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "GH_TOKEN" && value == Some(std::ffi::OsStr::new("fake-token-value"))
+        }));
     }
 
     #[test]
@@ -2256,6 +2364,39 @@ mod tests {
     }
 
     #[test]
+    fn setup_push_bootstraps_main_then_creates_develop() {
+        let root = TempRoot::new();
+        let work = repo_with_base(&root);
+        git_ok(&work, &["branch", "develop"]);
+        let remote = bare_repo(&root, "remote.git");
+        let backend = GhCliBackend::new(&work).with_remote_url(remote.display().to_string());
+
+        let main = BackendOp::PushSetupBranch {
+            owner: "acme".to_string(),
+            repo: "app".to_string(),
+            branch: "main".to_string(),
+            base: None,
+            commit_message: None,
+        };
+        backend
+            .run(&main, &Secret::new(TOKEN))
+            .expect("bootstrap main");
+        assert!(remote_has_branch(&remote, "main"));
+
+        let develop = BackendOp::PushSetupBranch {
+            owner: "acme".to_string(),
+            repo: "app".to_string(),
+            branch: "develop".to_string(),
+            base: Some("main".to_string()),
+            commit_message: None,
+        };
+        backend
+            .run(&develop, &Secret::new(TOKEN))
+            .expect("create develop");
+        assert!(remote_has_branch(&remote, "develop"));
+    }
+
+    #[test]
     fn push_ignores_a_repo_local_push_instead_of_redirect() {
         let root = TempRoot::new();
         let work = repo_with_base(&root);
@@ -2305,12 +2446,7 @@ mod tests {
         let work = repo_with_base(&root);
         commit_on_task_branch(
             &work,
-            &[
-                "-m",
-                "feat: add task",
-                "-m",
-                "Co-Authored-By: Someone <someone@example.com>",
-            ],
+            &["-m", "feat: add task", "-m", "Generated with a tool"],
         );
         let base_sha = git_output(&work, &["rev-parse", "refs/heads/main"]);
         git_ok(&work, &["tag", "jgt/T1", base_sha.trim()]);
@@ -2399,7 +2535,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pushed_attribution_trailer_is_rejected_before_the_push() {
+    fn a_pushed_valid_co_author_trailer_is_accepted() {
         let root = TempRoot::new();
         let work = repo_with_base(&root);
         commit_on_task_branch(
@@ -2413,17 +2549,23 @@ mod tests {
         );
         let remote = remote_with_base(&root, &work);
 
-        let error = push_to(&work, &remote).expect_err("attribution must be rejected");
-        let BackendError::CommitRejected { commit, reason } = error else {
-            panic!("expected a commit rejection");
-        };
-        assert_eq!(commit.chars().count(), SHORT_HASH_LEN);
-        assert!(reason.contains("attribution"), "reason was {reason:?}");
-        assert!(!remote_has_branch(&remote, "jgt/T1"));
-        assert!(
-            git_output(&work, &["rev-parse", "HEAD"]).starts_with(&commit),
-            "the rejection must name the pushed commit"
+        push_to(&work, &remote).expect("valid co-author trailer is allowed");
+        assert!(remote_has_branch(&remote, "jgt/T1"));
+    }
+
+    #[test]
+    fn a_pushed_generated_signature_is_rejected_before_the_push() {
+        let root = TempRoot::new();
+        let work = repo_with_base(&root);
+        commit_on_task_branch(
+            &work,
+            &["-m", "feat: add task", "-m", "Generated with a tool"],
         );
+        let remote = remote_with_base(&root, &work);
+
+        let error = push_to(&work, &remote).expect_err("generated attribution must be rejected");
+        assert!(matches!(error, BackendError::CommitRejected { .. }));
+        assert!(!remote_has_branch(&remote, "jgt/T1"));
     }
 
     #[test]

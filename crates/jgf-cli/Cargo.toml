@@ -11,4 +11,8 @@ path = "src/main.rs"
 
 [dependencies]
 jgf-core.workspace = true
+jgf-hub.workspace = true
 clap.workspace = true
+libc.workspace = true
+thiserror.workspace = true
+tempfile.workspace = true

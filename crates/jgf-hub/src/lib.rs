@@ -19,7 +19,9 @@ pub use broker_exec::{
     BackendError, BackendOp, BackendOutput, BrokerError, GITHUB_TOKEN_KEY, GhCliBackend,
     GithubBackend, testing::FakeBackend,
 };
-pub use ci_watch::{CiError, CiState, CiWatch, Decision, MAX_FIX_CYCLES, parse_ci_runs};
+pub use ci_watch::{
+    CiError, CiState, CiWatch, Decision, MAX_FIX_CYCLES, parse_ci_runs, parse_ci_runs_with_presence,
+};
 pub use git_flow::{
     DEFAULT_INTEGRATION_BRANCH, MergeAllowed, MergeContext, MergeDenied, MergeTarget,
     merge_decision, pr_base_branch,

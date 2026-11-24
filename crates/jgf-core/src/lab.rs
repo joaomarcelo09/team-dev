@@ -44,6 +44,9 @@ pub enum GithubAction {
     CreateRepo,
     /// Push a task branch.
     PushTaskBranch,
+    /// Push a branch the factory owns during repository setup, such as the default or
+    /// integration branch.
+    PushSetupBranch,
     /// Open a pull request.
     OpenPr,
     /// Merge a pull request.
@@ -76,6 +79,10 @@ mod tests {
         let text = "action = \"push_task_branch\"";
         let input: ActionInput = toml::from_str(text).expect("known action");
         assert_eq!(input.action, GithubAction::PushTaskBranch);
+
+        let text = "action = \"push_setup_branch\"";
+        let input: ActionInput = toml::from_str(text).expect("known action");
+        assert_eq!(input.action, GithubAction::PushSetupBranch);
 
         let text = "action = \"read_ci_status\"";
         let input: ActionInput = toml::from_str(text).expect("known action");
