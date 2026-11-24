@@ -1,5 +1,6 @@
 //! Library entry points of the `jg-factory` command line.
 
+pub mod broker;
 mod child;
 pub mod coder;
 pub mod e2e;

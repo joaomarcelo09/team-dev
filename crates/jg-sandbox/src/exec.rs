@@ -1,8 +1,8 @@
 //! A single command run inside a sandbox.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use std::{collections::BTreeMap, fmt};
 
 use crate::scope::{ExecScope, SCOPED_HOME, WORKSPACE};
 
@@ -14,7 +14,7 @@ pub const DEFAULT_HOME: &str = "/lab/home";
 pub const DEFAULT_LANG: &str = "C.UTF-8";
 
 /// A command to run inside a sandbox.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ExecRequest {
     /// `argv[0]` is the program, looked up in `PATH` when it has no `/`.
     pub argv: Vec<String>,
@@ -28,6 +28,21 @@ pub struct ExecRequest {
     pub timeout: Option<Duration>,
     /// Optional project scope; `None` runs lab-wide, as before.
     pub scope: Option<ExecScope>,
+}
+
+impl fmt::Debug for ExecRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecRequest")
+            .field("argv", &self.argv)
+            .field("env_keys", &self.env.keys().collect::<Vec<_>>())
+            .field("env", &"[redacted]")
+            .field("cwd", &self.cwd)
+            .field("stdin", &self.stdin)
+            .field("timeout", &self.timeout)
+            .field("scope", &self.scope)
+            .finish()
+    }
 }
 
 impl ExecRequest {
@@ -172,6 +187,17 @@ mod tests {
         assert_eq!(env.get("CUSTOM").map(String::as_str), Some("yes"));
         assert_eq!(env.get("HOME").map(String::as_str), Some(DEFAULT_HOME));
         assert!(!env.contains_key("HTTP_PROXY"));
+    }
+
+    #[test]
+    fn debug_redacts_environment_values() {
+        let value = "secret-value";
+        let request = ExecRequest::new(vec!["true".to_string()]).with_env("ALLOWED_SECRET", value);
+
+        let debug = format!("{request:?}");
+
+        assert!(debug.contains("ALLOWED_SECRET"));
+        assert!(!debug.contains(value));
     }
 
     #[test]

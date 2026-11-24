@@ -11,6 +11,7 @@
 //! is an error rather than a target.
 
 use jgf_core::ProjectStage;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::broker::branch_is_valid;
@@ -22,7 +23,7 @@ pub const DEFAULT_INTEGRATION_BRANCH: &str = "develop";
 const INTEGRATION_BRANCHES: [&str; 2] = ["develop", "stg"];
 
 /// What the factory knows about a project's branches and the user's word.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeContext {
     /// Stage of the project.
     pub stage: ProjectStage,

@@ -8,8 +8,8 @@ use std::{
 };
 
 use jg_sandbox::{ExecScope, ScopeAccess};
-use jgf_core::ProjectId;
-use jgf_hub::{LaunchToken, Role as HubRole, WorkerKind};
+use jgf_core::{FileSecretStore, Project, ProjectId, Secret, SecretStore, env_for_project};
+use jgf_hub::{LaunchToken, Role as HubRole, WorkerKind, broker_exec::GITHUB_TOKEN_KEY};
 
 use crate::{e2e::KillSwitch, sandbox::ClaudeSandbox};
 
@@ -102,6 +102,46 @@ pub struct RoleExecution {
     pub scope: ExecScope,
     /// Per-launch hub socket credentials, redacted from debug output.
     pub(crate) message_surface: Option<MessageSurface>,
+    /// Per-launch broker socket credentials, redacted from debug output.
+    pub(crate) broker_surface: Option<BrokerSurface>,
+    /// Project environment values, redacted from debug output.
+    pub(crate) project_environment: ProjectEnvironment,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ProjectEnvironment(BTreeMap<String, Secret>);
+
+impl PartialEq for ProjectEnvironment {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len()
+            && self.0.iter().all(|(key, value)| {
+                other
+                    .0
+                    .get(key)
+                    .is_some_and(|other_value| value.expose() == other_value.expose())
+            })
+    }
+}
+
+impl Eq for ProjectEnvironment {}
+
+impl ProjectEnvironment {
+    fn from_values(values: BTreeMap<String, Secret>) -> Self {
+        Self(values)
+    }
+
+    pub(crate) fn values(&self) -> &BTreeMap<String, Secret> {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ProjectEnvironment {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ProjectEnvironment")
+            .field("values", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Per-launch credentials passed only through the child's process environment.
@@ -145,6 +185,50 @@ impl fmt::Debug for MessageSurface {
     }
 }
 
+/// Per-launch credentials passed only through the child's process environment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct BrokerSurface {
+    socket_path: PathBuf,
+    token: LaunchToken,
+}
+
+impl BrokerSurface {
+    /// Builds a broker surface from a host-issued token and socket path.
+    pub fn new(socket_path: impl Into<PathBuf>, token: LaunchToken) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            token,
+        }
+    }
+
+    pub(crate) fn token(&self) -> &LaunchToken {
+        &self.token
+    }
+
+    fn environment(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "JG_BROKER_SOCKET".to_string(),
+                self.socket_path.to_string_lossy().into_owned(),
+            ),
+            (
+                "JG_BROKER_TOKEN".to_string(),
+                self.token.expose().to_string(),
+            ),
+        ])
+    }
+}
+
+impl fmt::Debug for BrokerSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BrokerSurface")
+            .field("socket_path", &self.socket_path)
+            .field("token", &"[redacted]")
+            .finish()
+    }
+}
+
 /// Sandbox operations needed by the role launcher.
 pub trait RoleLaunchExecutor {
     /// Returns the active lab directory or fails when the world is unavailable.
@@ -153,6 +237,10 @@ pub trait RoleLaunchExecutor {
     fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String>;
     /// Starts the role in the requested scoped exec.
     fn run_role(&self, execution: RoleExecution, kill: Option<&dyn KillSwitch>) -> ChildRun;
+    /// Returns allowed project environment values for the selected project.
+    fn project_environment(&self, _project_id: &str) -> Result<BTreeMap<String, Secret>, String> {
+        Ok(BTreeMap::new())
+    }
 
     /// Registers a host-selected message identity for the duration of a launch.
     fn register_message_role(&self, _role: HubRole) -> Result<Option<MessageSurface>, String> {
@@ -161,6 +249,18 @@ pub trait RoleLaunchExecutor {
 
     /// Revokes the identity returned by [`RoleLaunchExecutor::register_message_role`].
     fn revoke_message_role(&self, _surface: &MessageSurface) {}
+
+    /// Registers a broker capability for the selected project and worker.
+    fn register_broker_role(
+        &self,
+        _project: &str,
+        _worker: &str,
+    ) -> Result<Option<BrokerSurface>, String> {
+        Ok(None)
+    }
+
+    /// Revokes the capability returned by [`RoleLaunchExecutor::register_broker_role`].
+    fn revoke_broker_role(&self, _surface: &BrokerSurface) {}
 }
 
 /// Loads role instructions and starts the role through a sandbox executor.
@@ -192,16 +292,44 @@ impl<'a> RoleLauncher<'a> {
             return failed_launch(error);
         }
         let mut execution = execution;
-        let message_surface = match execution.message_role() {
-            Ok(Some(role)) => match self.executor.register_message_role(role) {
+        let broker_surface = if execution.role == Role::GitCoder {
+            match self
+                .executor
+                .register_broker_role(&execution.project_id, &execution.worker_id)
+            {
                 Ok(surface) => surface,
                 Err(error) => return failed_launch(error),
+            }
+        } else {
+            None
+        };
+        execution.broker_surface = broker_surface.clone();
+        let message_role = match execution.message_role() {
+            Ok(role) => role,
+            Err(error) => {
+                if let Some(surface) = broker_surface.as_ref() {
+                    self.executor.revoke_broker_role(surface);
+                }
+                return failed_launch(error);
+            }
+        };
+        let message_surface = match message_role {
+            Some(role) => match self.executor.register_message_role(role) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    if let Some(surface) = broker_surface.as_ref() {
+                        self.executor.revoke_broker_role(surface);
+                    }
+                    return failed_launch(error);
+                }
             },
-            Ok(None) => None,
-            Err(error) => return failed_launch(error),
+            None => None,
         };
         execution.message_surface = message_surface.clone();
         let result = self.executor.run_role(execution, kill);
+        if let Some(surface) = broker_surface.as_ref() {
+            self.executor.revoke_broker_role(surface);
+        }
         if let Some(surface) = message_surface.as_ref() {
             self.executor.revoke_message_role(surface);
         }
@@ -215,6 +343,13 @@ impl<'a> RoleLauncher<'a> {
 
         let lab_dir = fs::canonicalize(self.executor.lab_dir()?)
             .map_err(|error| format!("could not resolve role lab directory: {error}"))?;
+        let project_environment = self
+            .executor
+            .project_environment(&request.project_id)
+            .map_err(|_| "could not load project environment".to_string())?
+            .into_iter()
+            .filter(|(key, _)| !is_reserved_role_environment_key(key))
+            .collect();
         let skill = fs::read_to_string(
             self.skills_dir
                 .join(request.role.skill_directory())
@@ -284,6 +419,8 @@ impl<'a> RoleLauncher<'a> {
             timeout: request.timeout,
             scope,
             message_surface: None,
+            broker_surface: None,
+            project_environment: ProjectEnvironment::from_values(project_environment),
         })
     }
 }
@@ -316,6 +453,41 @@ impl RoleExecution {
             .map(MessageSurface::environment)
             .unwrap_or_default()
     }
+
+    pub(crate) fn broker_environment(&self) -> BTreeMap<String, String> {
+        self.broker_surface
+            .as_ref()
+            .map(BrokerSurface::environment)
+            .unwrap_or_default()
+    }
+}
+
+fn project_environment(
+    store: &dyn SecretStore,
+    project: &Project,
+) -> Result<BTreeMap<String, Secret>, String> {
+    let values = env_for_project(store, project)
+        .map_err(|_| "could not load project environment".to_string())?;
+    Ok(values
+        .into_iter()
+        .filter(|(key, _)| !is_reserved_role_environment_key(key.as_str()))
+        .map(|(key, secret)| (key.as_str().to_string(), secret))
+        .collect())
+}
+
+fn is_reserved_role_environment_key(key: &str) -> bool {
+    matches!(
+        key,
+        GITHUB_TOKEN_KEY
+            | "HTTP_PROXY"
+            | "HTTPS_PROXY"
+            | "ALL_PROXY"
+            | "NO_PROXY"
+            | "http_proxy"
+            | "https_proxy"
+            | "all_proxy"
+            | "no_proxy"
+    )
 }
 
 fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
@@ -436,6 +608,15 @@ impl RoleLaunchExecutor for ClaudeSandbox {
         self.execute_role(execution, kill)
     }
 
+    fn project_environment(&self, project: &str) -> Result<BTreeMap<String, Secret>, String> {
+        let project_id = ProjectId::parse(project)
+            .map_err(|_| "could not load project configuration".to_string())?;
+        let root = self.role_project_root();
+        let project = jgf_core::registry::load_project(root, &project_id)
+            .map_err(|_| "could not load project configuration".to_string())?;
+        project_environment(&FileSecretStore::new(root), &project)
+    }
+
     fn register_message_role(&self, role: HubRole) -> Result<Option<MessageSurface>, String> {
         self.register_hub_role(role).map(Some)
     }
@@ -443,12 +624,25 @@ impl RoleLaunchExecutor for ClaudeSandbox {
     fn revoke_message_role(&self, surface: &MessageSurface) {
         self.revoke_hub_role(surface);
     }
+
+    fn register_broker_role(
+        &self,
+        project: &str,
+        worker: &str,
+    ) -> Result<Option<BrokerSurface>, String> {
+        self.register_github_broker_role(project, worker).map(Some)
+    }
+
+    fn revoke_broker_role(&self, surface: &BrokerSurface) {
+        self.revoke_github_broker_role(surface);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
+    use jgf_core::{EnvProfile, ProjectStage, Secret, SecretKey, SecretScope};
     use jgf_hub::{HubClient, HubClientError, HubShim, Router};
 
     use super::*;
@@ -458,6 +652,10 @@ mod tests {
         lab_dir: PathBuf,
         launches: Mutex<Vec<RoleExecution>>,
         starts: Mutex<Vec<(String, String, Role)>>,
+        project: Option<Project>,
+        secret_store: Option<FileSecretStore>,
+        extra_environment: BTreeMap<String, Secret>,
+        environment_error: Option<String>,
     }
 
     impl RoleLaunchExecutor for RecordingExecutor {
@@ -481,6 +679,23 @@ mod tests {
                 .push(execution);
             ChildRun::default()
         }
+
+        fn project_environment(
+            &self,
+            _project_id: &str,
+        ) -> Result<BTreeMap<String, Secret>, String> {
+            match &self.environment_error {
+                Some(error) => Err(error.clone()),
+                None => {
+                    let mut env = match (&self.project, &self.secret_store) {
+                        (Some(project), Some(store)) => project_environment(store, project),
+                        _ => Ok(BTreeMap::new()),
+                    }?;
+                    env.extend(self.extra_environment.clone());
+                    Ok(env)
+                }
+            }
+        }
     }
 
     struct HubRecordingExecutor {
@@ -488,6 +703,7 @@ mod tests {
         hub: HubShim,
         launches: Mutex<Vec<RoleExecution>>,
         issued_token: Mutex<Option<LaunchToken>>,
+        issued_broker_token: Mutex<Option<LaunchToken>>,
     }
 
     impl RoleLaunchExecutor for HubRecordingExecutor {
@@ -527,6 +743,29 @@ mod tests {
         fn revoke_message_role(&self, surface: &MessageSurface) {
             self.hub.revoke(surface.token());
         }
+
+        fn register_broker_role(
+            &self,
+            project: &str,
+            worker: &str,
+        ) -> Result<Option<BrokerSurface>, String> {
+            let project = jgf_core::ProjectId::parse(project).map_err(|error| error.to_string())?;
+            let role = HubRole::worker(project, worker, WorkerKind::GitCoder)
+                .map_err(|error| error.to_string())?;
+            let token = self
+                .hub
+                .register_role(role)
+                .map_err(|error| error.to_string())?;
+            *self.issued_broker_token.lock().expect("broker token") = Some(token.clone());
+            Ok(Some(BrokerSurface::new(
+                self.hub.socket_path().to_path_buf(),
+                token,
+            )))
+        }
+
+        fn revoke_broker_role(&self, surface: &BrokerSurface) {
+            self.hub.revoke(surface.token());
+        }
     }
 
     fn request(role: Role) -> RoleLaunch {
@@ -540,6 +779,181 @@ mod tests {
             max_turns: 7,
             max_budget_usd: 1.25,
         }
+    }
+
+    fn sample_project(allowed: &[&str]) -> Project {
+        Project {
+            id: ProjectId::parse("project-a").expect("valid id"),
+            name: "Example".to_string(),
+            spec_path: PathBuf::from("/tmp/spec.md"),
+            spec_sha256: None,
+            repos: Vec::new(),
+            stage: ProjectStage::Mvp,
+            env_profile: EnvProfile {
+                allowed_keys: allowed.iter().map(|key| (*key).to_string()).collect(),
+            },
+            recipes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn launched_role_gets_only_allowed_project_environment_and_redacts_values() {
+        let temp = tempfile::tempdir().expect("secret store");
+        let store = FileSecretStore::new(temp.path());
+        let project = sample_project(&["ALLOWED_KEY", GITHUB_TOKEN_KEY, "HTTPS_PROXY"]);
+        let scope = SecretScope::Project(project.id.clone());
+        for (key, value) in [
+            ("ALLOWED_KEY", "allowed-value"),
+            ("DISALLOWED_KEY", "disallowed-value"),
+            (GITHUB_TOKEN_KEY, "github-token-value"),
+            ("HTTPS_PROXY", "untrusted-proxy-value"),
+        ] {
+            store
+                .set(
+                    &scope,
+                    &SecretKey::parse(key).expect("valid key"),
+                    Secret::new(value),
+                )
+                .expect("store secret");
+        }
+        let env = project_environment(&store, &project).expect("project environment");
+        assert!(
+            env.get("ALLOWED_KEY")
+                .is_some_and(|value| value.expose() == "allowed-value")
+        );
+        assert!(!env.contains_key("DISALLOWED_KEY"));
+        assert!(!env.contains_key(GITHUB_TOKEN_KEY));
+        assert!(!env.contains_key("HTTPS_PROXY"));
+
+        let lab_dir = temp.path().join("lab");
+        fs::create_dir_all(lab_dir.join("projects/project-a/worktrees/task-1")).expect("worktree");
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let extra_environment = BTreeMap::from([
+            (
+                GITHUB_TOKEN_KEY.to_string(),
+                Secret::new("github-token-value"),
+            ),
+            (
+                "HTTPS_PROXY".to_string(),
+                Secret::new("untrusted-proxy-value"),
+            ),
+        ]);
+        let executor = RecordingExecutor {
+            lab_dir,
+            project: Some(project),
+            secret_store: Some(store),
+            extra_environment,
+            ..RecordingExecutor::default()
+        };
+        let launcher = RoleLauncher::new(skills_dir, &executor);
+
+        let result = launcher.launch(&request(Role::Coder), None);
+
+        assert!(result.spawn_error.is_none());
+        let execution = executor.launches.lock().expect("launches").pop().unwrap();
+        assert!(
+            execution
+                .project_environment
+                .values()
+                .get("ALLOWED_KEY")
+                .is_some_and(|value| value.expose() == "allowed-value")
+        );
+        assert!(
+            !execution
+                .project_environment
+                .values()
+                .contains_key("DISALLOWED_KEY")
+        );
+        assert!(
+            !execution
+                .project_environment
+                .values()
+                .contains_key(GITHUB_TOKEN_KEY)
+        );
+        assert!(
+            !execution
+                .project_environment
+                .values()
+                .contains_key("HTTPS_PROXY")
+        );
+        let debug = format!("{execution:?}");
+        let allowed_value = "allowed-value";
+        let github_token_value = "github-token-value";
+        let proxy_value = "untrusted-proxy-value";
+        assert!(!debug.contains(allowed_value));
+        assert!(!debug.contains(github_token_value));
+        assert!(!debug.contains(proxy_value));
+        assert!(
+            !format!(
+                "{:?}",
+                executor.starts.lock().expect("audit-like start records")
+            )
+            .contains(allowed_value)
+        );
+    }
+
+    #[test]
+    fn project_environment_errors_do_not_leak_values() {
+        let temp = tempfile::tempdir().expect("lab directory");
+        let lab_dir = temp.path().join("lab");
+        fs::create_dir_all(lab_dir.join("projects/project-a/worktrees/task-1")).expect("worktree");
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let executor = RecordingExecutor {
+            lab_dir,
+            environment_error: Some("secret-error-value".to_string()),
+            ..RecordingExecutor::default()
+        };
+        let launcher = RoleLauncher::new(skills_dir, &executor);
+
+        let result = launcher.launch(&request(Role::Coder), None);
+
+        let error = result.spawn_error.expect("environment error");
+        assert!(!error.contains("secret-error-value"));
+        assert_eq!(error, "could not load project environment");
+        assert!(executor.launches.lock().expect("launches").is_empty());
+    }
+
+    #[test]
+    fn sandbox_loads_the_project_profile_before_preparing_role_environment() {
+        let temp = tempfile::tempdir().expect("project store");
+        let project = sample_project(&["ALLOWED_KEY", GITHUB_TOKEN_KEY, "HTTPS_PROXY"]);
+        jgf_core::registry::save_project(temp.path(), &project).expect("save project");
+        let store = FileSecretStore::new(temp.path());
+        let scope = SecretScope::Project(project.id.clone());
+        for (key, value) in [
+            ("ALLOWED_KEY", "allowed-value"),
+            ("DISALLOWED_KEY", "disallowed-value"),
+            (GITHUB_TOKEN_KEY, "github-token-value"),
+            ("HTTPS_PROXY", "untrusted-proxy-value"),
+        ] {
+            store
+                .set(
+                    &scope,
+                    &SecretKey::parse(key).expect("valid key"),
+                    Secret::new(value),
+                )
+                .expect("store secret");
+        }
+        let sandbox = ClaudeSandbox::new(temp.path(), "claude");
+
+        let env = RoleLaunchExecutor::project_environment(&sandbox, "project-a")
+            .expect("project environment");
+
+        assert!(
+            env.get("ALLOWED_KEY")
+                .is_some_and(|value| value.expose() == "allowed-value")
+        );
+        assert!(!env.contains_key("DISALLOWED_KEY"));
+        assert!(!env.contains_key(GITHUB_TOKEN_KEY));
+        assert!(!env.contains_key("HTTPS_PROXY"));
+        let debug = format!("{env:?}");
+        assert!(!debug.contains("allowed-value"));
+        assert!(!debug.contains("github-token-value"));
+        assert!(!debug.contains("untrusted-proxy-value"));
     }
 
     #[test]
@@ -651,6 +1065,7 @@ mod tests {
             hub,
             launches: Mutex::new(Vec::new()),
             issued_token: Mutex::new(None),
+            issued_broker_token: Mutex::new(None),
         };
         let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -673,6 +1088,53 @@ mod tests {
             .expect("registered token");
         assert_eq!(
             environment.get("JG_HUB_TOKEN").map(String::as_str),
+            Some(token.expose())
+        );
+        assert!(!format!("{execution:?}").contains(token.expose()));
+
+        let client = HubClient::new(executor.hub.socket_path(), token);
+        assert!(matches!(
+            client.inbox(),
+            Err(HubClientError::Shim(jgf_hub::ShimError::UnknownToken))
+        ));
+    }
+
+    #[test]
+    fn git_coder_receives_private_broker_environment_and_revoked_token() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab_dir = temp.path().join("lab");
+        let worktree = lab_dir.join("projects/project-a/worktrees/task-1");
+        fs::create_dir_all(&worktree).expect("worktree");
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        let hub = HubShim::start(temp.path().join("hub.sock"), router, |_| {}).expect("hub");
+        let executor = HubRecordingExecutor {
+            lab_dir: lab_dir.clone(),
+            hub,
+            launches: Mutex::new(Vec::new()),
+            issued_token: Mutex::new(None),
+            issued_broker_token: Mutex::new(None),
+        };
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let launcher = RoleLauncher::new(skills_dir, &executor);
+
+        let result = launcher.launch(&request(Role::GitCoder), None);
+        assert!(result.spawn_error.is_none());
+        let execution = executor.launches.lock().expect("launches").pop().unwrap();
+        let environment = execution.broker_environment();
+        assert_eq!(
+            environment.get("JG_BROKER_SOCKET").map(String::as_str),
+            Some(executor.hub.socket_path().to_str().expect("socket path"))
+        );
+        let token = executor
+            .issued_broker_token
+            .lock()
+            .expect("issued broker token")
+            .clone()
+            .expect("registered broker token");
+        assert_eq!(
+            environment.get("JG_BROKER_TOKEN").map(String::as_str),
             Some(token.expose())
         );
         assert!(!format!("{execution:?}").contains(token.expose()));

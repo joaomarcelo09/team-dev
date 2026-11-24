@@ -1971,6 +1971,7 @@ dependencies = [
  "jgf-core",
  "jgf-hub",
  "libc",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
 ]
