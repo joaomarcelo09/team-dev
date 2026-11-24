@@ -15,7 +15,7 @@ use nix::sched::{CloneFlags, setns, unshare};
 use nix::sys::signal::{Signal, kill};
 use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
 use nix::unistd::{
-    ForkResult, Pid, chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, getpid, setsid,
+    ForkResult, Pid, chdir, dup2_stderr, dup2_stdin, dup2_stdout, execve, getpid, getppid, setsid,
 };
 
 use crate::error::{Result, SandboxError};
@@ -225,7 +225,7 @@ fn run_parent(child: Pid, request: &ExecRequest, pipes: Pipes) -> Result<ExecOut
         .read_to_string(&mut result_text)
         .map_err(|source| SandboxError::io("<result pipe>", source))?;
 
-    let (exit_code, signal, worker_timeout) = parse_result(&result_text)?;
+    let (exit_code, signal, worker_timeout) = parse_result(&result_text, backstop_timeout)?;
     Ok(ExecOutput {
         exit_code,
         signal,
@@ -263,12 +263,14 @@ fn wait_for_worker(child: Pid, gpid: i32, timeout: Option<Duration>) -> (Option<
 
 /// Decode the result line written by the in-sandbox init.
 ///
-/// A missing or malformed line is a failure: the supervisor is the only writer
-/// that can produce it, so anything else means the exec was torn down or
-/// tampered with and must never be reported as a successful exit.
-fn parse_result(text: &str) -> Result<(Option<i32>, Option<i32>, bool)> {
+/// A missing line is a failure unless the host backstop fired before the
+/// supervisor could write a result. A malformed line is always a failure.
+fn parse_result(text: &str, backstop_timeout: bool) -> Result<(Option<i32>, Option<i32>, bool)> {
     let timed_out = text.lines().any(|line| line.trim() == "TIMEOUT");
     let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        if backstop_timeout {
+            return Ok((None, None, true));
+        }
         return Err(SandboxError::ExecFailed {
             reason: "the exec did not report a result".to_string(),
         });
@@ -529,6 +531,7 @@ fn supervisor_exec(
         util::exit_now(127)
     }
 
+    let nested_init_parent = getpid();
     let fork_result = util::fork_process();
     let fork_result = match fork_result {
         Ok(result) => result,
@@ -550,6 +553,7 @@ fn supervisor_exec(
             stderr_w,
             status_w,
             result_w,
+            nested_init_parent,
             egress_port,
             hub_socket,
         ),
@@ -622,17 +626,25 @@ fn nested_init_exec(
     stderr_w: OwnedFd,
     status_w: OwnedFd,
     result_w: OwnedFd,
+    expected_parent: Pid,
     egress_port: Option<u16>,
     hub_socket: Option<&Path>,
 ) -> ! {
     // If the supervisor dies (for example the host backstop kills it), this
     // init must die too, so the kernel tears the nested namespace down.
-    if let Err(error) = util::die_with_parent() {
+    if let Err(error) = arm_parent_death_signal(expected_parent, false) {
         report_worker_error(&status_w, &error);
         let _ = util::write_all(result_w.as_fd(), b"EXIT 255\n");
         util::exit_now(127)
     }
 
+    if let Err(error) = sanitize_nested_init_identity() {
+        report_worker_error(&status_w, &error);
+        let _ = util::write_all(result_w.as_fd(), b"EXIT 255\n");
+        util::exit_now(127)
+    }
+
+    let worker_parent = getpid();
     let fork_result = util::fork_process();
     let fork_result = match fork_result {
         Ok(result) => result,
@@ -656,6 +668,7 @@ fn nested_init_exec(
                 stdout_w,
                 stderr_w,
                 status_w,
+                worker_parent,
                 egress_port,
                 hub_socket,
             )
@@ -689,6 +702,75 @@ fn result_line(status: WaitStatus) -> String {
         WaitStatus::Signaled(_, signal, _) => format!("SIGNAL {}\n", signal as i32),
         _ => "EXIT 255\n".to_string(),
     }
+}
+
+fn sanitize_nested_init_identity() -> Result<()> {
+    const INIT_NAME: &[u8] = b"jg-sandbox-init\0";
+    // SAFETY: `prctl` receives a valid NUL-terminated name and scalar arguments.
+    let result = unsafe {
+        libc::prctl(
+            libc::PR_SET_NAME,
+            INIT_NAME.as_ptr() as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+            0 as libc::c_ulong,
+        )
+    };
+    if result != 0 {
+        return Err(SandboxError::nix(
+            "set nested init process name",
+            nix::errno::Errno::last(),
+        ));
+    }
+
+    clear_nested_init_arguments_and_environment()
+}
+
+fn clear_nested_init_arguments_and_environment() -> Result<()> {
+    let stat = std::fs::read_to_string("/proc/self/stat").map_err(|source| SandboxError::Io {
+        path: PathBuf::from("/proc/self/stat"),
+        source,
+    })?;
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+        .ok_or_else(|| SandboxError::ExecFailed {
+            reason: "could not parse /proc/self/stat".to_string(),
+        })?;
+    // /proc/<pid>/stat starts these fields at field 3 (state).
+    let arg_start = parse_proc_stat_address(&fields, 45, "argument start")?;
+    let arg_end = parse_proc_stat_address(&fields, 46, "argument end")?;
+    let env_start = parse_proc_stat_address(&fields, 47, "environment start")?;
+    let env_end = parse_proc_stat_address(&fields, 48, "environment end")?;
+
+    clear_process_memory_range(arg_start, arg_end)?;
+    clear_process_memory_range(env_start, env_end)
+}
+
+fn parse_proc_stat_address(fields: &[&str], index: usize, name: &str) -> Result<usize> {
+    fields
+        .get(index)
+        .and_then(|address| address.parse().ok())
+        .ok_or_else(|| SandboxError::ExecFailed {
+            reason: format!("could not read {name} from /proc/self/stat"),
+        })
+}
+
+fn clear_process_memory_range(start: usize, end: usize) -> Result<()> {
+    if start > end {
+        return Err(SandboxError::ExecFailed {
+            reason: "invalid argument or environment range in /proc/self/stat".to_string(),
+        });
+    }
+    if start < end {
+        // SAFETY: The kernel reports these writable argument/environment ranges
+        // for this process in /proc/self/stat. This process is the forked init,
+        // so clearing them does not modify the supervisor's copy.
+        unsafe {
+            std::ptr::write_bytes(start as *mut u8, 0, end - start);
+        }
+    }
+    Ok(())
 }
 
 /// Kill any direct child left after the nested init was reaped.
@@ -751,6 +833,31 @@ fn proc_state_and_parent(pid: i32) -> Option<(char, i32)> {
     Some((state, ppid))
 }
 
+fn arm_parent_death_signal(expected_parent: Pid, parent_is_visible: bool) -> Result<()> {
+    util::die_with_parent()?;
+
+    // getppid() returns zero when nested_init's parent is outside its PID
+    // namespace. Its procfs is still the sandbox-wide mount at this point, so
+    // also ensure the known parent is alive there.
+    let expected_ppid = if parent_is_visible {
+        expected_parent
+    } else {
+        Pid::from_raw(0)
+    };
+    let actual_ppid = getppid();
+    let parent_is_alive = parent_is_visible
+        || proc_state_and_parent(expected_parent.as_raw())
+            .is_some_and(|(state, _)| !matches!(state, 'Z' | 'X' | 'x'));
+    if actual_ppid != expected_ppid || !parent_is_alive {
+        return Err(SandboxError::ExecFailed {
+            reason: format!(
+                "parent changed while setting parent death signal (expected {expected_parent}, observed {actual_ppid})"
+            ),
+        });
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn worker_exec(
     request: &ExecRequest,
@@ -762,6 +869,7 @@ fn worker_exec(
     stdout_w: OwnedFd,
     stderr_w: OwnedFd,
     status_w: OwnedFd,
+    expected_parent: Pid,
     egress_port: Option<u16>,
     hub_socket: Option<&Path>,
 ) -> ! {
@@ -775,6 +883,7 @@ fn worker_exec(
         &stdout_w,
         &stderr_w,
         &status_w,
+        expected_parent,
         egress_port,
         hub_socket,
     ) {
@@ -812,24 +921,29 @@ fn worker_setup(
     stdout_w: &OwnedFd,
     stderr_w: &OwnedFd,
     status_w: &OwnedFd,
+    expected_parent: Pid,
     egress_port: Option<u16>,
     hub_socket: Option<&Path>,
 ) -> Result<()> {
+    arm_parent_death_signal(expected_parent, true)?;
     join_sandbox(mount, ipc, uts, net)?;
     if let Some(scope) = &request.scope {
         scope::enter_scope(scope)?;
         if !request.env.contains_key("HOME") {
             scope::create_scoped_home()?;
         }
+    } else {
+        // Unscoped execs need the same PID-scoped procfs as scoped execs.
+        unshare(CloneFlags::CLONE_NEWNS)
+            .map_err(|source| SandboxError::nix("unshare exec mount namespace", source))?;
+        util::make_mounts_private()?;
+        util::mount_proc(Path::new("/proc"))?;
     }
 
     // A fresh session detaches the command from the caller's job control and
     // its controlling terminal; the timeout kill still reaches the group because
     // the session leader is also the group leader.
     setsid().map_err(|source| SandboxError::nix("setsid", source))?;
-    // If the supervisor dies unexpectedly (for example the host backstop kills
-    // it), the command must not keep running by itself.
-    util::die_with_parent()?;
     dup2_stdin(stdin_r.as_fd()).map_err(|source| SandboxError::nix("redirect stdin", source))?;
     dup2_stdout(stdout_w.as_fd()).map_err(|source| SandboxError::nix("redirect stdout", source))?;
     dup2_stderr(stderr_w.as_fd()).map_err(|source| SandboxError::nix("redirect stderr", source))?;
@@ -905,17 +1019,26 @@ mod tests {
 
     #[test]
     fn missing_result_is_a_failure() {
-        assert!(parse_result("").is_err());
+        assert!(parse_result("", false).is_err());
+    }
+
+    #[test]
+    fn missing_result_after_backstop_is_a_timeout() {
+        assert_eq!(
+            parse_result("", true).expect("backstop timeout"),
+            (None, None, true)
+        );
     }
 
     #[test]
     fn malformed_result_is_a_failure() {
-        assert!(parse_result("EXIT nope\n").is_err());
+        assert!(parse_result("EXIT nope\n", false).is_err());
     }
 
     #[test]
     fn exit_and_timeout_lines_are_decoded() {
-        let (exit_code, signal, timed_out) = parse_result("SIGNAL 9\nTIMEOUT\n").expect("result");
+        let (exit_code, signal, timed_out) =
+            parse_result("SIGNAL 9\nTIMEOUT\n", false).expect("result");
         assert_eq!(exit_code, None);
         assert_eq!(signal, Some(9));
         assert!(timed_out);
