@@ -7,6 +7,7 @@ pub mod ci_watch;
 pub mod git_flow;
 pub mod routing;
 pub mod scheduler;
+pub mod usage;
 
 pub use board::{Actor, Board, BoardError, BoardFilter, Column, Outcome, OutcomeStatus, Task};
 pub use broker::{
@@ -29,4 +30,9 @@ pub use routing::{
 pub use scheduler::{
     CoderGrant, CoderSlot, Limits, MAX_CODERS, MAX_TEAMS, Mode, ReviewTicket, Scheduler,
     SchedulerError, SlotId, Switch, WaitReason,
+};
+pub use usage::{
+    HARD_PERCENT, LabState, Level, Parked, Policy, Provider, RESUME_DELAY_SECS, Reading,
+    ReadingState, ResumeQueue, SOFT_PERCENT, STALE_SECS, Throttle, UsageError, UsageMeter, Window,
+    lab_state,
 };
