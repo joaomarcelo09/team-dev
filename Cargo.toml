@@ -11,6 +11,7 @@ authors = ["joaogomes"]
 [workspace.dependencies]
 jgt-core = { path = "crates/jgt-core" }
 jgf-core = { path = "crates/jgf-core" }
+jgf-hub = { path = "crates/jgf-hub" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

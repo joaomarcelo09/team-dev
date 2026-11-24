@@ -5,6 +5,18 @@ edition.workspace = true
 license.workspace = true
 description = "Dark Factory (desktop): separate from the stable jg-team-dev app"
 
+[[bin]]
+name = "jg-factory-desktop"
+path = "src/main.rs"
+
 [dependencies]
 jgf-core.workspace = true
+jgf-hub.workspace = true
+iced.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
