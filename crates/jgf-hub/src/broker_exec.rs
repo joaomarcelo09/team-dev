@@ -95,19 +95,21 @@ pub enum BackendOp {
         base: String,
         commit_message: Option<String>,
     },
-    /// Open a pull request from `head`.
+    /// Open a pull request from `head` against `base`.
     OpenPr {
         owner: String,
         repo: String,
         head: Option<String>,
+        base: Option<String>,
         title: String,
         body: String,
     },
-    /// Merge a pull request identified by `branch`.
+    /// Merge a pull request identified by `branch` into `merge_target`.
     MergePr {
         owner: String,
         repo: String,
         branch: Option<String>,
+        merge_target: String,
     },
     /// Read the latest CI run of `branch`, or of the repository when no branch is known.
     ReadCiStatus {
@@ -148,6 +150,7 @@ impl BackendOp {
                     owner,
                     repo,
                     head: approved.branch.clone(),
+                    base: approved.base.clone(),
                     title,
                     body,
                 }
@@ -156,6 +159,7 @@ impl BackendOp {
                 owner,
                 repo,
                 branch: approved.branch.clone(),
+                merge_target: approved.merge_target.clone().unwrap_or_default(),
             },
             GithubAction::ReadCiStatus => Self::ReadCiStatus {
                 owner,
@@ -235,6 +239,26 @@ pub enum BackendError {
         field: &'static str,
     },
 
+    /// The pull request's real base branch could not be read.
+    #[error("could not read the base branch of pull request {branch}: {message}")]
+    MergeBaseUnreadable {
+        /// Branch that identifies the pull request.
+        branch: String,
+        /// Why the base could not be read, with the token redacted.
+        message: String,
+    },
+
+    /// The pull request merges into a branch the broker did not approve.
+    #[error("pull request {branch} targets {actual:?}, not the approved merge target {expected:?}")]
+    MergeTargetMismatch {
+        /// Branch that identifies the pull request.
+        branch: String,
+        /// Branch the broker approved.
+        expected: String,
+        /// Branch the pull request really targets.
+        actual: String,
+    },
+
     /// The host-owned push workspace could not be prepared.
     #[error("could not prepare the push workspace: {message}")]
     Workspace {
@@ -306,6 +330,19 @@ impl BackendError {
                 program: redact(&program, token),
                 message: redact(&message, token),
             },
+            Self::MergeBaseUnreadable { branch, message } => Self::MergeBaseUnreadable {
+                branch: redact(&branch, token),
+                message: redact(&message, token),
+            },
+            Self::MergeTargetMismatch {
+                branch,
+                expected,
+                actual,
+            } => Self::MergeTargetMismatch {
+                branch: redact(&branch, token),
+                expected: redact(&expected, token),
+                actual: redact(&actual, token),
+            },
             missing @ Self::MissingOperationField { .. } => missing,
         }
     }
@@ -325,6 +362,8 @@ pub struct GhCliBackend {
     #[cfg(test)]
     override_invocation: Option<Invocation>,
     #[cfg(test)]
+    override_merge_base: Option<Invocation>,
+    #[cfg(test)]
     remote_url: Option<String>,
 }
 
@@ -336,6 +375,8 @@ impl GhCliBackend {
             timeout: DEFAULT_TIMEOUT,
             #[cfg(test)]
             override_invocation: None,
+            #[cfg(test)]
+            override_merge_base: None,
             #[cfg(test)]
             remote_url: None,
         }
@@ -382,12 +423,17 @@ impl GhCliBackend {
                 owner,
                 repo,
                 head,
+                base,
                 title,
                 body,
             } => {
                 let head = head.as_deref().ok_or(BackendError::MissingOperationField {
                     action: "open_pr",
                     field: "head",
+                })?;
+                let base = base.as_deref().ok_or(BackendError::MissingOperationField {
+                    action: "open_pr",
+                    field: "base",
                 })?;
                 let mut args = vec![
                     "pr".to_string(),
@@ -396,6 +442,8 @@ impl GhCliBackend {
                     format!("{owner}/{repo}"),
                     "--head".to_string(),
                     head.to_string(),
+                    "--base".to_string(),
+                    base.to_string(),
                 ];
                 args.extend([
                     "--title".to_string(),
@@ -409,6 +457,7 @@ impl GhCliBackend {
                 owner,
                 repo,
                 branch,
+                ..
             } => {
                 let branch = branch
                     .as_deref()
@@ -444,6 +493,50 @@ impl GhCliBackend {
             }
         };
         Ok(Some(invocation))
+    }
+
+    /// The `gh` command that reads the pull request's real base branch.
+    fn lookup_base_invocation(&self, owner: &str, repo: &str, branch: &str) -> Invocation {
+        #[cfg(test)]
+        if let Some(invocation) = &self.override_merge_base {
+            return invocation.clone();
+        }
+        base_lookup_invocation(owner, repo, branch)
+    }
+
+    /// Refuses the merge unless the pull request really targets the approved branch.
+    fn verify_merge_base(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+        expected: &str,
+        token: &Secret,
+    ) -> Result<(), BackendError> {
+        let invocation = self.lookup_base_invocation(owner, repo, branch);
+        let neutral = TempDir::new().map_err(|source| BackendError::Workspace {
+            message: source.to_string(),
+        })?;
+        let (stdout, _stderr) = self.run_command(&invocation, neutral.path(), Some(token))?;
+        parse_merge_base(branch, expected, &stdout)
+    }
+
+    /// Runs the fixed `gh` invocation of a non-push operation.
+    fn run_fixed_gh(
+        &self,
+        op: &BackendOp,
+        token: &Secret,
+    ) -> Result<(String, String), BackendError> {
+        let invocation = self
+            .invocation(op)?
+            .ok_or(BackendError::MissingOperationField {
+                action: "non-push operation",
+                field: "command",
+            })?;
+        let neutral = TempDir::new().map_err(|source| BackendError::Workspace {
+            message: source.to_string(),
+        })?;
+        self.run_command(&invocation, neutral.path(), Some(token))
     }
 
     /// The validated push destination; only tests point it somewhere else.
@@ -708,18 +801,28 @@ impl GithubBackend for GhCliBackend {
                 base,
                 ..
             } => self.push_task_branch(owner, repo, branch, base, token)?,
-            _ => {
-                let invocation =
-                    self.invocation(op)?
-                        .ok_or(BackendError::MissingOperationField {
-                            action: "non-push operation",
-                            field: "command",
-                        })?;
-                let neutral = TempDir::new().map_err(|source| BackendError::Workspace {
-                    message: source.to_string(),
-                })?;
-                self.run_command(&invocation, neutral.path(), Some(token))?
+            BackendOp::MergePr {
+                owner,
+                repo,
+                branch,
+                merge_target,
+            } => {
+                let branch = branch
+                    .as_deref()
+                    .ok_or(BackendError::MissingOperationField {
+                        action: "merge_pr",
+                        field: "branch",
+                    })?;
+                if merge_target.is_empty() {
+                    return Err(BackendError::MissingOperationField {
+                        action: "merge_pr",
+                        field: "merge_target",
+                    });
+                }
+                self.verify_merge_base(owner, repo, branch, merge_target, token)?;
+                self.run_fixed_gh(op, token)?
             }
+            _ => self.run_fixed_gh(op, token)?,
         };
         Ok(BackendOutput {
             action: op.action(),
@@ -883,6 +986,54 @@ fn redact_optional(text: &str, token: Option<&Secret>) -> String {
         Some(token) => redact(text, token),
         None => text.to_string(),
     }
+}
+
+/// The fixed `gh` command that reads a pull request's real base branch.
+fn base_lookup_invocation(owner: &str, repo: &str, branch: &str) -> Invocation {
+    Invocation::new(
+        "gh",
+        vec![
+            "pr".to_string(),
+            "view".to_string(),
+            branch.to_string(),
+            "--repo".to_string(),
+            format!("{owner}/{repo}"),
+            "--json".to_string(),
+            "baseRefName".to_string(),
+        ],
+    )
+}
+
+/// Refuses the merge unless `gh` reported exactly `expected` as the pull request's base.
+///
+/// An unreadable or malformed response is a refusal too: a merge is never allowed on a base
+/// the broker could not confirm.
+fn parse_merge_base(branch: &str, expected: &str, stdout: &str) -> Result<(), BackendError> {
+    let actual =
+        parse_base_ref_name(stdout).map_err(|message| BackendError::MergeBaseUnreadable {
+            branch: branch.to_string(),
+            message,
+        })?;
+    if actual != expected {
+        return Err(BackendError::MergeTargetMismatch {
+            branch: branch.to_string(),
+            expected: expected.to_string(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Reads `baseRefName` out of a `gh pr view --json baseRefName` response.
+fn parse_base_ref_name(stdout: &str) -> Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(stdout).map_err(|error| format!("invalid JSON: {error}"))?;
+    value
+        .get("baseRefName")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "response has no baseRefName".to_string())
 }
 
 /// A `git` invocation with the host-side lockdown flags ahead of `args`.
@@ -1280,7 +1431,8 @@ mod tests {
             force: false,
             delete: false,
             target_is_default_branch: false,
-            merge_policy_allows: false,
+            merge_target: None,
+            merge_context: None,
             commit_message: None,
         }
     }
@@ -1461,7 +1613,8 @@ mod tests {
             owner: "acme".to_string(),
             repo: "app".to_string(),
             branch: Some("jgt/JGT-97".to_string()),
-            base: None,
+            base: Some("develop".to_string()),
+            merge_target: None,
             commit_message: Some(
                 "feat: add x\n\nCo-Authored-By: A <a@example.com>\nBody prose.".to_string(),
             ),
@@ -1502,6 +1655,7 @@ mod tests {
             owner: "acme".to_string(),
             repo: "app".to_string(),
             head: None,
+            base: Some("develop".to_string()),
             title: "title".to_string(),
             body: String::new(),
         };
@@ -1513,10 +1667,27 @@ mod tests {
             })
         ));
 
+        let no_base = BackendOp::OpenPr {
+            owner: "acme".to_string(),
+            repo: "app".to_string(),
+            head: Some("jgt/JGT-97".to_string()),
+            base: None,
+            title: "title".to_string(),
+            body: String::new(),
+        };
+        assert!(matches!(
+            backend.invocation(&no_base),
+            Err(BackendError::MissingOperationField {
+                action: "open_pr",
+                field: "base"
+            })
+        ));
+
         let merge = BackendOp::MergePr {
             owner: "acme".to_string(),
             repo: "app".to_string(),
             branch: None,
+            merge_target: "develop".to_string(),
         };
         assert!(matches!(
             backend.invocation(&merge),
@@ -1574,6 +1745,7 @@ mod tests {
             owner: "acme".to_string(),
             repo: "app".to_string(),
             head: Some("jgt/JGT-97".to_string()),
+            base: Some("develop".to_string()),
             title: "feat: add x".to_string(),
             body: "Body".to_string(),
         });
@@ -1587,6 +1759,8 @@ mod tests {
                 "acme/app",
                 "--head",
                 "jgt/JGT-97",
+                "--base",
+                "develop",
                 "--title",
                 "feat: add x",
                 "--body",
@@ -1601,12 +1775,107 @@ mod tests {
             owner: "acme".to_string(),
             repo: "app".to_string(),
             branch: Some("jgt/JGT-97".to_string()),
+            merge_target: "develop".to_string(),
         });
         assert_eq!(invocation.program, "gh");
         assert_eq!(
             invocation.args,
             ["pr", "merge", "jgt/JGT-97", "--repo", "acme/app", "--merge"]
         );
+    }
+
+    #[test]
+    fn merge_base_lookup_has_a_fixed_argument_vector() {
+        let invocation =
+            GhCliBackend::new("/work/tree").lookup_base_invocation("acme", "app", "jgt/JGT-97");
+        assert_eq!(invocation.program, "gh");
+        assert_eq!(
+            invocation.args,
+            [
+                "pr",
+                "view",
+                "jgt/JGT-97",
+                "--repo",
+                "acme/app",
+                "--json",
+                "baseRefName",
+            ]
+        );
+    }
+
+    fn merge_op() -> BackendOp {
+        BackendOp::MergePr {
+            owner: "acme".to_string(),
+            repo: "app".to_string(),
+            branch: Some("jgt/JGT-97".to_string()),
+            merge_target: "develop".to_string(),
+        }
+    }
+
+    fn shell_invocation(script: &str) -> Invocation {
+        Invocation::new("sh", vec!["-c".to_string(), script.to_string()])
+    }
+
+    fn merge_backend(lookup: Invocation) -> GhCliBackend {
+        GhCliBackend {
+            workdir: PathBuf::from("."),
+            timeout: Duration::from_secs(5),
+            override_invocation: Some(shell_invocation("echo merged")),
+            override_merge_base: Some(lookup),
+            remote_url: None,
+        }
+    }
+
+    #[test]
+    fn a_merge_is_refused_when_the_real_base_differs_from_the_approved_target() {
+        let backend = merge_backend(shell_invocation("echo '{\"baseRefName\":\"main\"}'"));
+
+        let error = backend
+            .run(&merge_op(), &Secret::new(TOKEN))
+            .expect_err("the real base is not the approved one");
+
+        assert!(matches!(
+            error,
+            BackendError::MergeTargetMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == "develop" && actual == "main"
+        ));
+    }
+
+    #[test]
+    fn a_merge_is_refused_when_the_base_lookup_fails() {
+        let backend = merge_backend(shell_invocation("exit 1"));
+
+        let error = backend
+            .run(&merge_op(), &Secret::new(TOKEN))
+            .expect_err("an unreadable base must fail closed");
+
+        assert!(matches!(error, BackendError::Failed { .. }));
+    }
+
+    #[test]
+    fn a_merge_is_refused_when_the_base_response_is_garbage() {
+        let backend = merge_backend(shell_invocation("echo not-json"));
+
+        let error = backend
+            .run(&merge_op(), &Secret::new(TOKEN))
+            .expect_err("a malformed base response must fail closed");
+
+        assert!(matches!(error, BackendError::MergeBaseUnreadable { .. }));
+    }
+
+    #[test]
+    fn a_merge_is_allowed_when_the_real_base_matches_the_approved_target() {
+        let backend = merge_backend(shell_invocation("echo '{\"baseRefName\":\"develop\"}'"));
+
+        let output = backend
+            .run(&merge_op(), &Secret::new(TOKEN))
+            .expect("the real base is the approved one");
+
+        assert_eq!(output.action, GithubAction::MergePr);
+        assert!(output.stdout.contains("merged"));
     }
 
     #[test]
@@ -1686,6 +1955,7 @@ mod tests {
                 owner: "acme".to_string(),
                 repo: "app".to_string(),
                 head: Some("jgt/JGT-97".to_string()),
+                base: Some("develop".to_string()),
                 title: "title".to_string(),
                 body: String::new(),
             },
@@ -1693,6 +1963,7 @@ mod tests {
                 owner: "acme".to_string(),
                 repo: "app".to_string(),
                 branch: Some("jgt/JGT-97".to_string()),
+                merge_target: "develop".to_string(),
             },
             BackendOp::ReadCiStatus {
                 owner: "acme".to_string(),
@@ -1751,6 +2022,7 @@ mod tests {
             workdir: PathBuf::from("."),
             timeout: Duration::from_secs(5),
             override_invocation: Some(Invocation::new("printenv", vec!["GH_TOKEN".to_string()])),
+            override_merge_base: None,
             remote_url: None,
         };
         let token = Secret::new(TOKEN);
@@ -1778,6 +2050,7 @@ mod tests {
                 "sh",
                 vec!["-c".to_string(), "printenv GH_TOKEN; exit 7".to_string()],
             )),
+            override_merge_base: None,
             remote_url: None,
         };
         let token = Secret::new(TOKEN);
@@ -1803,6 +2076,7 @@ mod tests {
             workdir: PathBuf::from("."),
             timeout: Duration::from_millis(100),
             override_invocation: Some(Invocation::new("sleep", vec!["5".to_string()])),
+            override_merge_base: None,
             remote_url: None,
         };
         let token = Secret::new(TOKEN);
