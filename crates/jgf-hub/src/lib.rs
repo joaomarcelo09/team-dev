@@ -1,10 +1,20 @@
 //! Dark Factory hub: separate from the stable jg-team-dev app.
 
 pub mod board;
+pub mod broker;
+pub mod broker_exec;
 pub mod routing;
 pub mod scheduler;
 
 pub use board::{Actor, Board, BoardError, BoardFilter, Column, Outcome, OutcomeStatus, Task};
+pub use broker::{
+    Approved, Broker, BrokerDenied, CommitError, DEFAULT_TASK_BRANCH_PREFIX, GithubRequest,
+    clean_pr_text, validate_commit_message,
+};
+pub use broker_exec::{
+    BackendError, BackendOp, BackendOutput, BrokerError, GITHUB_TOKEN_KEY, GhCliBackend,
+    GithubBackend, testing::FakeBackend,
+};
 pub use routing::{
     CoordinatorConfig, MAX_BODY_BYTES, Message, MessageKind, OutgoingMessage, Role, Router,
     RoutingError, WorkerKind,
