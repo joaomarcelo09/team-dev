@@ -488,7 +488,12 @@ impl GhCliBackend {
                     args.push("--branch".to_string());
                     args.push(branch.clone());
                 }
-                args.extend(["--limit".to_string(), "1".to_string()]);
+                args.extend([
+                    "--json".to_string(),
+                    "status,conclusion,databaseId,headSha".to_string(),
+                    "--limit".to_string(),
+                    "20".to_string(),
+                ]);
                 Invocation::new("gh", args)
             }
         };
@@ -1895,8 +1900,10 @@ mod tests {
                 "acme/app",
                 "--branch",
                 "jgt/JGT-97",
+                "--json",
+                "status,conclusion,databaseId,headSha",
                 "--limit",
-                "1",
+                "20",
             ]
         );
     }
