@@ -360,9 +360,27 @@ impl LabWorld {
     }
 
     fn audit(&self, message: &str) -> Result<(), String> {
+        self.audit_tagged(None, None, message)
+    }
+
+    pub(crate) fn record_role_start(
+        &self,
+        project: &str,
+        worker: &str,
+        role: &str,
+    ) -> Result<(), String> {
+        self.audit_tagged(Some(project), Some(worker), &format!("role_start:{role}"))
+    }
+
+    fn audit_tagged(
+        &self,
+        project: Option<&str>,
+        worker: Option<&str>,
+        message: &str,
+    ) -> Result<(), String> {
         let log = AuditLog::open(&self.audit_dir, self.lab_id.clone())
             .map_err(|error| format!("could not open lab audit log: {error}"))?;
-        log.append(None, None, AuditKind::note(message))
+        log.append(project, worker, AuditKind::note(message))
             .map(|_| ())
             .map_err(|error| format!("could not append lab lifecycle audit event: {error}"))
     }
@@ -436,6 +454,31 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn role_start_audit_records_lab_project_and_worker_once() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let world = LabWorld::new(
+            temp.path().join("state"),
+            temp.path().join("audit"),
+            "test-lab",
+            EndOfLifePolicy::KeepOnFailure,
+        );
+
+        world
+            .record_role_start("project-a", "worker-1", "coder")
+            .expect("role start audit");
+
+        let events = AuditLog::open(temp.path().join("audit"), "test-lab")
+            .expect("audit log")
+            .read_all()
+            .expect("audit events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].lab, "test-lab");
+        assert_eq!(events[0].project.as_deref(), Some("project-a"));
+        assert_eq!(events[0].worker.as_deref(), Some("worker-1"));
+        assert_eq!(events[0].kind, AuditKind::note("role_start:coder"));
     }
 
     #[test]

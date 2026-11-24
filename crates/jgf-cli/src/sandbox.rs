@@ -12,15 +12,17 @@ use std::{
     time::Duration,
 };
 
+use jg_sandbox::scope::{SCOPED_HOME, WORKSPACE};
 use jg_sandbox::{
     Backend, EgressEvent, EgressPolicy, EgressProxy, EgressSpec, ExecOutput, ExecRequest,
-    NamespaceBackend, SandboxHandle, SandboxSpec, default_ro_binds,
+    ExecScope, NamespaceBackend, SandboxHandle, SandboxSpec, default_ro_binds,
 };
 
 use crate::{
     child::{self, RuntimeLayout},
     e2e::{KillSwitch, RunOutcome},
-    lab_world::{EndOfLifePolicy, LabWorld, LabWorldSpec, RunEnd},
+    lab_world::{EndOfLifePolicy, LabWorld, LabWorldSpec, RunEnd, WorldStatus},
+    roles::RoleExecution,
     scratch::{ScratchHome, real_home},
 };
 
@@ -50,10 +52,24 @@ struct LiveSandbox {
     runtime: RuntimeLayout,
 }
 
+struct ClaudeExec<'a> {
+    binary: &'a Path,
+    argv: &'a [String],
+    work_tree: &'a Path,
+    scratch: &'a ScratchHome,
+    timeout: Duration,
+    scope: Option<ExecScope>,
+    kill: Option<&'a dyn KillSwitch>,
+}
+
 #[derive(Debug, Default)]
-pub(crate) struct ChildRun {
+/// Result of one Claude command inside the sandbox.
+pub struct ChildRun {
+    /// Output returned by the sandbox backend, when the command ran.
     pub output: Option<ExecOutput>,
+    /// Why the command could not start, if setup failed.
     pub spawn_error: Option<String>,
+    /// Whether a kill switch stopped the command.
     pub killed: bool,
 }
 
@@ -258,6 +274,18 @@ impl ClaudeSandbox {
         timeout: Duration,
         kill: Option<&dyn KillSwitch>,
     ) -> ChildRun {
+        self.run_claude_with_scope(ClaudeExec {
+            binary,
+            argv,
+            work_tree,
+            scratch,
+            timeout,
+            scope: None,
+            kill,
+        })
+    }
+
+    fn run_claude_with_scope(&self, execution: ClaudeExec<'_>) -> ChildRun {
         let live_guard = match self.live.lock() {
             Ok(live_guard) => live_guard,
             Err(_) => {
@@ -275,7 +303,7 @@ impl ClaudeSandbox {
                 ..ChildRun::default()
             };
         };
-        if binary != self.binary {
+        if execution.binary != self.binary {
             return ChildRun {
                 spawn_error: Some(
                     "Claude executable does not match the jg-sandbox runtime configuration"
@@ -284,7 +312,15 @@ impl ClaudeSandbox {
                 ..ChildRun::default()
             };
         }
-        if fs::canonicalize(work_tree).ok().as_deref() != Some(live.work_tree.as_path()) {
+        let resolved_work_tree = fs::canonicalize(execution.work_tree).ok();
+        let valid_work_tree = resolved_work_tree.as_ref().is_some_and(|work_tree| {
+            if execution.scope.is_some() {
+                work_tree.starts_with(&live.lab_dir) && work_tree != &live.lab_dir
+            } else {
+                work_tree == &live.work_tree
+            }
+        });
+        if !valid_work_tree {
             return ChildRun {
                 spawn_error: Some(
                     "Claude work tree does not match the jg-sandbox lab directory".to_string(),
@@ -302,7 +338,15 @@ impl ClaudeSandbox {
                 ..ChildRun::default()
             };
         }
-        if scratch.root() != live.scratch_root {
+        let valid_scratch = if execution.scope.is_some() {
+            execution.scratch.root().starts_with(&live.scratch_root)
+                && execution.scratch.root() != live.scratch_root
+                && !execution.scratch.root().starts_with(execution.work_tree)
+                && !execution.work_tree.starts_with(execution.scratch.root())
+        } else {
+            execution.scratch.root() == live.scratch_root
+        };
+        if !valid_scratch {
             return ChildRun {
                 spawn_error: Some(
                     "Claude scratch home does not match the jg-sandbox scratch directory"
@@ -311,13 +355,32 @@ impl ClaudeSandbox {
                 ..ChildRun::default()
             };
         }
-        if argv.is_empty() {
+        if let Some(scope) = &execution.scope {
+            let relative_work_tree = resolved_work_tree
+                .as_ref()
+                .and_then(|work_tree| work_tree.strip_prefix(&live.lab_dir).ok());
+            let expected_scope_path = relative_work_tree.map(|path| Path::new("/lab").join(path));
+            let relative_scratch = execution.scratch.root().strip_prefix(&live.lab_dir).ok();
+            let expected_scratch_path = relative_scratch.map(|path| Path::new("/lab").join(path));
+            if expected_scope_path.as_ref() != Some(&scope.worktree)
+                || expected_scratch_path.as_ref() != scope.scratch_home.as_ref()
+                || scope.validate().is_err()
+            {
+                return ChildRun {
+                    spawn_error: Some(
+                        "Claude exec scope does not match the jg-sandbox work tree".to_string(),
+                    ),
+                    ..ChildRun::default()
+                };
+            }
+        }
+        if execution.argv.is_empty() {
             return ChildRun {
                 spawn_error: Some("Claude argv must not be empty".to_string()),
                 ..ChildRun::default()
             };
         }
-        if kill.is_some_and(|kill| kill.killed()) {
+        if execution.kill.is_some_and(|kill| kill.killed()) {
             drop(live_guard);
             let destroy_error = self.world.finish(RunEnd::Killed, || self.destroy()).err();
             let mut result = ChildRun {
@@ -330,7 +393,7 @@ impl ClaudeSandbox {
             return result;
         }
 
-        if scratch.credentials_file() != live.credentials_file {
+        if execution.scratch.credentials_file() != live.credentials_file {
             return ChildRun {
                 spawn_error: Some(
                     "Claude credentials do not match the read-only jg-sandbox bind".to_string(),
@@ -338,13 +401,14 @@ impl ClaudeSandbox {
                 ..ChildRun::default()
             };
         }
-        let request = match build_exec_request(
-            argv,
-            timeout,
-            scratch,
+        let request = match build_exec_request_with_scope(
+            execution.argv,
+            execution.timeout,
+            execution.scratch,
             &live.lab_dir,
-            &live.work_tree,
+            execution.work_tree,
             &live.runtime,
+            execution.scope,
         ) {
             Ok(request) => request,
             Err(error) => {
@@ -396,7 +460,7 @@ impl ClaudeSandbox {
                     };
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if kill.is_some_and(|kill| kill.killed()) {
+                    if execution.kill.is_some_and(|kill| kill.killed()) {
                         let destroy_error =
                             self.world.finish(RunEnd::Killed, || self.destroy()).err();
                         let _ = receiver.recv_timeout(KILL_WAIT_TIMEOUT);
@@ -413,6 +477,62 @@ impl ClaudeSandbox {
                 }
             }
         }
+    }
+
+    pub(crate) fn role_lab_dir(&self) -> Result<PathBuf, String> {
+        if self.world.status() == WorldStatus::Destroyed {
+            return Err("jg-sandbox world is destroyed; refusing to launch a role".to_string());
+        }
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
+        live.as_ref()
+            .map(|live| live.lab_dir.clone())
+            .ok_or_else(|| "jg-sandbox world is missing; refusing to launch a role".to_string())
+    }
+
+    pub(crate) fn audit_role_start(
+        &self,
+        project: &str,
+        worker: &str,
+        role: &str,
+    ) -> Result<(), String> {
+        self.world.record_role_start(project, worker, role)
+    }
+
+    pub(crate) fn execute_role(
+        &self,
+        execution: RoleExecution,
+        kill: Option<&dyn KillSwitch>,
+    ) -> ChildRun {
+        let host_home = match real_home() {
+            Ok(home) => home,
+            Err(error) => {
+                return ChildRun {
+                    spawn_error: Some(error.to_string()),
+                    ..ChildRun::default()
+                };
+            }
+        };
+        let scratch = match ScratchHome::prepare(&execution.scratch_home, &host_home) {
+            Ok(scratch) => scratch,
+            Err(error) => {
+                return ChildRun {
+                    spawn_error: Some(error.to_string()),
+                    ..ChildRun::default()
+                };
+            }
+        };
+        self.run_claude_with_scope(ClaudeExec {
+            binary: &self.binary,
+            argv: &execution.argv,
+            work_tree: &execution.worktree,
+            scratch: &scratch,
+            timeout: execution.timeout,
+            scope: Some(execution.scope),
+            kill,
+        })
     }
 
     /// Destroys the world and removes the private child home; safe to call more than once.
@@ -528,36 +648,48 @@ fn build_sandbox_spec(
     Ok(spec)
 }
 
-fn build_exec_request(
+fn build_exec_request_with_scope(
     argv: &[String],
     timeout: Duration,
     scratch: &ScratchHome,
     lab_dir: &Path,
     work_tree: &Path,
     runtime: &RuntimeLayout,
+    scope: Option<ExecScope>,
 ) -> Result<ExecRequest, String> {
     let relative_work = work_tree
         .strip_prefix(lab_dir)
         .map_err(|_| "Claude work tree is outside the jg-sandbox lab".to_string())?;
-    if relative_work != Path::new(LAB_WORK_DIR) {
+    if relative_work.as_os_str().is_empty()
+        || (scope.is_none() && relative_work != Path::new(LAB_WORK_DIR))
+    {
         return Err("Claude work tree must be the lab's work directory".to_string());
     }
     let relative_scratch = scratch
         .root()
         .strip_prefix(lab_dir)
         .map_err(|_| "Claude scratch home is outside the jg-sandbox lab".to_string())?;
-    if relative_scratch != Path::new(LAB_SCRATCH_DIR) {
+    if relative_scratch.as_os_str().is_empty()
+        || (scope.is_none() && relative_scratch != Path::new(LAB_SCRATCH_DIR))
+        || (scope.is_some() && !relative_scratch.starts_with(LAB_SCRATCH_DIR))
+    {
         return Err("Claude scratch home must be the lab's scratch directory".to_string());
     }
-    let guest_scratch = Path::new("/lab").join(relative_scratch);
+    let guest_scratch = if scope.is_some() {
+        PathBuf::from(SCOPED_HOME)
+    } else {
+        Path::new("/lab").join(relative_scratch)
+    };
     let guest_work = Path::new("/lab").join(relative_work);
     let mut child_argv = Vec::with_capacity(argv.len());
     child_argv.push(runtime.executable.to_string_lossy().into_owned());
     child_argv.extend(argv.iter().skip(1).cloned());
 
-    let mut request = ExecRequest::new(child_argv)
-        .with_cwd(guest_work)
-        .with_timeout(timeout);
+    let mut request = ExecRequest::new(child_argv).with_timeout(timeout);
+    request = match scope {
+        Some(scope) => request.with_cwd(WORKSPACE).with_scope(scope),
+        None => request.with_cwd(guest_work),
+    };
     request.env = scratch_environment(scratch, &guest_scratch, &runtime.path)?;
     Ok(request)
 }
@@ -700,13 +832,14 @@ mod tests {
             path: "/usr/bin:/opt/claude-runtime".into(),
         };
 
-        let request = build_exec_request(
+        let request = build_exec_request_with_scope(
             &["claude".to_string(), "-p".to_string()],
             Duration::from_secs(30),
             &scratch,
             &lab_dir,
             &work_tree,
             &runtime,
+            None,
         )
         .expect("exec request");
 
@@ -730,6 +863,50 @@ mod tests {
         for key in ["GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "GIT_ASKPASS"] {
             assert!(!request.env.contains_key(key), "{key} reached the child");
         }
+    }
+
+    #[test]
+    fn scoped_exec_request_mounts_only_the_selected_worktree_at_workspace() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab_dir = temp.path().join("lab");
+        let work_tree = lab_dir.join("projects/project-a/worktrees/task-1");
+        let scratch_root = lab_dir.join("scratch/project-a/worker-1");
+        let host_home = temp.path().join("host-home");
+        fs::create_dir_all(&work_tree).expect("work tree");
+        fs::create_dir_all(host_home.join(".claude")).expect("claude directory");
+        fs::write(host_home.join(".claude/.credentials.json"), "placeholder")
+            .expect("placeholder credentials");
+        let scratch = ScratchHome::prepare(&scratch_root, &host_home).expect("scratch home");
+        let runtime = RuntimeLayout {
+            executable: PathBuf::from("/opt/claude-runtime/claude"),
+            directories: vec![],
+            path: "/usr/bin:/opt/claude-runtime".into(),
+        };
+        let scope = ExecScope::new(
+            jg_sandbox::ScopeAccess::ReadWrite,
+            "/lab/projects/project-a/worktrees/task-1",
+        )
+        .with_common_dir("/lab/projects/project-a/repository/.git")
+        .with_scratch_home("/lab/scratch/project-a/worker-1")
+        .with_project("project-a");
+
+        let request = build_exec_request_with_scope(
+            &["claude".to_string(), "-p".to_string()],
+            Duration::from_secs(30),
+            &scratch,
+            &lab_dir,
+            &work_tree,
+            &runtime,
+            Some(scope.clone()),
+        )
+        .expect("scoped exec request");
+
+        assert_eq!(request.cwd, PathBuf::from("/workspace"));
+        assert_eq!(request.scope, Some(scope));
+        assert_eq!(
+            request.env.get("HOME").map(String::as_str),
+            Some("/tmp/home/home")
+        );
     }
 
     #[test]
