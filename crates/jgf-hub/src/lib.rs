@@ -3,6 +3,7 @@
 pub mod board;
 pub mod broker;
 pub mod broker_exec;
+pub mod git_flow;
 pub mod routing;
 pub mod scheduler;
 
@@ -14,6 +15,10 @@ pub use broker::{
 pub use broker_exec::{
     BackendError, BackendOp, BackendOutput, BrokerError, GITHUB_TOKEN_KEY, GhCliBackend,
     GithubBackend, testing::FakeBackend,
+};
+pub use git_flow::{
+    DEFAULT_INTEGRATION_BRANCH, MergeAllowed, MergeContext, MergeDenied, MergeTarget,
+    merge_decision, pr_base_branch,
 };
 pub use routing::{
     CoordinatorConfig, MAX_BODY_BYTES, Message, MessageKind, OutgoingMessage, Role, Router,

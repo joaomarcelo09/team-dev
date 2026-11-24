@@ -8,7 +8,7 @@
 //! A decision is fail-closed. The request is refused unless the owner is granted, the action
 //! is granted, the branch (when the action targets one) is a task branch below the configured
 //! prefix, and the action is not a force-push or a delete. Merges are refused unless the grant
-//! lists them and the request says the run's merge policy allows them.
+//! lists them and the run's [`MergeContext`] allows the merge target.
 //!
 //! Daily counters live in `<dir>/github_broker.json`. An in-process mutex and a cross-process
 //! `flock` of `<dir>/github_broker.lock` serialize check-and-count, so two brokers on one
@@ -35,6 +35,8 @@ use std::{
 use jgf_core::{AuditKind, AuditLog, GithubAction, GithubGrant, ModelError, ProjectId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::git_flow::{MergeContext, MergeDenied, merge_decision, pr_base_branch};
 
 /// Default prefix of the branches the broker may push.
 pub const DEFAULT_TASK_BRANCH_PREFIX: &str = "jgt/";
@@ -81,8 +83,10 @@ pub struct GithubRequest {
     pub delete: bool,
     /// Whether the targeted branch is the repository's default branch.
     pub target_is_default_branch: bool,
-    /// Whether the run's merge policy allows this merge. Defaults to `false`.
-    pub merge_policy_allows: bool,
+    /// Branch a pull request merges into. Required to merge.
+    pub merge_target: Option<String>,
+    /// The run's merge policy. Required to merge.
+    pub merge_context: Option<MergeContext>,
     /// Commit message to check and clean, when the action creates a commit.
     pub commit_message: Option<String>,
 }
@@ -98,8 +102,11 @@ pub struct Approved {
     pub repo: String,
     /// Branch the action may target, when it has one.
     pub branch: Option<String>,
-    /// Base the task branch was cut from, when the action pushes one.
+    /// Base the task branch was cut from, when the action pushes one, or the branch a pull
+    /// request opens against.
     pub base: Option<String>,
+    /// Branch the approved pull request merges into.
+    pub merge_target: Option<String>,
     /// Cleaned commit message, when the request carried one.
     pub commit_message: Option<String>,
 }
@@ -174,9 +181,17 @@ pub enum BrokerDenied {
         prefix: String,
     },
 
-    /// Merging needs the grant and an explicit merge policy.
-    #[error("merging needs an explicit merge policy")]
-    MergePolicyRequired,
+    /// Merging needs the branch it merges into.
+    #[error("merging needs a merge target")]
+    MissingMergeTarget,
+
+    /// Merging needs the run's merge policy context.
+    #[error("merging needs a merge context")]
+    MissingMergeContext,
+
+    /// The merge policy refused the target.
+    #[error(transparent)]
+    Merge(#[from] MergeDenied),
 
     /// The action reached its daily cap.
     #[error("daily cap of {limit} {unit} reached")]
@@ -373,6 +388,7 @@ impl Broker {
 
         let branch = self.policy_branch(req)?;
         let base = self.policy_base(req)?;
+        let merge_target = self.policy_merge_target(req)?;
         let commit_message = req
             .commit_message
             .as_deref()
@@ -387,6 +403,7 @@ impl Broker {
             repo: req.repo.clone(),
             branch,
             base,
+            merge_target,
             commit_message,
         })
     }
@@ -415,9 +432,6 @@ impl Broker {
                     .branch
                     .as_deref()
                     .ok_or(BrokerDenied::MissingBranch("merge_pr"))?;
-                if !req.merge_policy_allows {
-                    return Err(BrokerDenied::MergePolicyRequired);
-                }
                 Ok(Some(branch.to_string()))
             }
             GithubAction::OpenPr => {
@@ -449,6 +463,33 @@ impl Broker {
                     return Err(BrokerDenied::InvalidName { field: "base" });
                 }
                 Ok(Some(base.to_string()))
+            }
+            GithubAction::OpenPr => {
+                let context = req
+                    .merge_context
+                    .as_ref()
+                    .ok_or(BrokerDenied::MissingBase("open_pr"))?;
+                let base = pr_base_branch(context)?;
+                Ok(Some(base.to_string()))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Applies the merge policy and returns the approved merge target.
+    fn policy_merge_target(&self, req: &GithubRequest) -> Result<Option<String>, BrokerDenied> {
+        match req.action {
+            GithubAction::MergePr => {
+                let target = req
+                    .merge_target
+                    .as_deref()
+                    .ok_or(BrokerDenied::MissingMergeTarget)?;
+                let context = req
+                    .merge_context
+                    .as_ref()
+                    .ok_or(BrokerDenied::MissingMergeContext)?;
+                merge_decision(context, target)?;
+                Ok(Some(target.to_string()))
             }
             _ => Ok(None),
         }
@@ -572,7 +613,7 @@ fn validate_branch(branch: &str) -> Result<(), BrokerDenied> {
     }
 }
 
-fn branch_is_valid(branch: &str) -> bool {
+pub(crate) fn branch_is_valid(branch: &str) -> bool {
     !branch.is_empty()
         && branch.chars().count() <= MAX_BRANCH_LEN
         && !branch.starts_with(['-', '.', '/'])
@@ -884,7 +925,7 @@ mod tests {
         thread,
     };
 
-    use jgf_core::AuditEvent;
+    use jgf_core::{AuditEvent, ProjectStage};
 
     use super::*;
 
@@ -954,9 +995,27 @@ mod tests {
             force: false,
             delete: false,
             target_is_default_branch: false,
-            merge_policy_allows: false,
+            merge_target: None,
+            merge_context: None,
             commit_message: None,
         }
+    }
+
+    fn merge_context(stage: ProjectStage, user_approved: bool) -> MergeContext {
+        MergeContext {
+            stage,
+            integration_branch: Some("develop".to_string()),
+            default_branch: "main".to_string(),
+            user_approved,
+        }
+    }
+
+    fn merge_request(target: &str, stage: ProjectStage, user_approved: bool) -> GithubRequest {
+        let mut req = request(GithubAction::MergePr, "acme", "app");
+        req.branch = Some("jgt/JGT-97".to_string());
+        req.merge_target = Some(target.to_string());
+        req.merge_context = Some(merge_context(stage, user_approved));
+        req
     }
 
     fn valid_request(action: GithubAction) -> GithubRequest {
@@ -966,10 +1025,12 @@ mod tests {
                 req.branch = Some("jgt/JGT-97".to_string());
                 req.base = Some("main".to_string());
             }
-            GithubAction::OpenPr => req.branch = Some("jgt/JGT-97".to_string()),
-            GithubAction::MergePr => {
+            GithubAction::OpenPr => {
                 req.branch = Some("jgt/JGT-97".to_string());
-                req.merge_policy_allows = true;
+                req.merge_context = Some(merge_context(ProjectStage::Mvp, false));
+            }
+            GithubAction::MergePr => {
+                req = merge_request("develop", ProjectStage::Mvp, false);
             }
             _ => {}
         }
@@ -1040,12 +1101,17 @@ mod tests {
             Err(BrokerDenied::MissingBranch(_))
         ));
 
-        let mut wrong = push_request();
-        wrong.branch = Some("feature/work".to_string());
-        assert!(matches!(
-            check(&broker, &wrong),
-            Err(BrokerDenied::BranchNotTask { .. })
-        ));
+        for branch in ["feature/work", "develop", "stg", "main"] {
+            let mut wrong = push_request();
+            wrong.branch = Some(branch.to_string());
+            assert!(
+                matches!(
+                    check(&broker, &wrong),
+                    Err(BrokerDenied::BranchNotTask { .. })
+                ),
+                "push to {branch:?} must be refused"
+            );
+        }
     }
 
     #[test]
@@ -1170,18 +1236,95 @@ mod tests {
     }
 
     #[test]
-    fn merge_needs_an_explicit_policy() {
+    fn merge_needs_a_target_and_a_context() {
         let root = TempRoot::new();
         let broker = open(&root, permissive_grant());
         let mut req = request(GithubAction::MergePr, "acme", "app");
         req.branch = Some("jgt/JGT-97".to_string());
         assert!(matches!(
             check(&broker, &req),
-            Err(BrokerDenied::MergePolicyRequired)
+            Err(BrokerDenied::MissingMergeTarget)
         ));
 
-        req.merge_policy_allows = true;
+        req.merge_target = Some("develop".to_string());
+        assert!(matches!(
+            check(&broker, &req),
+            Err(BrokerDenied::MissingMergeContext)
+        ));
+
+        req.merge_context = Some(merge_context(ProjectStage::Mvp, false));
         assert!(check(&broker, &req).is_ok());
+    }
+
+    #[test]
+    fn merge_policy_flows_through_the_broker() {
+        let root = TempRoot::new();
+        let broker = open(&root, permissive_grant());
+
+        assert!(check(&broker, &merge_request("develop", ProjectStage::Mvp, false)).is_ok());
+        assert!(
+            check(
+                &broker,
+                &merge_request("develop", ProjectStage::Production, false)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            check(
+                &broker,
+                &merge_request("main", ProjectStage::Production, false)
+            ),
+            Err(BrokerDenied::Merge(MergeDenied::NeedsUserApproval))
+        ));
+        assert!(
+            check(
+                &broker,
+                &merge_request("main", ProjectStage::Production, true)
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            check(
+                &broker,
+                &merge_request("other", ProjectStage::Production, true)
+            ),
+            Err(BrokerDenied::Merge(MergeDenied::TargetNotAllowed))
+        ));
+        assert!(matches!(
+            check(
+                &broker,
+                &merge_request("refs/heads/main", ProjectStage::Mvp, true)
+            ),
+            Err(BrokerDenied::Merge(MergeDenied::InvalidTargetBranch { .. }))
+        ));
+    }
+
+    #[test]
+    fn allowed_and_denied_merges_are_audited() {
+        let root = TempRoot::new();
+        let broker = open(&root, permissive_grant());
+
+        assert!(check(&broker, &merge_request("develop", ProjectStage::Mvp, false)).is_ok());
+        assert!(
+            check(
+                &broker,
+                &merge_request("main", ProjectStage::Production, false)
+            )
+            .is_err()
+        );
+
+        let log = AuditLog::open(root.path(), "lab").expect("open audit log");
+        let events: Vec<AuditEvent> = log.read_all().expect("read audit log");
+        let merges: Vec<bool> = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                AuditKind::GithubAction {
+                    action, allowed, ..
+                } if action == "merge_pr" => Some(*allowed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(merges, [true, false]);
     }
 
     #[test]
@@ -1202,15 +1345,45 @@ mod tests {
         ));
 
         req.branch = Some("jgt/JGT-97".to_string());
+        req.merge_context = Some(merge_context(ProjectStage::Mvp, false));
         assert!(check(&broker, &req).is_ok());
+    }
+
+    #[test]
+    fn open_pr_needs_a_context_and_carries_its_base() {
+        let root = TempRoot::new();
+        let broker = open(&root, permissive_grant());
+        let mut req = request(GithubAction::OpenPr, "acme", "app");
+        req.branch = Some("jgt/JGT-97".to_string());
+
+        assert!(matches!(
+            check(&broker, &req),
+            Err(BrokerDenied::MissingBase("open_pr"))
+        ));
+
+        req.merge_context = Some(merge_context(ProjectStage::Mvp, false));
+        let approved = check(&broker, &req).expect("open pr with a context");
+        assert_eq!(approved.base.as_deref(), Some("develop"));
+        assert_eq!(approved.merge_target, None);
+    }
+
+    #[test]
+    fn a_merge_approval_carries_the_checked_target() {
+        let root = TempRoot::new();
+        let broker = open(&root, permissive_grant());
+
+        let approved = check(&broker, &merge_request("develop", ProjectStage::Mvp, false))
+            .expect("allowed merge");
+        assert_eq!(approved.merge_target.as_deref(), Some("develop"));
+        assert_eq!(approved.base, None);
     }
 
     #[test]
     fn merge_pr_needs_a_branch() {
         let root = TempRoot::new();
         let broker = open(&root, permissive_grant());
-        let mut req = request(GithubAction::MergePr, "acme", "app");
-        req.merge_policy_allows = true;
+        let mut req = merge_request("develop", ProjectStage::Mvp, false);
+        req.branch = None;
 
         assert!(matches!(
             check(&broker, &req),
