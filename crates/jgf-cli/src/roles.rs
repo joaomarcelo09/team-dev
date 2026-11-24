@@ -1,12 +1,15 @@
 //! Launches factory roles inside a scoped lab-world exec.
 
 use std::{
-    fs,
+    collections::BTreeMap,
+    fmt, fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use jg_sandbox::{ExecScope, ScopeAccess};
+use jgf_core::ProjectId;
+use jgf_hub::{LaunchToken, Role as HubRole, WorkerKind};
 
 use crate::{e2e::KillSwitch, sandbox::ClaudeSandbox};
 
@@ -97,6 +100,49 @@ pub struct RoleExecution {
     pub timeout: Duration,
     /// Only this project worktree is mounted into the scoped exec.
     pub scope: ExecScope,
+    /// Per-launch hub socket credentials, redacted from debug output.
+    pub(crate) message_surface: Option<MessageSurface>,
+}
+
+/// Per-launch credentials passed only through the child's process environment.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageSurface {
+    socket_path: PathBuf,
+    token: LaunchToken,
+}
+
+impl MessageSurface {
+    /// Builds a message surface from a host-issued token and socket path.
+    pub fn new(socket_path: impl Into<PathBuf>, token: LaunchToken) -> Self {
+        Self {
+            socket_path: socket_path.into(),
+            token,
+        }
+    }
+
+    pub(crate) fn token(&self) -> &LaunchToken {
+        &self.token
+    }
+
+    fn environment(&self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (
+                "JG_HUB_SOCKET".to_string(),
+                self.socket_path.to_string_lossy().into_owned(),
+            ),
+            ("JG_HUB_TOKEN".to_string(), self.token.expose().to_string()),
+        ])
+    }
+}
+
+impl fmt::Debug for MessageSurface {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MessageSurface")
+            .field("socket_path", &self.socket_path)
+            .field("token", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Sandbox operations needed by the role launcher.
@@ -107,6 +153,14 @@ pub trait RoleLaunchExecutor {
     fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String>;
     /// Starts the role in the requested scoped exec.
     fn run_role(&self, execution: RoleExecution, kill: Option<&dyn KillSwitch>) -> ChildRun;
+
+    /// Registers a host-selected message identity for the duration of a launch.
+    fn register_message_role(&self, _role: HubRole) -> Result<Option<MessageSurface>, String> {
+        Ok(None)
+    }
+
+    /// Revokes the identity returned by [`RoleLaunchExecutor::register_message_role`].
+    fn revoke_message_role(&self, _surface: &MessageSurface) {}
 }
 
 /// Loads role instructions and starts the role through a sandbox executor.
@@ -137,7 +191,21 @@ impl<'a> RoleLauncher<'a> {
         ) {
             return failed_launch(error);
         }
-        self.executor.run_role(execution, kill)
+        let mut execution = execution;
+        let message_surface = match execution.message_role() {
+            Ok(Some(role)) => match self.executor.register_message_role(role) {
+                Ok(surface) => surface,
+                Err(error) => return failed_launch(error),
+            },
+            Ok(None) => None,
+            Err(error) => return failed_launch(error),
+        };
+        execution.message_surface = message_surface.clone();
+        let result = self.executor.run_role(execution, kill);
+        if let Some(surface) = message_surface.as_ref() {
+            self.executor.revoke_message_role(surface);
+        }
+        result
     }
 
     fn prepare(&self, request: &RoleLaunch) -> Result<RoleExecution, String> {
@@ -215,7 +283,38 @@ impl<'a> RoleLauncher<'a> {
             argv,
             timeout: request.timeout,
             scope,
+            message_surface: None,
         })
+    }
+}
+
+impl RoleExecution {
+    fn message_role(&self) -> Result<Option<HubRole>, String> {
+        let project = ProjectId::parse(&self.project_id).map_err(|error| error.to_string())?;
+        match self.role {
+            Role::LabCoordinator => Ok(Some(HubRole::LabCoordinator)),
+            Role::CoCoordinator => Ok(Some(HubRole::CoCoordinator(project))),
+            Role::Coder | Role::Reviewer | Role::Tester | Role::GitCoder => {
+                let kind = match self.role {
+                    Role::Coder => WorkerKind::Coder,
+                    Role::Reviewer => WorkerKind::Reviewer,
+                    Role::Tester => WorkerKind::Tester,
+                    Role::GitCoder => WorkerKind::GitCoder,
+                    _ => unreachable!("worker role matched above"),
+                };
+                HubRole::worker(project, self.worker_id.clone(), kind)
+                    .map(Some)
+                    .map_err(|error| error.to_string())
+            }
+            Role::WakeUp => Ok(None),
+        }
+    }
+
+    pub(crate) fn message_environment(&self) -> BTreeMap<String, String> {
+        self.message_surface
+            .as_ref()
+            .map(MessageSurface::environment)
+            .unwrap_or_default()
     }
 }
 
@@ -336,11 +435,21 @@ impl RoleLaunchExecutor for ClaudeSandbox {
     fn run_role(&self, execution: RoleExecution, kill: Option<&dyn KillSwitch>) -> ChildRun {
         self.execute_role(execution, kill)
     }
+
+    fn register_message_role(&self, role: HubRole) -> Result<Option<MessageSurface>, String> {
+        self.register_hub_role(role).map(Some)
+    }
+
+    fn revoke_message_role(&self, surface: &MessageSurface) {
+        self.revoke_hub_role(surface);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+
+    use jgf_hub::{HubClient, HubClientError, HubShim, Router};
 
     use super::*;
 
@@ -371,6 +480,52 @@ mod tests {
                 .expect("launch records")
                 .push(execution);
             ChildRun::default()
+        }
+    }
+
+    struct HubRecordingExecutor {
+        lab_dir: PathBuf,
+        hub: HubShim,
+        launches: Mutex<Vec<RoleExecution>>,
+        issued_token: Mutex<Option<LaunchToken>>,
+    }
+
+    impl RoleLaunchExecutor for HubRecordingExecutor {
+        fn lab_dir(&self) -> Result<PathBuf, String> {
+            Ok(self.lab_dir.clone())
+        }
+
+        fn record_role_start(
+            &self,
+            _project: &str,
+            _worker: &str,
+            _role: Role,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn run_role(&self, execution: RoleExecution, _kill: Option<&dyn KillSwitch>) -> ChildRun {
+            *self.issued_token.lock().expect("issued token") = execution
+                .message_surface
+                .as_ref()
+                .map(|surface| surface.token().clone());
+            self.launches.lock().expect("launches").push(execution);
+            ChildRun::default()
+        }
+
+        fn register_message_role(&self, role: HubRole) -> Result<Option<MessageSurface>, String> {
+            let token = self
+                .hub
+                .register_role(role)
+                .map_err(|error| error.to_string())?;
+            Ok(Some(MessageSurface::new(
+                self.hub.socket_path().to_path_buf(),
+                token,
+            )))
+        }
+
+        fn revoke_message_role(&self, surface: &MessageSurface) {
+            self.hub.revoke(surface.token());
         }
     }
 
@@ -481,6 +636,52 @@ mod tests {
             );
         }
         assert_eq!(executor.starts.lock().expect("starts").len(), roles.len());
+    }
+
+    #[test]
+    fn launcher_sets_private_message_environment_and_revokes_token_after_exit() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab_dir = temp.path().join("lab");
+        let worktree = lab_dir.join("projects/project-a/worktrees/task-1");
+        fs::create_dir_all(&worktree).expect("worktree");
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        let hub = HubShim::start(temp.path().join("hub.sock"), router, |_| {}).expect("hub");
+        let executor = HubRecordingExecutor {
+            lab_dir: lab_dir.clone(),
+            hub,
+            launches: Mutex::new(Vec::new()),
+            issued_token: Mutex::new(None),
+        };
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let launcher = RoleLauncher::new(skills_dir, &executor);
+
+        let result = launcher.launch(&request(Role::Coder), None);
+        assert!(result.spawn_error.is_none());
+        let execution = executor.launches.lock().expect("launches").pop().unwrap();
+        let environment = execution.message_environment();
+        assert_eq!(
+            environment.get("JG_HUB_SOCKET").map(String::as_str),
+            Some(executor.hub.socket_path().to_str().expect("socket path"))
+        );
+        let token = executor
+            .issued_token
+            .lock()
+            .expect("issued token")
+            .clone()
+            .expect("registered token");
+        assert_eq!(
+            environment.get("JG_HUB_TOKEN").map(String::as_str),
+            Some(token.expose())
+        );
+        assert!(!format!("{execution:?}").contains(token.expose()));
+
+        let client = HubClient::new(executor.hub.socket_path(), token);
+        assert!(matches!(
+            client.inbox(),
+            Err(HubClientError::Shim(jgf_hub::ShimError::UnknownToken))
+        ));
     }
 
     #[test]

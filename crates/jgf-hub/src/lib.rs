@@ -7,6 +7,7 @@ pub mod ci_watch;
 pub mod git_flow;
 pub mod routing;
 pub mod scheduler;
+pub mod shim;
 pub mod usage;
 pub mod watchdog;
 
@@ -34,6 +35,7 @@ pub use scheduler::{
     CoderGrant, CoderSlot, Limits, MAX_CODERS, MAX_TEAMS, Mode, ReviewTicket, Scheduler,
     SchedulerError, SlotId, Switch, WaitReason,
 };
+pub use shim::{HubClient, HubClientError, HubShim, LaunchToken, ShimAuditEvent, ShimError};
 pub use usage::{
     HARD_PERCENT, LabState, Level, Parked, Policy, Provider, RESUME_DELAY_SECS, Reading,
     ReadingState, ResumeQueue, SOFT_PERCENT, STALE_SECS, Throttle, UsageError, UsageMeter, Window,

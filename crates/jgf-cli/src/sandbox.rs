@@ -17,12 +17,13 @@ use jg_sandbox::{
     Backend, EgressEvent, EgressPolicy, EgressProxy, EgressSpec, ExecOutput, ExecRequest,
     ExecScope, NamespaceBackend, SandboxHandle, SandboxSpec, default_ro_binds,
 };
+use jgf_hub::{HubShim, Role as HubRole, Router, ShimAuditEvent};
 
 use crate::{
     child::{self, RuntimeLayout},
     e2e::{KillSwitch, RunOutcome},
     lab_world::{EndOfLifePolicy, LabWorld, LabWorldSpec, RunEnd, WorldStatus},
-    roles::RoleExecution,
+    roles::{MessageSurface, RoleExecution},
     scratch::{ScratchHome, real_home},
 };
 
@@ -36,7 +37,7 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const SCRATCH_EXCLUDE: &str = "/.jgf-claude-home/";
 
 pub(crate) struct ClaudeSandbox {
-    world: LabWorld,
+    world: Arc<LabWorld>,
     binary: PathBuf,
     backend: NamespaceBackend,
     live: Mutex<Option<LiveSandbox>>,
@@ -45,6 +46,7 @@ pub(crate) struct ClaudeSandbox {
 struct LiveSandbox {
     handle: SandboxHandle,
     proxy: Option<EgressProxy>,
+    hub: Option<HubShim>,
     lab_dir: PathBuf,
     work_tree: PathBuf,
     scratch_root: PathBuf,
@@ -59,6 +61,7 @@ struct ClaudeExec<'a> {
     scratch: &'a ScratchHome,
     timeout: Duration,
     scope: Option<ExecScope>,
+    message_environment: &'a BTreeMap<String, String>,
     kill: Option<&'a dyn KillSwitch>,
 }
 
@@ -103,7 +106,7 @@ impl ClaudeSandbox {
         policy: EndOfLifePolicy,
     ) -> Self {
         Self {
-            world: LabWorld::new(state_dir, audit_dir, lab_id, policy),
+            world: Arc::new(LabWorld::new(state_dir, audit_dir, lab_id, policy)),
             binary: binary.into(),
             backend: NamespaceBackend::new(),
             live: Mutex::new(None),
@@ -217,6 +220,14 @@ impl ClaudeSandbox {
                 &world_spec.scratch_home,
                 &host_home,
             )?;
+            let hub_socket_path = state_dir.join("hub.sock");
+            let router = Router::open(state_dir.join("mail"))
+                .map_err(|error| format!("could not open lab message router: {error}"))?;
+            let audit_world = Arc::clone(&self.world);
+            let hub = HubShim::start(&hub_socket_path, router, move |event: ShimAuditEvent| {
+                let _ = audit_world.record_hub_event(&event);
+            })
+            .map_err(|error| format!("could not start the lab hub shim: {error}"))?;
             let spec = build_sandbox_spec(
                 &state_dir,
                 &world_spec.lab_dir,
@@ -234,6 +245,7 @@ impl ClaudeSandbox {
             Ok(LiveSandbox {
                 handle,
                 proxy: Some(proxy),
+                hub: Some(hub),
                 lab_dir: world_spec.lab_dir.clone(),
                 work_tree: world_spec.work_tree.clone(),
                 scratch_root: world_spec.scratch_home.clone(),
@@ -244,8 +256,16 @@ impl ClaudeSandbox {
         match created {
             Ok(world) => Ok(world),
             Err(error) => {
+                let mail_cleanup = fs::remove_dir_all(state_dir.join("mail"));
                 let state_cleanup = fs::remove_dir(&state_dir);
                 let scratch_cleanup = fs::remove_dir(&world_spec.scratch_home);
+                if let Err(cleanup) = mail_cleanup
+                    && cleanup.kind() != std::io::ErrorKind::NotFound
+                {
+                    return Err(format!(
+                        "{error}; could not remove lab message store: {cleanup}"
+                    ));
+                }
                 if let Err(cleanup) = state_cleanup
                     && cleanup.kind() != std::io::ErrorKind::NotFound
                 {
@@ -281,6 +301,7 @@ impl ClaudeSandbox {
             scratch,
             timeout,
             scope: None,
+            message_environment: &BTreeMap::new(),
             kill,
         })
     }
@@ -401,7 +422,7 @@ impl ClaudeSandbox {
                 ..ChildRun::default()
             };
         }
-        let request = match build_exec_request_with_scope(
+        let mut request = match build_exec_request_with_scope(
             execution.argv,
             execution.timeout,
             execution.scratch,
@@ -418,6 +439,12 @@ impl ClaudeSandbox {
                 };
             }
         };
+        request.env.extend(
+            execution
+                .message_environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
         let handle = live.handle.clone();
         let backend = self.backend;
         drop(live_guard);
@@ -501,6 +528,29 @@ impl ClaudeSandbox {
         self.world.record_role_start(project, worker, role)
     }
 
+    pub(crate) fn register_hub_role(&self, role: HubRole) -> Result<MessageSurface, String> {
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
+        let hub = live
+            .as_ref()
+            .and_then(|active| active.hub.as_ref())
+            .ok_or_else(|| "lab hub shim is unavailable".to_string())?;
+        let token = hub
+            .register_role(role)
+            .map_err(|error| format!("could not register lab message identity: {error}"))?;
+        Ok(MessageSurface::new(hub.socket_path().to_path_buf(), token))
+    }
+
+    pub(crate) fn revoke_hub_role(&self, surface: &MessageSurface) {
+        if let Ok(live) = self.live.lock()
+            && let Some(hub) = live.as_ref().and_then(|active| active.hub.as_ref())
+        {
+            hub.revoke(surface.token());
+        }
+    }
+
     pub(crate) fn execute_role(
         &self,
         execution: RoleExecution,
@@ -524,6 +574,7 @@ impl ClaudeSandbox {
                 };
             }
         };
+        let message_environment = execution.message_environment();
         self.run_claude_with_scope(ClaudeExec {
             binary: &self.binary,
             argv: &execution.argv,
@@ -531,6 +582,7 @@ impl ClaudeSandbox {
             scratch: &scratch,
             timeout: execution.timeout,
             scope: Some(execution.scope),
+            message_environment: &message_environment,
             kill,
         })
     }
@@ -550,19 +602,32 @@ impl ClaudeSandbox {
                 .backend
                 .destroy(&active.handle)
                 .map_err(|error| format!("could not destroy jg-sandbox world: {error}"));
-            cleanup_after_destroy(result, &mut active.proxy, &state_dir, &active.scratch_root)
+            cleanup_after_destroy(
+                result,
+                &mut active.hub,
+                &mut active.proxy,
+                &state_dir,
+                &active.scratch_root,
+            )
         })
     }
 }
 
 fn cleanup_after_destroy(
     result: Result<(), String>,
+    hub: &mut Option<HubShim>,
     proxy: &mut Option<EgressProxy>,
     state_dir: &Path,
     scratch_root: &Path,
 ) -> Result<(), String> {
+    drop(hub.take());
     drop(proxy.take());
 
+    let mail_result = match fs::remove_dir_all(state_dir.join("mail")) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove lab message store: {error}")),
+    };
     let state_result = match fs::remove_dir(state_dir) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -591,7 +656,10 @@ fn cleanup_after_destroy(
         )),
     };
 
-    result.and(state_result).and(scratch_result)
+    result
+        .and(mail_result)
+        .and(state_result)
+        .and(scratch_result)
 }
 
 struct RunningWorld<'a>(&'a LabWorld);
@@ -642,6 +710,7 @@ fn build_sandbox_spec(
     ro_binds.dedup();
     spec.ro_binds = ro_binds;
     spec.lab_ro_binds.push(read_only_git.to_path_buf());
+    spec.allowed_sockets.push(state_dir.join("hub.sock"));
     spec.egress = Some(EgressSpec::new(proxy.socket_path()));
     spec.validate()
         .map_err(|error| format!("invalid Claude jg-sandbox spec: {error}"))?;
@@ -778,9 +847,12 @@ mod tests {
         fs::create_dir_all(&runtime_dir).expect("runtime directory");
         fs::write(runtime_dir.join("claude"), "placeholder").expect("fake executable");
         let state_dir = temp.path().join("state");
+        fs::create_dir_all(&state_dir).expect("state directory");
         let proxy_socket = temp.path().join("egress.sock");
         let policy = EgressPolicy::with_ports(CLAUDE_EGRESS_HOSTS, [443]).expect("policy");
         let proxy = EgressProxy::start(&proxy_socket, policy, Arc::new(|_| {})).expect("proxy");
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        let hub = HubShim::start(state_dir.join("hub.sock"), router, |_| {}).expect("hub");
         let runtime = RuntimeLayout {
             executable: runtime_dir.join("claude"),
             directories: vec![runtime_dir.clone()],
@@ -803,6 +875,7 @@ mod tests {
         assert_eq!(spec.egress.as_ref().map(|egress| egress.port), Some(3128));
         assert!(spec.ro_binds.contains(&credentials));
         assert!(spec.ro_binds.contains(&runtime_dir));
+        assert_eq!(spec.allowed_sockets, vec![hub.socket_path().to_path_buf()]);
         assert_eq!(
             spec.egress.as_ref().expect("egress").proxy_socket,
             proxy_socket
@@ -951,9 +1024,11 @@ mod tests {
         let policy = EgressPolicy::with_ports(CLAUDE_EGRESS_HOSTS, [443]).expect("policy");
         let mut proxy =
             Some(EgressProxy::start(&socket_path, policy, Arc::new(|_| {})).expect("proxy"));
+        let mut hub = None;
 
         let result = cleanup_after_destroy(
             Err("backend destroy failed".to_string()),
+            &mut hub,
             &mut proxy,
             &state_dir,
             &scratch_root,
