@@ -3,6 +3,7 @@
 pub mod board;
 pub mod broker;
 pub mod broker_exec;
+pub mod broker_shim;
 pub mod ci_watch;
 pub mod git_flow;
 pub mod routing;
@@ -19,6 +20,10 @@ pub use broker::{
 pub use broker_exec::{
     BackendError, BackendOp, BackendOutput, BrokerError, GITHUB_TOKEN_KEY, GhCliBackend,
     GithubBackend, testing::FakeBackend,
+};
+pub use broker_shim::{
+    BrokerAction, BrokerClient, BrokerClientError, BrokerShim, BrokerShimAuditEvent,
+    BrokerShimError,
 };
 pub use ci_watch::{
     CiError, CiState, CiWatch, Decision, MAX_FIX_CYCLES, parse_ci_runs, parse_ci_runs_with_presence,

@@ -41,6 +41,14 @@ impl LaunchToken {
     pub fn expose(&self) -> &str {
         &self.0
     }
+
+    pub(crate) fn from_raw(token: String) -> Self {
+        Self(token)
+    }
+
+    pub(crate) fn generate() -> io::Result<Self> {
+        random_token().map(Self)
+    }
 }
 
 impl std::fmt::Debug for LaunchToken {
@@ -228,12 +236,14 @@ impl HubShim {
             message: "token registry is unavailable".to_string(),
         })?;
         loop {
-            let token = random_token().map_err(|error| ShimError::Routing {
+            let token = LaunchToken::generate().map_err(|error| ShimError::Routing {
                 message: format!("could not generate launch token: {error}"),
             })?;
-            if let std::collections::hash_map::Entry::Vacant(entry) = tokens.entry(token.clone()) {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                tokens.entry(token.expose().to_string())
+            {
                 entry.insert(role);
-                return Ok(LaunchToken(token));
+                return Ok(token);
             }
         }
     }

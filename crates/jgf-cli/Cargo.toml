@@ -15,5 +15,6 @@ jgf-hub.workspace = true
 jg-sandbox.workspace = true
 clap.workspace = true
 libc.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tempfile.workspace = true

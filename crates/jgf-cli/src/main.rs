@@ -8,6 +8,7 @@ use std::{
 
 use clap::{Args, Parser, Subcommand};
 use jgf_cli::e2e::{self, E2eConfig, RunOutcome};
+use jgf_hub::BrokerAction;
 
 /// Dark Factory: autonomous lab for building software from specs.
 #[derive(Parser)]
@@ -21,6 +22,15 @@ struct Cli {
 enum Command {
     /// Run the end-to-end toy scenario.
     E2e(E2eArgs),
+    /// Submit one JSON GitHub action to the host broker from an in-lab role.
+    Broker(BrokerArgs),
+}
+
+#[derive(Args)]
+struct BrokerArgs {
+    /// JSON action object (owner and project are resolved by the host).
+    #[arg(long, value_name = "JSON")]
+    request: String,
 }
 
 #[derive(Args)]
@@ -77,12 +87,46 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::E2e(args)) => run_e2e(args),
+        Some(Command::Broker(args)) => run_broker(args),
         None => {
             println!(
                 "jg-factory: state dir {}",
                 jgf_core::paths::data_dir().display()
             );
             ExitCode::SUCCESS
+        }
+    }
+}
+
+fn run_broker(args: BrokerArgs) -> ExitCode {
+    let action = match serde_json::from_str::<BrokerAction>(&args.request) {
+        Ok(action) => action,
+        Err(_) => {
+            eprintln!("jg-factory broker: invalid action JSON");
+            return ExitCode::FAILURE;
+        }
+    };
+    let client = match jgf_cli::broker::client_from_env() {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("jg-factory broker: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match client.request(action) {
+        Ok(output) => {
+            println!("status: completed ({:?})", output.action);
+            if !output.stdout.is_empty() {
+                print!("{}", output.stdout);
+            }
+            if !output.stderr.is_empty() {
+                eprint!("{}", output.stderr);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("jg-factory broker: {error}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -190,5 +234,23 @@ mod tests {
             panic!("expected e2e command");
         };
         assert_eq!(args.max_pushes_per_day, Some(0));
+    }
+
+    #[test]
+    fn broker_action_json_parses_without_owner_or_project_fields() {
+        let cli = Cli::try_parse_from([
+            "jg-factory",
+            "broker",
+            "--request",
+            r#"{"action":"create_repo","repo":"sample"}"#,
+        ])
+        .expect("parse broker command");
+        let Some(Command::Broker(args)) = cli.command else {
+            panic!("expected broker command");
+        };
+        let action: BrokerAction =
+            serde_json::from_str(&args.request).expect("parse broker action");
+        assert_eq!(action.action, jgf_core::GithubAction::CreateRepo);
+        assert_eq!(action.repo, "sample");
     }
 }

@@ -39,7 +39,7 @@ use crate::reviewer::{
     ClaudeReviewerRunner, FakeReviewerRunner, ReviewDecision, ReviewRequest, ReviewRun,
     ReviewerRunner,
 };
-use crate::sandbox::ClaudeSandbox;
+use crate::sandbox::{BrokerRuntimeConfig, ClaudeSandbox};
 
 /// Default branch the toy repository starts from.
 pub const DEFAULT_BRANCH: &str = "main";
@@ -586,13 +586,25 @@ pub fn run(config: &E2eConfig) -> RunOutcome {
             ClaudeSandbox::scratch_dir(&run_lab_dir(&config)).display(),
         );
         let store = FileSecretStore::new(&config.state_dir);
-        let sandbox = std::sync::Arc::new(ClaudeSandbox::new_with_audit(
-            config.state_dir.join(E2E_SANDBOX_DIR).join(&config.lab),
-            "claude",
-            config.state_dir.clone(),
-            config.lab.clone(),
-            E2E_SANDBOX_POLICY,
-        ));
+        let sandbox = std::sync::Arc::new(
+            ClaudeSandbox::new_with_audit(
+                config.state_dir.join(E2E_SANDBOX_DIR).join(&config.lab),
+                "claude",
+                config.state_dir.clone(),
+                config.lab.clone(),
+                E2E_SANDBOX_POLICY,
+            )
+            .with_broker(BrokerRuntimeConfig {
+                owner: config.owner.clone(),
+                broker_dir: broker_dir(&config),
+                audit_dir: config.state_dir.clone(),
+                lab: config.lab.clone(),
+                grant: github_grant(&config),
+                task_branch_prefix: config.task_branch_prefix.clone(),
+                backend_workdir: work_dir(&config),
+                secret_dir: config.state_dir.clone(),
+            }),
+        );
         run_prepared_sandboxed(
             &config,
             &GhCliBackend::new(work_dir(&config)),
@@ -1220,6 +1232,22 @@ fn broker_dir(config: &E2eConfig) -> PathBuf {
     config.state_dir.join(name)
 }
 
+fn github_grant(config: &E2eConfig) -> GithubGrant {
+    GithubGrant {
+        owners: vec![config.owner.clone()],
+        actions: vec![
+            GithubAction::CreateRepo,
+            GithubAction::PushSetupBranch,
+            GithubAction::PushTaskBranch,
+            GithubAction::OpenPr,
+            GithubAction::ReadCiStatus,
+            GithubAction::MergePr,
+        ],
+        max_prs_per_day: config.max_prs_per_day,
+        max_pushes_per_day: config.max_pushes_per_day,
+    }
+}
+
 fn board_dir(config: &E2eConfig) -> PathBuf {
     config.state_dir.join(BOARD_DIR)
 }
@@ -1287,19 +1315,7 @@ where
     let started = Instant::now();
     let audit = AuditLog::open(&config.state_dir, &config.lab)?;
     let broker_audit = AuditLog::open(&config.state_dir, &config.lab)?;
-    let grant = GithubGrant {
-        owners: vec![config.owner.clone()],
-        actions: vec![
-            GithubAction::CreateRepo,
-            GithubAction::PushSetupBranch,
-            GithubAction::PushTaskBranch,
-            GithubAction::OpenPr,
-            GithubAction::ReadCiStatus,
-            GithubAction::MergePr,
-        ],
-        max_prs_per_day: config.max_prs_per_day,
-        max_pushes_per_day: config.max_pushes_per_day,
-    };
+    let grant = github_grant(config);
     let broker = Broker::open(broker_dir(config), &config.lab, grant, broker_audit)?
         .with_task_branch_prefix(&config.task_branch_prefix);
 

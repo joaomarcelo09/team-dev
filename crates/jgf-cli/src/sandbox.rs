@@ -17,13 +17,17 @@ use jg_sandbox::{
     Backend, EgressEvent, EgressPolicy, EgressProxy, EgressSpec, ExecOutput, ExecRequest,
     ExecScope, NamespaceBackend, SandboxHandle, SandboxSpec, default_ro_binds,
 };
-use jgf_hub::{HubShim, Role as HubRole, Router, ShimAuditEvent};
+use jgf_core::{AuditKind, AuditLog, GithubGrant, ProjectId};
+use jgf_hub::{
+    Broker, BrokerShim, BrokerShimAuditEvent, GhCliBackend, HubShim, Role as HubRole, Router,
+    ShimAuditEvent,
+};
 
 use crate::{
     child::{self, RuntimeLayout},
     e2e::{KillSwitch, RunOutcome},
     lab_world::{EndOfLifePolicy, LabWorld, LabWorldSpec, RunEnd, WorldStatus},
-    roles::{MessageSurface, RoleExecution},
+    roles::{BrokerSurface, MessageSurface, RoleExecution},
     scratch::{ScratchHome, real_home},
 };
 
@@ -41,17 +45,32 @@ pub(crate) struct ClaudeSandbox {
     binary: PathBuf,
     backend: NamespaceBackend,
     live: Mutex<Option<LiveSandbox>>,
+    broker_config: Option<BrokerRuntimeConfig>,
+    project_root: PathBuf,
 }
 
 struct LiveSandbox {
     handle: SandboxHandle,
     proxy: Option<EgressProxy>,
     hub: Option<HubShim>,
+    broker: Option<BrokerShim<GhCliBackend, jgf_core::FileSecretStore>>,
     lab_dir: PathBuf,
     work_tree: PathBuf,
     scratch_root: PathBuf,
     credentials_file: PathBuf,
     runtime: RuntimeLayout,
+}
+
+#[derive(Clone)]
+pub(crate) struct BrokerRuntimeConfig {
+    pub(crate) owner: String,
+    pub(crate) broker_dir: PathBuf,
+    pub(crate) audit_dir: PathBuf,
+    pub(crate) lab: String,
+    pub(crate) grant: GithubGrant,
+    pub(crate) task_branch_prefix: String,
+    pub(crate) backend_workdir: PathBuf,
+    pub(crate) secret_dir: PathBuf,
 }
 
 struct ClaudeExec<'a> {
@@ -105,12 +124,25 @@ impl ClaudeSandbox {
         lab_id: impl Into<String>,
         policy: EndOfLifePolicy,
     ) -> Self {
+        let state_dir = state_dir.into();
         Self {
-            world: Arc::new(LabWorld::new(state_dir, audit_dir, lab_id, policy)),
+            world: Arc::new(LabWorld::new(state_dir.clone(), audit_dir, lab_id, policy)),
             binary: binary.into(),
             backend: NamespaceBackend::new(),
             live: Mutex::new(None),
+            broker_config: None,
+            project_root: state_dir,
         }
+    }
+
+    pub(crate) fn with_broker(mut self, config: BrokerRuntimeConfig) -> Self {
+        self.project_root = config.secret_dir.clone();
+        self.broker_config = Some(config);
+        self
+    }
+
+    pub(crate) fn role_project_root(&self) -> &Path {
+        &self.project_root
     }
 
     pub(crate) fn scratch_dir(lab_dir: &Path) -> PathBuf {
@@ -228,6 +260,7 @@ impl ClaudeSandbox {
                 let _ = audit_world.record_hub_event(&event);
             })
             .map_err(|error| format!("could not start the lab hub shim: {error}"))?;
+            let broker = self.start_broker_shim(&state_dir)?;
             let spec = build_sandbox_spec(
                 &state_dir,
                 &world_spec.lab_dir,
@@ -236,6 +269,7 @@ impl ClaudeSandbox {
                 &credentials_file,
                 &proxy,
                 &runtime,
+                broker.is_some(),
             )?;
             let handle = self
                 .backend
@@ -246,6 +280,7 @@ impl ClaudeSandbox {
                 handle,
                 proxy: Some(proxy),
                 hub: Some(hub),
+                broker,
                 lab_dir: world_spec.lab_dir.clone(),
                 work_tree: world_spec.work_tree.clone(),
                 scratch_root: world_spec.scratch_home.clone(),
@@ -283,6 +318,41 @@ impl ClaudeSandbox {
                 Err(error)
             }
         }
+    }
+
+    fn start_broker_shim(
+        &self,
+        state_dir: &Path,
+    ) -> Result<Option<BrokerShim<GhCliBackend, jgf_core::FileSecretStore>>, String> {
+        let Some(config) = self.broker_config.as_ref() else {
+            return Ok(None);
+        };
+        let audit = AuditLog::open(&config.audit_dir, &config.lab)
+            .map_err(|error| format!("could not open GitHub broker audit log: {error}"))?;
+        let broker = Broker::open(&config.broker_dir, &config.lab, config.grant.clone(), audit)
+            .map_err(|error| format!("could not open GitHub broker: {error}"))?
+            .with_task_branch_prefix(&config.task_branch_prefix);
+        let audit_dir = config.audit_dir.clone();
+        let lab = config.lab.clone();
+        let shim = BrokerShim::start(
+            state_dir.join("broker.sock"),
+            broker,
+            GhCliBackend::new(&config.backend_workdir),
+            jgf_core::FileSecretStore::new(&config.secret_dir),
+            move |event: BrokerShimAuditEvent| {
+                if let Ok(audit) = AuditLog::open(&audit_dir, &lab) {
+                    let _ = audit.append(
+                        None,
+                        None,
+                        AuditKind::Note {
+                            text: event.audit_summary(),
+                        },
+                    );
+                }
+            },
+        )
+        .map_err(|error| format!("could not start the GitHub broker shim: {error}"))?;
+        Ok(Some(shim))
     }
 
     pub(crate) fn run_claude(
@@ -551,6 +621,42 @@ impl ClaudeSandbox {
         }
     }
 
+    pub(crate) fn register_github_broker_role(
+        &self,
+        project: &str,
+        worker: &str,
+    ) -> Result<BrokerSurface, String> {
+        let owner = self
+            .broker_config
+            .as_ref()
+            .map(|config| config.owner.as_str())
+            .ok_or_else(|| "GitHub broker shim is unavailable".to_string())?;
+        let project = ProjectId::parse(project).map_err(|error| error.to_string())?;
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
+        let broker = live
+            .as_ref()
+            .and_then(|active| active.broker.as_ref())
+            .ok_or_else(|| "GitHub broker shim is unavailable".to_string())?;
+        let token = broker
+            .register_role(owner, project, worker)
+            .map_err(|error| format!("could not register GitHub broker identity: {error}"))?;
+        Ok(BrokerSurface::new(
+            broker.socket_path().to_path_buf(),
+            token,
+        ))
+    }
+
+    pub(crate) fn revoke_github_broker_role(&self, surface: &BrokerSurface) {
+        if let Ok(live) = self.live.lock()
+            && let Some(broker) = live.as_ref().and_then(|active| active.broker.as_ref())
+        {
+            broker.revoke(surface.token());
+        }
+    }
+
     pub(crate) fn execute_role(
         &self,
         execution: RoleExecution,
@@ -574,7 +680,14 @@ impl ClaudeSandbox {
                 };
             }
         };
-        let message_environment = execution.message_environment();
+        let mut message_environment: BTreeMap<String, String> = execution
+            .project_environment
+            .values()
+            .iter()
+            .map(|(key, secret)| (key.clone(), secret.expose().to_string()))
+            .collect();
+        message_environment.extend(execution.message_environment());
+        message_environment.extend(execution.broker_environment());
         self.run_claude_with_scope(ClaudeExec {
             binary: &self.binary,
             argv: &execution.argv,
@@ -605,6 +718,7 @@ impl ClaudeSandbox {
             cleanup_after_destroy(
                 result,
                 &mut active.hub,
+                &mut active.broker,
                 &mut active.proxy,
                 &state_dir,
                 &active.scratch_root,
@@ -616,11 +730,13 @@ impl ClaudeSandbox {
 fn cleanup_after_destroy(
     result: Result<(), String>,
     hub: &mut Option<HubShim>,
+    broker: &mut Option<BrokerShim<GhCliBackend, jgf_core::FileSecretStore>>,
     proxy: &mut Option<EgressProxy>,
     state_dir: &Path,
     scratch_root: &Path,
 ) -> Result<(), String> {
     drop(hub.take());
+    drop(broker.take());
     drop(proxy.take());
 
     let mail_result = match fs::remove_dir_all(state_dir.join("mail")) {
@@ -686,6 +802,7 @@ impl fmt::Debug for ClaudeSandbox {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_sandbox_spec(
     state_dir: &Path,
     lab_dir: &Path,
@@ -694,6 +811,7 @@ fn build_sandbox_spec(
     credentials_file: &Path,
     proxy: &EgressProxy,
     runtime: &RuntimeLayout,
+    broker_enabled: bool,
 ) -> Result<SandboxSpec, String> {
     let lab_dir = fs::canonicalize(lab_dir)
         .map_err(|error| format!("could not resolve jg-sandbox lab directory: {error}"))?;
@@ -711,6 +829,9 @@ fn build_sandbox_spec(
     spec.ro_binds = ro_binds;
     spec.lab_ro_binds.push(read_only_git.to_path_buf());
     spec.allowed_sockets.push(state_dir.join("hub.sock"));
+    if broker_enabled {
+        spec.allowed_sockets.push(state_dir.join("broker.sock"));
+    }
     spec.egress = Some(EgressSpec::new(proxy.socket_path()));
     spec.validate()
         .map_err(|error| format!("invalid Claude jg-sandbox spec: {error}"))?;
@@ -831,6 +952,7 @@ fn log_egress(event: EgressEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
 
     #[test]
     fn the_claude_spec_exposes_only_the_runtime_and_credentials_and_protects_git() {
@@ -867,15 +989,33 @@ mod tests {
             &credentials,
             &proxy,
             &runtime,
+            false,
         )
         .expect("sandbox spec");
 
         assert_eq!(spec.lab_dir, lab_dir);
-        assert_eq!(spec.lab_ro_binds, vec![git]);
+        assert_eq!(spec.lab_ro_binds, vec![git.clone()]);
         assert_eq!(spec.egress.as_ref().map(|egress| egress.port), Some(3128));
         assert!(spec.ro_binds.contains(&credentials));
         assert!(spec.ro_binds.contains(&runtime_dir));
         assert_eq!(spec.allowed_sockets, vec![hub.socket_path().to_path_buf()]);
+        let broker_socket = state_dir.join("broker.sock");
+        let _broker_listener = UnixListener::bind(&broker_socket).expect("broker socket");
+        let broker_spec = build_sandbox_spec(
+            &state_dir,
+            &lab_dir,
+            &work_tree,
+            &git,
+            &credentials,
+            &proxy,
+            &runtime,
+            true,
+        )
+        .expect("sandbox spec with broker");
+        assert_eq!(
+            broker_spec.allowed_sockets,
+            vec![hub.socket_path().to_path_buf(), broker_socket]
+        );
         assert_eq!(
             spec.egress.as_ref().expect("egress").proxy_socket,
             proxy_socket
@@ -980,6 +1120,25 @@ mod tests {
             request.env.get("HOME").map(String::as_str),
             Some("/tmp/home/home")
         );
+        let environment = request.resolved_env(Some(jg_sandbox::DEFAULT_EGRESS_PORT), None);
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
+            assert_eq!(
+                environment.get(key).map(String::as_str),
+                Some("http://127.0.0.1:3128"),
+                "{key} must route role egress through the allowlist proxy"
+            );
+        }
+        assert_eq!(
+            environment.get("NO_PROXY").map(String::as_str),
+            Some("localhost,127.0.0.1")
+        );
     }
 
     #[test]
@@ -1025,10 +1184,12 @@ mod tests {
         let mut proxy =
             Some(EgressProxy::start(&socket_path, policy, Arc::new(|_| {})).expect("proxy"));
         let mut hub = None;
+        let mut broker = None;
 
         let result = cleanup_after_destroy(
             Err("backend destroy failed".to_string()),
             &mut hub,
+            &mut broker,
             &mut proxy,
             &state_dir,
             &scratch_root,

@@ -32,6 +32,7 @@ use std::{
 use jgf_core::{
     AuditKind, GithubAction, ModelError, ProjectId, Secret, SecretKey, SecretScope, SecretStore,
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::broker::{
@@ -151,7 +152,7 @@ impl BackendOp {
     }
 
     /// Builds the operation for an approved action.
-    fn from_approved(approved: &Approved) -> Self {
+    pub(crate) fn from_approved(approved: &Approved) -> Self {
         let owner = approved.owner.clone();
         let repo = approved.repo.clone();
         match approved.action {
@@ -197,7 +198,7 @@ impl BackendOp {
 }
 
 /// What a backend produced for an approved operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendOutput {
     /// Action that ran.
     pub action: GithubAction,
@@ -318,28 +319,32 @@ pub enum BackendError {
 impl BackendError {
     /// Removes the token from every message returned by a backend implementation.
     fn redact_token(self, token: &Secret) -> Self {
+        self.redact_literal(token.expose())
+    }
+
+    pub(crate) fn redact_literal(self, value: &str) -> Self {
         match self {
             Self::Spawn { program, message } => Self::Spawn {
-                program: redact(&program, token),
-                message: redact(&message, token),
+                program: redact_literal(program, value),
+                message: redact_literal(message, value),
             },
             Self::Timeout { program, millis } => Self::Timeout {
-                program: redact(&program, token),
+                program: redact_literal(program, value),
                 millis,
             },
             Self::CommitRejected { commit, reason } => Self::CommitRejected {
-                commit: redact(&commit, token),
-                reason: redact(&reason, token),
+                commit: redact_literal(commit, value),
+                reason: redact_literal(reason, value),
             },
             Self::CommitLog { message } => Self::CommitLog {
-                message: redact(&message, token),
+                message: redact_literal(message, value),
             },
             Self::BaseFetch { base, message } => Self::BaseFetch {
-                base: redact(&base, token),
-                message: redact(&message, token),
+                base: redact_literal(base, value),
+                message: redact_literal(message, value),
             },
             Self::Workspace { message } => Self::Workspace {
-                message: redact(&message, token),
+                message: redact_literal(message, value),
             },
             Self::Failed {
                 program,
@@ -347,30 +352,38 @@ impl BackendError {
                 stdout,
                 stderr,
             } => Self::Failed {
-                program: redact(&program, token),
-                status: redact(&status, token),
-                stdout: redact(&stdout, token),
-                stderr: redact(&stderr, token),
+                program: redact_literal(program, value),
+                status: redact_literal(status, value),
+                stdout: redact_literal(stdout, value),
+                stderr: redact_literal(stderr, value),
             },
             Self::Wait { program, message } => Self::Wait {
-                program: redact(&program, token),
-                message: redact(&message, token),
+                program: redact_literal(program, value),
+                message: redact_literal(message, value),
             },
             Self::MergeBaseUnreadable { branch, message } => Self::MergeBaseUnreadable {
-                branch: redact(&branch, token),
-                message: redact(&message, token),
+                branch: redact_literal(branch, value),
+                message: redact_literal(message, value),
             },
             Self::MergeTargetMismatch {
                 branch,
                 expected,
                 actual,
             } => Self::MergeTargetMismatch {
-                branch: redact(&branch, token),
-                expected: redact(&expected, token),
-                actual: redact(&actual, token),
+                branch: redact_literal(branch, value),
+                expected: redact_literal(expected, value),
+                actual: redact_literal(actual, value),
             },
             missing @ Self::MissingOperationField { .. } => missing,
         }
+    }
+}
+
+fn redact_literal(value: String, marker: &str) -> String {
+    if marker.is_empty() {
+        value
+    } else {
+        value.replace(marker, "[redacted]")
     }
 }
 
@@ -985,12 +998,47 @@ impl Broker {
         B: GithubBackend + ?Sized,
         S: SecretStore + ?Sized,
     {
+        self.execute_with_redaction(req, project, worker, backend, store, None)
+    }
+
+    /// Runs an action for a launch capability, also redacting that capability from backend
+    /// output and errors before they are returned or audited.
+    pub(crate) fn execute_for_launch<B, S>(
+        &self,
+        req: &GithubRequest,
+        project: &ProjectId,
+        worker: &str,
+        backend: &B,
+        store: &S,
+        launch_token: &str,
+    ) -> Result<BackendOutput, BrokerError>
+    where
+        B: GithubBackend + ?Sized,
+        S: SecretStore + ?Sized,
+    {
+        self.execute_with_redaction(req, project, worker, backend, store, Some(launch_token))
+    }
+
+    fn execute_with_redaction<B, S>(
+        &self,
+        req: &GithubRequest,
+        project: &ProjectId,
+        worker: &str,
+        backend: &B,
+        store: &S,
+        launch_token: Option<&str>,
+    ) -> Result<BackendOutput, BrokerError>
+    where
+        B: GithubBackend + ?Sized,
+        S: SecretStore + ?Sized,
+    {
         let approved = self.check(req, project, worker)?;
         let key = token_key();
         let token = match store.get(&SecretScope::Lab, &key) {
             Ok(token) => token,
             Err(source) => {
-                self.audit_refusal(req, project, worker, &source.to_string(), None)?;
+                let reason = redact_launch_literal(source.to_string(), launch_token);
+                self.audit_refusal(req, project, worker, &reason, None)?;
                 return Err(BrokerError::Store {
                     key: key.clone(),
                     source: Box::new(source),
@@ -1004,9 +1052,15 @@ impl Broker {
 
         let op = BackendOp::from_approved(&approved);
         match backend.run(&op, &token) {
-            Ok(output) => Ok(output),
+            Ok(mut output) => {
+                output.stdout = redact_launch_literal(redact(&output.stdout, &token), launch_token);
+                output.stderr = redact_launch_literal(redact(&output.stderr, &token), launch_token);
+                Ok(output)
+            }
             Err(error) => {
-                let error = error.redact_token(&token);
+                let error = error
+                    .redact_token(&token)
+                    .redact_literal(launch_token.unwrap_or_default());
                 self.audit_refusal(req, project, worker, &error.to_string(), Some(&token))?;
                 Err(BrokerError::Backend(error))
             }
@@ -1038,6 +1092,13 @@ impl Broker {
                 ),
             )
             .map(|_| ())
+    }
+}
+
+fn redact_launch_literal(value: String, launch_token: Option<&str>) -> String {
+    match launch_token {
+        Some(token) => redact_literal(value, token),
+        None => value,
     }
 }
 
