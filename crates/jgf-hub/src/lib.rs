@@ -8,6 +8,7 @@ pub mod git_flow;
 pub mod routing;
 pub mod scheduler;
 pub mod usage;
+pub mod watchdog;
 
 pub use board::{Actor, Board, BoardError, BoardFilter, Column, Outcome, OutcomeStatus, Task};
 pub use broker::{
@@ -35,4 +36,8 @@ pub use usage::{
     HARD_PERCENT, LabState, Level, Parked, Policy, Provider, RESUME_DELAY_SECS, Reading,
     ReadingState, ResumeQueue, SOFT_PERCENT, STALE_SECS, Throttle, UsageError, UsageMeter, Window,
     lab_state,
+};
+pub use watchdog::{
+    Action, CheckInput, HEARTBEAT_TTL_SECS, MAX_WAKE_ATTEMPTS, WAKE_COOLDOWN_SECS,
+    WATCHDOG_INTERVAL_SECS, WakeReason, WakeRequest, Watchdog, WatchdogError, wake_request,
 };
