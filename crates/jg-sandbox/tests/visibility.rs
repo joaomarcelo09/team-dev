@@ -163,6 +163,41 @@ fn read_only_mounts_and_pivot_hide_the_host() {
     };
     let handle = guard.handle();
 
+    let host_argv = std::fs::read("/proc/self/cmdline").expect("host process cmdline");
+    let host_argv = host_argv
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| String::from_utf8_lossy(argument).into_owned())
+        .collect::<Vec<_>>();
+    let host_comm = std::fs::read_to_string("/proc/self/comm").expect("host process comm");
+    let init_identity = run_ok(
+        backend,
+        handle,
+        "cat /proc/1/cmdline; printf '\\n'; cat /proc/1/comm",
+    );
+    let identity_text = init_identity.stdout_text();
+    let (init_cmdline, init_comm) = identity_text
+        .split_once('\n')
+        .expect("PID 1 identity output");
+    for argument in host_argv {
+        assert!(
+            !init_cmdline.contains(&argument),
+            "PID 1 cmdline exposed host argv"
+        );
+    }
+    assert!(
+        !init_comm.contains(host_comm.trim()),
+        "PID 1 comm exposed the host process name: {init_comm:?}"
+    );
+    assert_eq!(init_comm, "jg-sandbox-init\n");
+
+    let pids = run_ok(
+        backend,
+        handle,
+        "for pid in /proc/[0-9]*; do printf '%s\\n' \"${pid##*/}\"; done",
+    );
+    assert_eq!(pids.stdout_text(), "1\n2\n");
+
     let write_usr = run_shell(backend, handle, "echo nope > /usr/forbidden.txt");
     assert_ne!(
         write_usr.exit_code,
@@ -201,11 +236,11 @@ fn read_only_mounts_and_pivot_hide_the_host() {
     );
     assert!(text.contains("no-home"), "host /home reachable via dotdot");
 
-    let passwd = run_ok(backend, handle, "cat /proc/1/root/etc/passwd");
+    let passwd = run_ok(backend, handle, "cat /etc/passwd");
     assert_eq!(
         passwd.stdout_text().lines().count(),
         2,
-        "host /etc/passwd is reachable through /proc/1/root"
+        "only the sandbox's passwd entries should be visible"
     );
     assert!(
         passwd
