@@ -26,6 +26,10 @@ const MAX_HOST_LEN: usize = 255;
 const MAX_URL_LEN: usize = 1024;
 /// Maximum length of a worker name.
 const MAX_WORKER_LEN: usize = 128;
+/// Maximum length of a GitHub owner or repository name.
+const MAX_GITHUB_NAME_LEN: usize = 255;
+/// Maximum length of a Git branch name.
+const MAX_BRANCH_LEN: usize = 255;
 /// Maximum length of a lab name.
 pub(crate) const MAX_LAB_LEN: usize = 128;
 /// Maximum length of a project id.
@@ -141,6 +145,21 @@ pub enum AuditKind {
         /// Why the write was refused.
         reason: String,
     },
+    /// A GitHub action was allowed or refused by the credential broker.
+    GithubAction {
+        /// Action the caller asked for, such as `push_task_branch`.
+        action: String,
+        /// Owner (user or organization) the action targets.
+        owner: String,
+        /// Repository the action targets.
+        repo: String,
+        /// Branch the action targets, when it has one.
+        branch: Option<String>,
+        /// Whether the broker allowed the action.
+        allowed: bool,
+        /// Why the decision was made.
+        reason: String,
+    },
     /// A task card moved on the board.
     BoardMove {
         /// Task that moved.
@@ -224,6 +243,26 @@ impl AuditKind {
         .capped()
     }
 
+    /// A GitHub action decision made by the credential broker.
+    pub fn github_action(
+        action: impl Into<String>,
+        owner: impl Into<String>,
+        repo: impl Into<String>,
+        branch: Option<String>,
+        allowed: bool,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::GithubAction {
+            action: action.into(),
+            owner: owner.into(),
+            repo: repo.into(),
+            branch,
+            allowed,
+            reason: reason.into(),
+        }
+        .capped()
+    }
+
     /// A task card move.
     pub fn board_move(
         task: impl Into<String>,
@@ -282,6 +321,7 @@ impl AuditKind {
             Self::Command { .. } => "command",
             Self::Network { .. } => "network",
             Self::DeniedWrite { .. } => "denied_write",
+            Self::GithubAction { .. } => "github_action",
             Self::BoardMove { .. } => "board_move",
             Self::CiResult { .. } => "ci_result",
             Self::Cost { .. } => "cost",
@@ -319,6 +359,21 @@ impl AuditKind {
             },
             Self::DeniedWrite { path, reason } => Self::DeniedWrite {
                 path: truncate(&path, MAX_PATH_LEN),
+                reason: truncate(&reason, MAX_TEXT_LEN),
+            },
+            Self::GithubAction {
+                action,
+                owner,
+                repo,
+                branch,
+                allowed,
+                reason,
+            } => Self::GithubAction {
+                action: truncate(&action, MAX_TEXT_LEN),
+                owner: truncate(&owner, MAX_GITHUB_NAME_LEN),
+                repo: truncate(&repo, MAX_GITHUB_NAME_LEN),
+                branch: branch.map(|value| truncate(&value, MAX_BRANCH_LEN)),
+                allowed,
                 reason: truncate(&reason, MAX_TEXT_LEN),
             },
             Self::BoardMove {
@@ -505,6 +560,17 @@ mod tests {
             ),
             (AuditKind::denied_write("/tmp/x", "outside"), "denied_write"),
             (
+                AuditKind::github_action(
+                    "push_task_branch",
+                    "acme",
+                    "app",
+                    Some("jgt/JGT-1".into()),
+                    true,
+                    "allowed",
+                ),
+                "github_action",
+            ),
+            (
                 AuditKind::board_move("JGT-1", "todo", "doing", "dev", "start", Vec::new()),
                 "board_move",
             ),
@@ -573,6 +639,38 @@ mod tests {
     }
 
     #[test]
+    fn github_action_fields_are_capped_and_marked() {
+        let long_name = "a".repeat(MAX_GITHUB_NAME_LEN + 50);
+        let long_branch = "b".repeat(MAX_BRANCH_LEN + 50);
+        let long_reason = "c".repeat(MAX_TEXT_LEN + 50);
+        let kind = AuditKind::github_action(
+            "push_task_branch",
+            long_name.clone(),
+            long_name,
+            Some(long_branch),
+            false,
+            long_reason,
+        );
+        let AuditKind::GithubAction {
+            owner,
+            repo,
+            branch,
+            reason,
+            allowed,
+            ..
+        } = kind
+        else {
+            panic!("expected a GitHub action event");
+        };
+        assert_eq!(owner.chars().count(), MAX_GITHUB_NAME_LEN);
+        assert!(owner.ends_with(TRUNCATED));
+        assert_eq!(repo.chars().count(), MAX_GITHUB_NAME_LEN);
+        assert!(branch.expect("branch").ends_with(TRUNCATED));
+        assert!(reason.ends_with(TRUNCATED));
+        assert!(!allowed);
+    }
+
+    #[test]
     fn too_many_arguments_are_truncated_with_a_marker() {
         let argv: Vec<String> = (0..MAX_ARGS + 5)
             .map(|index| format!("arg{index}"))
@@ -592,6 +690,36 @@ mod tests {
         assert_eq!(value["kind"]["kind"], "command");
         assert_eq!(value["seq"], 1);
         assert_eq!(value["project"], "demo");
+    }
+
+    #[test]
+    fn github_action_event_serializes_every_field() {
+        let kind = AuditKind::github_action(
+            "open_pr",
+            "acme",
+            "app",
+            Some("jgt/JGT-97".into()),
+            true,
+            "allowed",
+        );
+        let event = AuditEvent::new(
+            1,
+            1_700_000_000_000,
+            "alpha",
+            None,
+            Some("worker-1".into()),
+            kind,
+            "",
+        )
+        .expect("valid event");
+        let value = serde_json::to_value(&event).expect("serialize");
+        assert_eq!(value["kind"]["kind"], "github_action");
+        assert_eq!(value["kind"]["action"], "open_pr");
+        assert_eq!(value["kind"]["owner"], "acme");
+        assert_eq!(value["kind"]["repo"], "app");
+        assert_eq!(value["kind"]["branch"], "jgt/JGT-97");
+        assert_eq!(value["kind"]["allowed"], true);
+        assert_eq!(value["kind"]["reason"], "allowed");
     }
 
     #[test]
