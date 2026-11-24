@@ -22,6 +22,8 @@ mod scope;
 mod util;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const SANDBOX_UID: u32 = 1000;
+const SANDBOX_GID: u32 = 1000;
 
 /// Where the host egress proxy socket is exposed inside the sandbox.
 pub(crate) const EGRESS_SOCKET_PATH: &str = "/run/jg/egress.sock";

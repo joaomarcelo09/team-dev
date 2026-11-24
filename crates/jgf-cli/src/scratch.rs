@@ -1,12 +1,11 @@
 //! The scratch home of a real coder or reviewer child.
 //!
-//! A [`ScratchHome`] is a private directory (mode 0700) inside the run's state directory. The
-//! child runs in a bwrap filesystem view: the host filesystem is not visible except for the
-//! listed binds; the task work tree is writable except for its read-only `.git` directory, and
-//! scratch is writable, while system directories and Claude's single credentials file are
-//! read-only. `/tmp` is a fresh tmpfs, and `/proc` and `/dev` are fresh views. The network stays
-//! open, so the child can still reach whatever the network allows with the credentials it has:
-//! Claude auth only.
+//! A [`ScratchHome`] is a private directory (mode 0700) beside the run's isolated work tree.
+//! The jg-sandbox lab exposes separate `work/` and `scratch/` directories; the work tree is
+//! writable except for its read-only `.git` directory, and system/runtime directories plus
+//! Claude's single credentials file are read-only.
+//! `/tmp` is a fresh tmpfs, and `/proc` and `/dev` are fresh views. Direct network is disabled;
+//! Claude API traffic uses the host-side egress proxy and its allowlist.
 //!
 //! The host credentials file is only located and linked; this module never reads its contents.
 //! A token refresh may replace the symlink with a regular file in the scratch directory.

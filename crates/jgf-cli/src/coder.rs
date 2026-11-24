@@ -1,38 +1,29 @@
 //! The coder step of an end-to-end run.
 //!
 //! A [`CoderRunner`] receives the prompt (frozen spec, plan and task branch) and edits the
-//! scratch work tree. [`ClaudeCoderRunner`] runs `claude -p` under bwrap with a hard wall-clock
+//! scratch work tree. [`ClaudeCoderRunner`] runs `claude -p` under jg-sandbox with a hard wall-clock
 //! limit, a turn cap and a dollar budget; [`FakeCoderRunner`] is the dry-run and test double.
 //!
-//! Filesystem access is isolated via bwrap: the host filesystem is not visible except for the
-//! listed binds; the task work tree is writable except for its read-only `.git` directory, and
-//! scratch is writable, while system directories and the single Claude credentials file are
-//! read-only. `/tmp` is a fresh tmpfs, and `/proc` and `/dev` are fresh views. Network access
-//! remains open, so the child can still reach whatever the network allows with the credentials it
-//! has: Claude auth only. Full `jg-sandbox` integration is a follow-up. No code here reads a
-//! secret store.
+//! The world exposes only the work tree (with `.git` read-only), the private scratch home, the
+//! required read-only runtime paths and the Claude credentials file. Network egress is restricted
+//! to Claude's API through the jg-sandbox proxy. No code here reads a secret store.
 
 use std::{
     fs,
-    io::Read,
     path::PathBuf,
-    process::Stdio,
-    sync::Mutex,
-    thread,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use crate::{
     child,
     e2e::KillSwitch,
+    sandbox::ClaudeSandbox,
     scratch::{ScratchError, ScratchHome},
 };
 
 /// File the dry-run and test coder writes to prove it changed the work tree.
 pub const FAKE_EDIT_FILE: &str = "CODER_NOTE.md";
-
-/// How often a running coder is checked for completion.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// One coder invocation.
 #[derive(Debug, Clone, PartialEq)]
@@ -144,8 +135,8 @@ pub trait CoderRunner {
 #[derive(Debug, Clone)]
 pub struct ClaudeCoderRunner {
     binary: PathBuf,
-    bwrap_binary: PathBuf,
     real_home: Option<PathBuf>,
+    sandbox: Option<Arc<ClaudeSandbox>>,
 }
 
 impl ClaudeCoderRunner {
@@ -153,8 +144,16 @@ impl ClaudeCoderRunner {
     pub fn new() -> Self {
         Self {
             binary: PathBuf::from("claude"),
-            bwrap_binary: PathBuf::from(child::BWRAP_BINARY),
             real_home: None,
+            sandbox: None,
+        }
+    }
+
+    pub(crate) fn in_sandbox(sandbox: Arc<ClaudeSandbox>) -> Self {
+        Self {
+            binary: PathBuf::from("claude"),
+            real_home: None,
+            sandbox: Some(sandbox),
         }
     }
 
@@ -168,8 +167,8 @@ impl ClaudeCoderRunner {
     ) -> Self {
         Self {
             binary: binary.into(),
-            bwrap_binary: PathBuf::from(child::BWRAP_BINARY),
             real_home: Some(home.into()),
+            sandbox: None,
         }
     }
 
@@ -184,6 +183,15 @@ impl ClaudeCoderRunner {
         let argv = request.command();
         let started = Instant::now();
 
+        let Some(sandbox) = &self.sandbox else {
+            return CoderRun {
+                spawn_error: Some(
+                    "jg-sandbox world is missing; refusing to run Claude unsandboxed".to_string(),
+                ),
+                duration_ms: elapsed_ms(started),
+                ..CoderRun::default()
+            };
+        };
         let scratch = match self.scratch_home(request) {
             Ok(scratch) => scratch,
             Err(error) => {
@@ -195,88 +203,40 @@ impl ClaudeCoderRunner {
             }
         };
 
-        let mut command = match child::sandbox_command(
-            &self.bwrap_binary,
+        let child_run = sandbox.run_claude(
             &self.binary,
             &argv,
-            &request.state_dir,
             &request.work_dir,
             &scratch,
-        ) {
-            Ok(command) => command,
-            Err(error) => {
-                return CoderRun {
-                    spawn_error: Some(error),
-                    duration_ms: elapsed_ms(started),
-                    ..CoderRun::default()
-                };
-            }
+            request.timeout,
+            kill,
+        );
+        let Some(output) = child_run.output else {
+            return CoderRun {
+                killed: child_run.killed,
+                spawn_error: child_run.spawn_error,
+                duration_ms: elapsed_ms(started),
+                ..CoderRun::default()
+            };
         };
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        child::own_process_group(&mut command);
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(error) => {
-                return CoderRun {
-                    spawn_error: Some(format!(
-                        "could not start bwrap at {}: {error}",
-                        self.bwrap_binary.display()
-                    )),
-                    duration_ms: elapsed_ms(started),
-                    ..CoderRun::default()
-                };
-            }
-        };
-
-        let stdout_reader = child.stdout.take().map(spawn_reader);
-        let stderr_reader = child.stderr.take().map(spawn_reader);
-
-        let mut timed_out = false;
-        let mut killed = false;
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child::kill_process_group(&mut child);
-                    return CoderRun {
-                        spawn_error: Some(error.to_string()),
-                        duration_ms: elapsed_ms(started),
-                        ..CoderRun::default()
-                    };
-                }
-            }
-            if kill.is_some_and(|kill| kill.killed()) {
-                killed = true;
-                break child::kill_process_group(&mut child);
-            }
-            if started.elapsed() >= request.timeout {
-                timed_out = true;
-                break child::kill_process_group(&mut child);
-            }
-            thread::sleep(POLL_INTERVAL);
-        };
-
-        let stdout = join_reader(stdout_reader);
-        let stderr = join_reader(stderr_reader);
-        let spawn_error = child::bwrap_start_error(&stderr);
-        let exit_code = status.and_then(|status| status.code());
-        let signal = status.and_then(|status| {
-            use std::os::unix::process::ExitStatusExt;
-            status.signal()
-        });
-        let failed = !timed_out && exit_code != Some(0) && signal.is_none();
+        let stdout = output.stdout_text();
+        let stderr = output.stderr_text();
+        let exit_code = output.exit_code;
+        let signal = output.signal;
+        let timed_out = output.timed_out;
+        let mut spawn_error = child_run.spawn_error;
+        if output.truncated {
+            spawn_error = Some("jg-sandbox command output was truncated".to_string());
+        }
+        let failed =
+            spawn_error.is_some() || (!timed_out && exit_code != Some(0) && signal.is_none());
         let budget_exhausted = failed && mentions_budget(&stdout, &stderr);
 
         CoderRun {
             exit_code,
             signal,
             timed_out,
-            killed,
+            killed: child_run.killed,
             budget_exhausted,
             stdout,
             stderr,
@@ -388,24 +348,6 @@ impl CoderRunner for FakeCoderRunner {
     }
 }
 
-fn spawn_reader<R>(mut pipe: R) -> thread::JoinHandle<Vec<u8>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        bytes
-    })
-}
-
-fn join_reader(reader: Option<thread::JoinHandle<Vec<u8>>>) -> String {
-    let bytes = reader
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default();
-    String::from_utf8_lossy(&bytes).into_owned()
-}
-
 fn mentions_budget(stdout: &str, stderr: &str) -> bool {
     let text = format!("{stdout}\n{stderr}").to_ascii_lowercase();
     text.contains("exceeded usd budget") || text.contains("budget exceeded")
@@ -455,11 +397,6 @@ mod tests {
         path
     }
 
-    fn env_value<'a>(dump: &'a str, key: &str) -> Option<&'a str> {
-        dump.lines()
-            .find_map(|line| line.strip_prefix(&format!("{key}=")))
-    }
-
     #[test]
     fn the_command_carries_the_limits_and_the_prompt() {
         let dir = std::env::temp_dir();
@@ -478,112 +415,24 @@ mod tests {
     }
 
     #[test]
-    fn the_child_sees_a_scratch_home_without_gh_ssh_git_or_token_vars() {
+    fn a_runner_without_a_created_world_never_starts_the_cli() {
         let root = tempfile::TempDir::new().expect("temp dir");
-        fs::create_dir(root.path().join(".git")).expect("work-tree git directory");
         let home = fake_home(root.path());
-        let dump = root.path().join("child.env");
+        let marker = root.path().join("started");
         let binary = script(
             root.path(),
             "fake-claude",
-            &format!("env > '{}'", dump.display()),
+            &format!("touch '{}'", marker.display()),
         );
         let runner = ClaudeCoderRunner::with_binary_and_home(&binary, &home);
 
         let run = runner.run(&request(root.path()));
-        assert!(run.succeeded(), "{:?}", run.failure_reason());
-
-        let env = fs::read_to_string(&dump).expect("child env");
-        let scratch = root.path().join("scratch");
-        assert_eq!(
-            env_value(&env, "HOME"),
-            Some(scratch.join("home").to_str().unwrap())
-        );
-        assert_eq!(
-            env_value(&env, "XDG_CONFIG_HOME"),
-            Some(scratch.join("config").to_str().unwrap())
-        );
-        assert_eq!(
-            env_value(&env, "XDG_DATA_HOME"),
-            Some(scratch.join("data").to_str().unwrap())
-        );
-        assert_eq!(
-            env_value(&env, "XDG_CACHE_HOME"),
-            Some(scratch.join("cache").to_str().unwrap())
-        );
-        assert_eq!(
-            env_value(&env, "GH_CONFIG_DIR"),
-            Some(scratch.join("gh").to_str().unwrap())
-        );
-        assert_eq!(
-            env_value(&env, "CLAUDE_CONFIG_DIR"),
-            Some(scratch.join("claude").to_str().unwrap())
-        );
-        assert_eq!(env_value(&env, "GIT_CONFIG_GLOBAL"), Some("/dev/null"));
-        assert_eq!(env_value(&env, "GIT_CONFIG_SYSTEM"), Some("/dev/null"));
-        assert_eq!(env_value(&env, "GIT_TERMINAL_PROMPT"), Some("0"));
-        for key in ["GITHUB_TOKEN", "GH_TOKEN", "SSH_AUTH_SOCK", "GIT_ASKPASS"] {
-            assert_eq!(env_value(&env, key), None, "{key} reached the child");
-        }
-        assert!(
-            fs::symlink_metadata(scratch.join("claude").join(".credentials.json"))
-                .expect("credentials link")
-                .file_type()
-                .is_symlink()
-        );
-    }
-
-    #[test]
-    fn a_missing_bwrap_binary_fails_closed_with_a_clear_error() {
-        let root = tempfile::TempDir::new().expect("temp dir");
-        fs::create_dir(root.path().join(".git")).expect("work-tree git directory");
-        let home = fake_home(root.path());
-        let binary = script(root.path(), "fake-claude", "exit 0");
-        let mut runner = ClaudeCoderRunner::with_binary_and_home(&binary, &home);
-        runner.bwrap_binary = root.path().join("missing-bwrap");
-
-        let run = runner.run(&request(root.path()));
-
         assert!(!run.succeeded());
         assert!(
-            run.failure_reason().contains("could not start bwrap"),
-            "{}",
             run.failure_reason()
+                .contains("refusing to run Claude unsandboxed")
         );
-    }
-
-    #[test]
-    fn a_kill_switch_stops_the_whole_process_group() {
-        let root = tempfile::TempDir::new().expect("temp dir");
-        fs::create_dir(root.path().join(".git")).expect("work-tree git directory");
-        let home = fake_home(root.path());
-        let descendant_file = root.path().join("descendant.txt");
-        let kill_path = crate::e2e::kill_file(root.path());
-        fs::create_dir_all(kill_path.parent().expect("kill parent")).expect("kill dir");
-        let binary = script(
-            root.path(),
-            "fake-claude",
-            &format!(
-                "(while :; do echo x >> '{}'; sleep 0.01; done) &\ntouch '{}'\nwait",
-                descendant_file.display(),
-                kill_path.display()
-            ),
-        );
-        let runner = ClaudeCoderRunner::with_binary_and_home(&binary, &home);
-        let kill = crate::e2e::FileKillSwitch::new(root.path());
-
-        let run = runner.run_with_kill(&request(root.path()), &kill);
-
-        assert!(run.killed);
-        let written = fs::read(&descendant_file).expect("descendant writes");
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(
-            fs::read(&descendant_file)
-                .expect("descendant output remains")
-                .len(),
-            written.len(),
-            "descendant kept running after its process group was killed"
-        );
+        assert!(!marker.exists(), "unsandboxed Claude binary was started");
     }
 
     #[test]

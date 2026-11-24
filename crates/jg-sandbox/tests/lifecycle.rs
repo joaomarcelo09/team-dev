@@ -3,6 +3,7 @@
 mod support;
 
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -40,6 +41,88 @@ fn create_exec_destroy_cycle() {
         "state file left behind"
     );
     assert_process_gone(init_pid);
+}
+
+#[test]
+fn lab_read_only_bind_cannot_be_written() {
+    let lab = fixture();
+    let git_dir = lab.spec.lab_dir.join("repo/.git");
+    std::fs::create_dir_all(&git_dir).expect("git dir");
+    let config = git_dir.join("config");
+    std::fs::write(&config, "original\n").expect("git config");
+
+    let mut spec = lab.spec.clone();
+    spec.lab_ro_binds.push(git_dir.clone());
+    let backend = NamespaceBackend::new();
+    let Some(guard) = create_or_skip(backend, &spec) else {
+        return;
+    };
+
+    let output = run_shell(
+        backend,
+        guard.handle(),
+        "if printf 'changed\\n' > /lab/repo/.git/config 2>/dev/null; then exit 41; fi; \
+         cat /lab/repo/.git/config",
+    );
+    assert_eq!(output.exit_code, Some(0), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "original\n");
+    assert_eq!(
+        std::fs::read_to_string(config).expect("host git config"),
+        "original\n"
+    );
+}
+
+#[test]
+fn exec_runs_non_root_with_writable_lab_and_scratch_home() {
+    let lab = fixture();
+    let repo = lab.spec.lab_dir.join("repo");
+    let git_dir = repo.join(".git");
+    std::fs::create_dir_all(&git_dir).expect("git dir");
+    std::fs::write(git_dir.join("config"), "original\n").expect("git config");
+
+    let scratch_home = lab.spec.lab_dir.join("scratch/home");
+    std::fs::create_dir_all(&scratch_home).expect("scratch home");
+    std::fs::set_permissions(&scratch_home, std::fs::Permissions::from_mode(0o700))
+        .expect("private scratch home permissions");
+
+    let mut spec = lab.spec.clone();
+    spec.lab_ro_binds.push(git_dir.clone());
+    let backend = NamespaceBackend::new();
+    let Some(guard) = create_or_skip(backend, &spec) else {
+        return;
+    };
+
+    let request = ExecRequest::new(vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        "set -eu\nid -u\nprintf lab > /lab/lab-write\n\
+         printf worktree > /lab/repo/worktree-write\n\
+         printf scratch > \"$HOME/write-test\"\n\
+         if printf changed > /lab/repo/.git/config 2>/dev/null; then exit 41; fi"
+            .to_string(),
+    ])
+    .with_env("HOME", "/lab/scratch/home")
+    .with_timeout(Duration::from_secs(30));
+    let output = backend.exec(guard.handle(), &request).expect("exec");
+
+    assert_eq!(output.exit_code, Some(0), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "1000\n");
+    assert_eq!(
+        std::fs::read_to_string(lab.spec.lab_dir.join("lab-write")).expect("lab write"),
+        "lab"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("worktree-write")).expect("worktree write"),
+        "worktree"
+    );
+    assert_eq!(
+        std::fs::read_to_string(scratch_home.join("write-test")).expect("scratch write"),
+        "scratch"
+    );
+    assert_eq!(
+        std::fs::read_to_string(git_dir.join("config")).expect("git config"),
+        "original\n"
+    );
 }
 
 #[test]

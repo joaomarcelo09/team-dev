@@ -12,6 +12,7 @@ use crate::error::{Result, SandboxError};
 use crate::namespace::bridge;
 use crate::namespace::rootfs;
 use crate::namespace::util;
+use crate::namespace::{SANDBOX_GID, SANDBOX_UID};
 use crate::spec::SandboxSpec;
 
 const MAP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -108,7 +109,7 @@ fn stop_init(pid: i32) {
 
 fn write_id_maps(pid: i32, uid: u32, gid: u32) -> Result<()> {
     let uid_map = format!("/proc/{pid}/uid_map");
-    std::fs::write(&uid_map, format!("0 {uid} 1\n")).map_err(|source| {
+    std::fs::write(&uid_map, format!("{SANDBOX_UID} {uid} 1\n")).map_err(|source| {
         SandboxError::Unsupported {
             reason: format!("cannot write {uid_map}: {source}"),
         }
@@ -126,7 +127,7 @@ fn write_id_maps(pid: i32, uid: u32, gid: u32) -> Result<()> {
     }
 
     let gid_map = format!("/proc/{pid}/gid_map");
-    std::fs::write(&gid_map, format!("0 {gid} 1\n")).map_err(|source| {
+    std::fs::write(&gid_map, format!("{SANDBOX_GID} {gid} 1\n")).map_err(|source| {
         SandboxError::Unsupported {
             reason: format!("cannot write {gid_map}: {source}"),
         }

@@ -185,10 +185,10 @@ fn fd_limit() -> u32 {
 
 /// Remove every privilege a sandboxed command must not keep.
 ///
-/// Inside the sandbox the command runs as uid 0 of the user namespace that owns
-/// the mount namespace, so without this it could remount read-only binds or
-/// create new mounts. Clears the no-new-privs flag, the ambient set, the
-/// bounding set and the effective/permitted/inheritable sets.
+/// A process inside the sandbox retains its mapped non-root identity while
+/// holding namespace capabilities, so without this it could remount read-only
+/// binds or create new mounts. Clears no-new-privs, ambient, bounding,
+/// effective, permitted and inheritable capability sets.
 pub(crate) fn drop_all_privileges() -> Result<()> {
     set_no_new_privileges()?;
     clear_ambient_capabilities()?;

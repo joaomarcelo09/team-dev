@@ -239,13 +239,18 @@ fn read_only_mounts_and_pivot_hide_the_host() {
     let passwd = run_ok(backend, handle, "cat /etc/passwd");
     assert_eq!(
         passwd.stdout_text().lines().count(),
-        2,
+        3,
         "only the sandbox's passwd entries should be visible"
     );
     assert!(
         passwd
             .stdout_text()
             .starts_with("root:x:0:0:root:/lab/home:")
+    );
+    assert!(
+        passwd
+            .stdout_text()
+            .contains("sandbox:x:1000:1000:sandbox:/lab/home:")
     );
 
     run_ok(backend, handle, "test -L /bin && test -x /bin/sh");
