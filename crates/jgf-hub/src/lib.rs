@@ -3,6 +3,7 @@
 pub mod board;
 pub mod broker;
 pub mod broker_exec;
+pub mod ci_watch;
 pub mod git_flow;
 pub mod routing;
 pub mod scheduler;
@@ -16,6 +17,7 @@ pub use broker_exec::{
     BackendError, BackendOp, BackendOutput, BrokerError, GITHUB_TOKEN_KEY, GhCliBackend,
     GithubBackend, testing::FakeBackend,
 };
+pub use ci_watch::{CiError, CiState, CiWatch, Decision, MAX_FIX_CYCLES, parse_ci_runs};
 pub use git_flow::{
     DEFAULT_INTEGRATION_BRANCH, MergeAllowed, MergeContext, MergeDenied, MergeTarget,
     merge_decision, pr_base_branch,
