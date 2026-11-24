@@ -1,0 +1,1 @@
+# Workspace-wide clippy settings. CI denies warnings with `-D warnings`.

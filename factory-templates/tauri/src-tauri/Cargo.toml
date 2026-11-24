@@ -1,0 +1,21 @@
+[package]
+name = "tauri-template"
+version = "0.1.0"
+description = "Tauri template: thin commands over a tested core crate"
+edition = "2021"
+publish = false
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+app-core = { path = "core" }
+tauri = { version = "2.0.0", features = [] }
+
+[workspace]
+members = ["core"]
+resolver = "2"
