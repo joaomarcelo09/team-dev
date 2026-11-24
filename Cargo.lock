@@ -1968,6 +1968,10 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "jgf-core",
+ "jgf-hub",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

@@ -377,13 +377,24 @@ impl CiWatch {
 
 /// Parses the output of `gh run list --json status,conclusion,databaseId,headSha`.
 ///
-/// Only runs whose `headSha` equals `expected_sha` are considered. An empty list, or a list
-/// without a run for that SHA, is [`CiState::Pending`]. The parser fails closed: malformed JSON,
-/// fields or values, and unknown statuses are [`CiError::Unrecognized`]. A run that is not
-/// completed keeps the result pending while its status is one of `queued`, `in_progress`,
-/// `waiting` or `pending`. Every completed run must conclude `success` for a green result;
-/// `neutral`, `skipped` and the failure conclusions make the result failed.
+/// Only runs whose `headSha` equals `expected_sha` are considered. The parser fails closed:
+/// malformed JSON, fields or values, and unknown statuses are [`CiError::Unrecognized`]. A run
+/// that is not completed keeps the result pending while its status is one of `queued`,
+/// `in_progress`, `waiting` or `pending`. Every completed run must conclude `success` for a green
+/// result; `neutral`, `skipped` and the failure conclusions make the result failed.
 pub fn parse_ci_runs(json: &str, expected_sha: &str) -> Result<CiState, CiError> {
+    Ok(parse_ci_runs_with_presence(json, expected_sha)?.unwrap_or(CiState::Pending))
+}
+
+/// Parses CI runs and distinguishes no run for `expected_sha` from an existing pending run.
+///
+/// An empty list, or a list without a run for that SHA, returns `Ok(None)`. A matching run list
+/// returns its state. Use [`parse_ci_runs`] when the legacy behavior of treating no run as pending
+/// is desired.
+pub fn parse_ci_runs_with_presence(
+    json: &str,
+    expected_sha: &str,
+) -> Result<Option<CiState>, CiError> {
     if !sha_is_valid(expected_sha) {
         return Err(CiError::InvalidSha {
             sha: expected_sha.to_string(),
@@ -396,7 +407,7 @@ pub fn parse_ci_runs(json: &str, expected_sha: &str) -> Result<CiState, CiError>
         .filter(|run| run.head_sha.eq_ignore_ascii_case(expected_sha))
         .collect();
     if matching.is_empty() {
-        return Ok(CiState::Pending);
+        return Ok(None);
     }
 
     let mut pending = false;
@@ -416,11 +427,11 @@ pub fn parse_ci_runs(json: &str, expected_sha: &str) -> Result<CiState, CiError>
     }
 
     if pending {
-        Ok(CiState::Pending)
+        Ok(Some(CiState::Pending))
     } else if failed {
-        Ok(CiState::Failed)
+        Ok(Some(CiState::Failed))
     } else {
-        Ok(CiState::Green)
+        Ok(Some(CiState::Green))
     }
 }
 
@@ -768,6 +779,23 @@ mod tests {
     #[test]
     fn an_empty_run_list_is_pending() {
         assert_eq!(parse(&[]).expect("empty list"), CiState::Pending);
+        assert_eq!(
+            parse_ci_runs_with_presence("[]", SHA).expect("empty list"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_run_list_without_the_expected_sha_has_no_matching_run() {
+        let json = runs(&[run(OTHER_SHA, "in_progress", serde_json::Value::Null)]);
+        assert_eq!(
+            parse_ci_runs_with_presence(&json, SHA).expect("unrelated run"),
+            None
+        );
+        assert_eq!(
+            parse_ci_runs(&json, SHA).expect("legacy behavior"),
+            CiState::Pending
+        );
     }
 
     #[test]

@@ -127,6 +127,11 @@ pub enum AuditKind {
         /// Wall-clock duration in milliseconds.
         duration_ms: u64,
     },
+    /// A plain note about the run.
+    Note {
+        /// Note text.
+        text: String,
+    },
     /// An egress connection was allowed or refused.
     Network {
         /// Destination host.
@@ -216,6 +221,11 @@ impl AuditKind {
             duration_ms,
         }
         .capped()
+    }
+
+    /// A plain note.
+    pub fn note(text: impl Into<String>) -> Self {
+        Self::Note { text: text.into() }.capped()
     }
 
     /// An egress decision.
@@ -319,6 +329,7 @@ impl AuditKind {
     pub fn tag(&self) -> &'static str {
         match self {
             Self::Command { .. } => "command",
+            Self::Note { .. } => "note",
             Self::Network { .. } => "network",
             Self::DeniedWrite { .. } => "denied_write",
             Self::GithubAction { .. } => "github_action",
@@ -345,6 +356,9 @@ impl AuditKind {
                 signal,
                 timed_out,
                 duration_ms,
+            },
+            Self::Note { text } => Self::Note {
+                text: truncate(&text, MAX_TEXT_LEN),
             },
             Self::Network {
                 host,
@@ -554,6 +568,7 @@ mod tests {
                 AuditKind::command(Vec::new(), Some(0), None, false, 1),
                 "command",
             ),
+            (AuditKind::note("push cap: 30 per day"), "note"),
             (
                 AuditKind::network("example.com", 443, true, "allowed"),
                 "network",
