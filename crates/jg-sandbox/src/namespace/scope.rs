@@ -22,6 +22,7 @@ use crate::scope::{
 /// never fall back to the unscoped view.
 pub(crate) fn enter_scope(scope: &ExecScope) -> Result<()> {
     scope.validate()?;
+    let scratch_home = open_scratch_home(scope)?;
     unshare(CloneFlags::CLONE_NEWNS)
         .map_err(|source| SandboxError::nix("unshare scoped mount namespace", source))?;
     // The new namespace must not propagate mounts back to the sandbox.
@@ -43,7 +44,8 @@ pub(crate) fn enter_scope(scope: &ExecScope) -> Result<()> {
         util::verify_read_only_tree(workspace)?;
     }
     cover_lab(&git_mounts, scope.access)?;
-    mount_private_tmp(scope)
+    mount_private_tmp(scope)?;
+    mount_scratch_home(scratch_home)
 }
 
 /// Create the default `HOME` of a scoped exec on its private `/tmp`.
@@ -134,6 +136,18 @@ fn open_git_mounts(scope: &ExecScope) -> Result<Vec<GitMount>> {
     Ok(mounts)
 }
 
+/// Open the scratch home before the lab cover hides its `/lab` path.
+fn open_scratch_home(scope: &ExecScope) -> Result<Option<OwnedFd>> {
+    let Some(path) = scope.scratch_home.as_deref() else {
+        return Ok(None);
+    };
+    let path = resolve_dir(path, "scope scratch home")?;
+    let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    open(&path, flags, Mode::empty())
+        .map(Some)
+        .map_err(|errno| scope_error(format!("open scratch home {}: {errno}", path.display())))
+}
+
 fn open_git_mount(path: PathBuf, writable: bool) -> Result<GitMount> {
     let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
     let source = open(&path, flags, Mode::empty())
@@ -206,4 +220,23 @@ fn mount_git(git: &GitMount, access: ScopeAccess) -> Result<()> {
 fn mount_private_tmp(scope: &ExecScope) -> Result<()> {
     let options = format!("mode=1777,size={}", scope.effective_tmp_bytes());
     util::mount_tmpfs(Path::new(TMP_DIR), &options)
+}
+
+/// Mount the per-role host scratch home over the scoped exec's private home.
+fn mount_scratch_home(scratch_home: Option<OwnedFd>) -> Result<()> {
+    let Some(scratch_home) = scratch_home else {
+        return Ok(());
+    };
+    let target = Path::new(SCOPED_HOME);
+    std::fs::create_dir_all(target).map_err(|source| SandboxError::io(target, source))?;
+    let metadata =
+        std::fs::symlink_metadata(target).map_err(|source| SandboxError::io(target, source))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(scope_error(format!(
+            "{} is not a plain directory",
+            target.display()
+        )));
+    }
+    let source = PathBuf::from(format!("/proc/self/fd/{}", scratch_home.as_raw_fd()));
+    util::bind_non_recursive(&source, target)
 }

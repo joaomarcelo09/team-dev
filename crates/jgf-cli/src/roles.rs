@@ -1,0 +1,523 @@
+//! Launches factory roles inside a scoped lab-world exec.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use jg_sandbox::{ExecScope, ScopeAccess};
+
+use crate::{e2e::KillSwitch, sandbox::ClaudeSandbox};
+
+pub use crate::sandbox::ChildRun;
+
+/// A factory role and the skill directory that defines it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Owns the lab-wide queue and user-facing reports.
+    LabCoordinator,
+    /// Coordinates one project's workers.
+    CoCoordinator,
+    /// Implements one assigned project piece.
+    Coder,
+    /// Reviews one assigned project piece.
+    Reviewer,
+    /// Tests the project's acceptance criteria.
+    Tester,
+    /// Performs authorized host-side Git broker actions.
+    GitCoder,
+    /// Checks lab health for the host watchdog.
+    WakeUp,
+}
+
+impl Role {
+    /// Directory name containing this role's `SKILL.md`.
+    pub fn skill_directory(self) -> &'static str {
+        match self {
+            Self::LabCoordinator => "lab-coordinator",
+            Self::CoCoordinator => "co-coordinator",
+            Self::Coder => "coder",
+            Self::Reviewer => "reviewer",
+            Self::Tester => "tester",
+            Self::GitCoder => "git-coder",
+            Self::WakeUp => "wake-up",
+        }
+    }
+
+    fn worktree_access(self) -> ScopeAccess {
+        match self {
+            Self::Coder | Self::GitCoder => ScopeAccess::ReadWrite,
+            Self::LabCoordinator
+            | Self::CoCoordinator
+            | Self::Reviewer
+            | Self::Tester
+            | Self::WakeUp => ScopeAccess::ReadOnly,
+        }
+    }
+}
+
+/// One role launch requested by the lab runtime.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleLaunch {
+    /// Role to start.
+    pub role: Role,
+    /// Project whose worktree is available to the role.
+    pub project_id: String,
+    /// Worker identity for audit attribution and its private scratch home.
+    pub worker_id: String,
+    /// Name of the project's worktree.
+    pub worktree_name: String,
+    /// Task prompt passed to Claude.
+    pub prompt: String,
+    /// Wall-clock limit for this role process.
+    pub timeout: Duration,
+    /// Maximum agentic turns Claude may take.
+    pub max_turns: u32,
+    /// Maximum Claude budget in US dollars.
+    pub max_budget_usd: f64,
+}
+
+/// One prepared role invocation, passed to the sandbox executor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RoleExecution {
+    /// Role started by this invocation.
+    pub role: Role,
+    /// Project whose worktree is mounted.
+    pub project_id: String,
+    /// Worker identity used for audit attribution.
+    pub worker_id: String,
+    /// Host worktree path, validated by the sandbox runner.
+    pub worktree: PathBuf,
+    /// Private scratch home for this role.
+    pub scratch_home: PathBuf,
+    /// Claude executable arguments, including the skill and standards prompt.
+    pub argv: Vec<String>,
+    /// Process wall-clock limit.
+    pub timeout: Duration,
+    /// Only this project worktree is mounted into the scoped exec.
+    pub scope: ExecScope,
+}
+
+/// Sandbox operations needed by the role launcher.
+pub trait RoleLaunchExecutor {
+    /// Returns the active lab directory or fails when the world is unavailable.
+    fn lab_dir(&self) -> Result<PathBuf, String>;
+    /// Writes the single tagged role-start audit event.
+    fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String>;
+    /// Starts the role in the requested scoped exec.
+    fn run_role(&self, execution: RoleExecution, kill: Option<&dyn KillSwitch>) -> ChildRun;
+}
+
+/// Loads role instructions and starts the role through a sandbox executor.
+pub struct RoleLauncher<'a> {
+    skills_dir: PathBuf,
+    executor: &'a dyn RoleLaunchExecutor,
+}
+
+impl<'a> RoleLauncher<'a> {
+    /// Creates a launcher for skill files beneath `skills_dir`.
+    pub fn new(skills_dir: impl Into<PathBuf>, executor: &'a dyn RoleLaunchExecutor) -> Self {
+        Self {
+            skills_dir: skills_dir.into(),
+            executor,
+        }
+    }
+
+    /// Loads the skill and standards, records the start, and runs the role.
+    pub fn launch(&self, request: &RoleLaunch, kill: Option<&dyn KillSwitch>) -> ChildRun {
+        let execution = match self.prepare(request) {
+            Ok(execution) => execution,
+            Err(error) => return failed_launch(error),
+        };
+        if let Err(error) = self.executor.record_role_start(
+            &execution.project_id,
+            &execution.worker_id,
+            execution.role,
+        ) {
+            return failed_launch(error);
+        }
+        self.executor.run_role(execution, kill)
+    }
+
+    fn prepare(&self, request: &RoleLaunch) -> Result<RoleExecution, String> {
+        validate_identifier("project id", &request.project_id)?;
+        validate_identifier("worker id", &request.worker_id)?;
+        validate_identifier("worktree name", &request.worktree_name)?;
+
+        let lab_dir = fs::canonicalize(self.executor.lab_dir()?)
+            .map_err(|error| format!("could not resolve role lab directory: {error}"))?;
+        let skill = fs::read_to_string(
+            self.skills_dir
+                .join(request.role.skill_directory())
+                .join("SKILL.md"),
+        )
+        .map_err(|error| {
+            format!(
+                "could not load {} role skill: {error}",
+                request.role.skill_directory()
+            )
+        })?;
+        let standards = fs::read_to_string(self.skills_dir.join("standards/STANDARDS.md"))
+            .map_err(|error| format!("could not load lab standards: {error}"))?;
+
+        let worktree = lab_dir
+            .join("projects")
+            .join(&request.project_id)
+            .join("worktrees")
+            .join(&request.worktree_name);
+        let scratch_home = lab_dir
+            .join("scratch")
+            .join(&request.project_id)
+            .join(&request.worker_id);
+        if worktree.starts_with(&scratch_home) || scratch_home.starts_with(&worktree) {
+            return Err("role worktree and scratch home must be separate".to_string());
+        }
+
+        let relative_worktree = worktree
+            .strip_prefix(&lab_dir)
+            .map_err(|_| "role worktree is outside the lab".to_string())?;
+        let guest_worktree = Path::new("/lab").join(relative_worktree);
+        let relative_scratch = scratch_home
+            .strip_prefix(&lab_dir)
+            .map_err(|_| "role scratch home is outside the lab".to_string())?;
+        let guest_scratch = Path::new("/lab").join(relative_scratch);
+        let scope = build_role_scope(
+            request.role,
+            &request.project_id,
+            &lab_dir,
+            &worktree,
+            &guest_worktree,
+        )?
+        .with_scratch_home(guest_scratch);
+
+        let system_prompt = format!("{skill}\n\n---\n\n# Lab standards\n\n{standards}");
+        let argv = vec![
+            "claude".to_string(),
+            "-p".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--no-session-persistence".to_string(),
+            "--max-turns".to_string(),
+            request.max_turns.to_string(),
+            "--max-budget-usd".to_string(),
+            format!("{:.2}", request.max_budget_usd),
+            "--append-system-prompt".to_string(),
+            system_prompt,
+            request.prompt.clone(),
+        ];
+
+        Ok(RoleExecution {
+            role: request.role,
+            project_id: request.project_id.clone(),
+            worker_id: request.worker_id.clone(),
+            worktree,
+            scratch_home,
+            argv,
+            timeout: request.timeout,
+            scope,
+        })
+    }
+}
+
+fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > 64
+        || value == "."
+        || value == ".."
+        || !value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
+        return Err(format!(
+            "{name} must be 1 to 64 ASCII letters, digits, '-' or '_'"
+        ));
+    }
+    Ok(())
+}
+
+fn build_role_scope(
+    role: Role,
+    project: &str,
+    lab_dir: &Path,
+    worktree: &Path,
+    guest_worktree: &Path,
+) -> Result<ExecScope, String> {
+    let mut scope =
+        ExecScope::new(role.worktree_access(), guest_worktree).with_project(project.to_string());
+    let git_entry = worktree.join(".git");
+    let metadata = match fs::symlink_metadata(&git_entry) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(scope),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect role worktree git metadata: {error}"
+            ));
+        }
+    };
+
+    if metadata.is_dir() {
+        if scope.access == ScopeAccess::ReadWrite {
+            return Err(
+                "writable role worktrees must use linked git metadata so .git remains read-only"
+                    .to_string(),
+            );
+        }
+        return Ok(scope);
+    }
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err("role worktree .git must be a plain file or directory".to_string());
+    }
+
+    let pointer = fs::read_to_string(&git_entry)
+        .map_err(|error| format!("could not read role worktree git pointer: {error}"))?;
+    let git_dir = pointer
+        .trim()
+        .strip_prefix("gitdir: ")
+        .ok_or_else(|| "role worktree .git file has an invalid gitdir pointer".to_string())?;
+    let git_dir = Path::new(git_dir);
+    let git_dir = if git_dir.is_absolute() {
+        git_dir.to_path_buf()
+    } else {
+        worktree.join(git_dir)
+    };
+    let git_dir = fs::canonicalize(&git_dir)
+        .map_err(|error| format!("could not resolve role worktree git directory: {error}"))?;
+    if !git_dir.is_dir() || !git_dir.starts_with(lab_dir) {
+        return Err("role worktree git directory is outside the lab".to_string());
+    }
+
+    let common_dir_file = git_dir.join("commondir");
+    let common_dir = match fs::read_to_string(&common_dir_file) {
+        Ok(path) => {
+            let path = Path::new(path.trim());
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                git_dir.join(path)
+            };
+            fs::canonicalize(&path).map_err(|error| {
+                format!("could not resolve role worktree common git directory: {error}")
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => git_dir,
+        Err(error) => {
+            return Err(format!(
+                "could not read role worktree common git directory: {error}"
+            ));
+        }
+    };
+    if !common_dir.is_dir() {
+        return Err("role worktree common git directory is not a directory".to_string());
+    }
+    let relative_common_dir = common_dir
+        .strip_prefix(lab_dir)
+        .map_err(|_| "role worktree common git directory is outside the lab".to_string())?;
+    // Common git metadata is always mounted read-only; pushes and other outward actions use the broker.
+    scope = scope.with_common_dir(Path::new("/lab").join(relative_common_dir));
+    Ok(scope)
+}
+
+fn failed_launch(error: String) -> ChildRun {
+    ChildRun {
+        spawn_error: Some(error),
+        ..ChildRun::default()
+    }
+}
+
+impl RoleLaunchExecutor for ClaudeSandbox {
+    fn lab_dir(&self) -> Result<PathBuf, String> {
+        self.role_lab_dir()
+    }
+
+    fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String> {
+        self.audit_role_start(project, worker, role.skill_directory())
+    }
+
+    fn run_role(&self, execution: RoleExecution, kill: Option<&dyn KillSwitch>) -> ChildRun {
+        self.execute_role(execution, kill)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct RecordingExecutor {
+        lab_dir: PathBuf,
+        launches: Mutex<Vec<RoleExecution>>,
+        starts: Mutex<Vec<(String, String, Role)>>,
+    }
+
+    impl RoleLaunchExecutor for RecordingExecutor {
+        fn lab_dir(&self) -> Result<PathBuf, String> {
+            Ok(self.lab_dir.clone())
+        }
+
+        fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String> {
+            self.starts.lock().expect("start records").push((
+                project.to_string(),
+                worker.to_string(),
+                role,
+            ));
+            Ok(())
+        }
+
+        fn run_role(&self, execution: RoleExecution, _kill: Option<&dyn KillSwitch>) -> ChildRun {
+            self.launches
+                .lock()
+                .expect("launch records")
+                .push(execution);
+            ChildRun::default()
+        }
+    }
+
+    fn request(role: Role) -> RoleLaunch {
+        RoleLaunch {
+            role,
+            project_id: "project-a".to_string(),
+            worker_id: "worker-1".to_string(),
+            worktree_name: "task-1".to_string(),
+            prompt: "Do the assigned work".to_string(),
+            timeout: Duration::from_secs(120),
+            max_turns: 7,
+            max_budget_usd: 1.25,
+        }
+    }
+
+    #[test]
+    fn every_role_loads_its_skill_and_launches_with_full_allow_and_expected_scope() {
+        let lab = tempfile::tempdir().expect("lab directory");
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let worktree = lab.path().join("projects/project-a/worktrees/task-1");
+        let git_dir = lab
+            .path()
+            .join("projects/project-a/repository/.git/worktrees/task-1");
+        fs::create_dir_all(&worktree).expect("worktree");
+        fs::create_dir_all(&git_dir).expect("worktree git directory");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("git pointer");
+        fs::write(git_dir.join("commondir"), "../..\n").expect("common git directory");
+        let executor = RecordingExecutor {
+            lab_dir: lab.path().to_path_buf(),
+            ..RecordingExecutor::default()
+        };
+        let launcher = RoleLauncher::new(&skills_dir, &executor);
+        let roles = [
+            Role::LabCoordinator,
+            Role::CoCoordinator,
+            Role::Coder,
+            Role::Reviewer,
+            Role::Tester,
+            Role::GitCoder,
+            Role::WakeUp,
+        ];
+
+        for role in roles {
+            let result = launcher.launch(&request(role), None);
+            assert!(result.spawn_error.is_none());
+        }
+
+        let launches = executor.launches.lock().expect("launches");
+        assert_eq!(launches.len(), roles.len());
+        for (execution, role) in launches.iter().zip(roles) {
+            let skill =
+                fs::read_to_string(skills_dir.join(role.skill_directory()).join("SKILL.md"))
+                    .expect("role skill");
+            let standards =
+                fs::read_to_string(skills_dir.join("standards/STANDARDS.md")).expect("standards");
+            let system_prompt = execution.argv.get(9).expect("appended system prompt");
+            assert!(system_prompt.contains(&skill));
+            assert!(system_prompt.contains(&standards));
+            assert!(
+                execution
+                    .argv
+                    .contains(&"--dangerously-skip-permissions".to_string())
+            );
+            assert_eq!(
+                execution.argv.get(4).map(String::as_str),
+                Some("--max-turns")
+            );
+            assert_eq!(execution.argv.get(5).map(String::as_str), Some("7"));
+            assert_eq!(execution.argv.get(7).map(String::as_str), Some("1.25"));
+            assert_eq!(
+                execution.argv.get(8).map(String::as_str),
+                Some("--append-system-prompt")
+            );
+            assert_eq!(
+                execution.argv.last().map(String::as_str),
+                Some("Do the assigned work")
+            );
+            assert_eq!(
+                execution.scope.worktree.as_path(),
+                "/lab/projects/project-a/worktrees/task-1"
+            );
+            assert_eq!(
+                execution.scope.common_dir.as_deref(),
+                Some(Path::new("/lab/projects/project-a/repository/.git"))
+            );
+            assert_eq!(
+                execution.scope.scratch_home.as_deref(),
+                Some(Path::new("/lab/scratch/project-a/worker-1"))
+            );
+            assert_eq!(execution.scope.project.as_deref(), Some("project-a"));
+            assert_eq!(
+                execution.scope.access,
+                match role {
+                    Role::Coder | Role::GitCoder => ScopeAccess::ReadWrite,
+                    _ => ScopeAccess::ReadOnly,
+                }
+            );
+            assert_eq!(
+                execution.scratch_home,
+                lab.path().join("scratch/project-a/worker-1")
+            );
+        }
+        assert_eq!(executor.starts.lock().expect("starts").len(), roles.len());
+    }
+
+    #[test]
+    fn unsafe_path_identifiers_are_rejected_before_starting_a_role() {
+        let lab = tempfile::tempdir().expect("lab directory");
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let executor = RecordingExecutor {
+            lab_dir: lab.path().to_path_buf(),
+            ..RecordingExecutor::default()
+        };
+        let launcher = RoleLauncher::new(skills_dir, &executor);
+        let mut launch = request(Role::Coder);
+        launch.worktree_name = "../outside".to_string();
+
+        let result = launcher.launch(&launch, None);
+
+        assert!(result.spawn_error.is_some());
+        assert!(executor.launches.lock().expect("launches").is_empty());
+        assert!(executor.starts.lock().expect("starts").is_empty());
+    }
+
+    #[test]
+    fn missing_world_fails_closed_without_starting_claude() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let sandbox = ClaudeSandbox::new(temp.path().join("state"), "claude");
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let launcher = RoleLauncher::new(skills_dir, &sandbox);
+
+        let result = launcher.launch(&request(Role::Coder), None);
+
+        assert!(result.output.is_none());
+        assert!(result.spawn_error.as_deref().is_some_and(|error| {
+            error.contains("world is missing") || error.contains("world is destroyed")
+        }));
+    }
+}

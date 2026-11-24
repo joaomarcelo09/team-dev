@@ -52,6 +52,8 @@ pub struct ExecScope {
     pub git_dir: Option<PathBuf>,
     /// The repository's common git directory (`.git`).
     pub common_dir: Option<PathBuf>,
+    /// Host scratch home mounted read-write at `/tmp/home` for this exec.
+    pub scratch_home: Option<PathBuf>,
     /// The project whose cgroup and limits the exec shares.
     pub project: Option<String>,
     /// Limits for the project cgroup; only valid together with a project.
@@ -68,6 +70,7 @@ impl ExecScope {
             worktree: worktree.into(),
             git_dir: None,
             common_dir: None,
+            scratch_home: None,
             project: None,
             limits: None,
             tmp_bytes: None,
@@ -83,6 +86,12 @@ impl ExecScope {
     /// Set the repository's common git directory.
     pub fn with_common_dir(mut self, common_dir: impl Into<PathBuf>) -> Self {
         self.common_dir = Some(common_dir.into());
+        self
+    }
+
+    /// Set the scratch home mounted at `/tmp/home` inside this scoped exec.
+    pub fn with_scratch_home(mut self, scratch_home: impl Into<PathBuf>) -> Self {
+        self.scratch_home = Some(scratch_home.into());
         self
     }
 
@@ -117,6 +126,14 @@ impl ExecScope {
         }
         if let Some(common_dir) = &self.common_dir {
             validate_scope_path(common_dir, "scope common dir")?;
+        }
+        if let Some(scratch_home) = &self.scratch_home {
+            validate_scope_path(scratch_home, "scope scratch home")?;
+            if scratch_home.starts_with(&self.worktree) || self.worktree.starts_with(scratch_home) {
+                return Err(scope_error(
+                    "scope scratch home must be separate from the worktree".to_string(),
+                ));
+            }
         }
         match &self.project {
             Some(project) => validate_project_name(project)?,
@@ -260,6 +277,29 @@ mod tests {
             .with_git_dir("/lab/r/.git/worktrees/a")
             .with_common_dir("/lab/r/.git");
         assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn scratch_home_is_confined_to_the_lab_and_separate_from_worktree() {
+        let good =
+            scope("/lab/projects/a/worktrees/task").with_scratch_home("/lab/scratch/a/worker");
+        assert!(good.validate().is_ok());
+
+        for path in ["/etc/scratch", "/lab/../scratch"] {
+            assert!(
+                scope("/lab/projects/a/worktrees/task")
+                    .with_scratch_home(path)
+                    .validate()
+                    .is_err(),
+                "{path} must be rejected"
+            );
+        }
+        assert!(
+            scope("/lab/projects/a/worktrees/task")
+                .with_scratch_home("/lab/projects/a/worktrees/task/.scratch")
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
