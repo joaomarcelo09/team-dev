@@ -19,11 +19,14 @@ use jg_sandbox::{
 
 use crate::{
     child::{self, RuntimeLayout},
-    e2e::KillSwitch,
+    e2e::{KillSwitch, RunOutcome},
+    lab_world::{EndOfLifePolicy, LabWorld, LabWorldSpec, RunEnd},
     scratch::{ScratchHome, real_home},
 };
 
-const CLAUDE_EGRESS_HOSTS: [&str; 1] = ["api.anthropic.com"];
+#[cfg(test)]
+use crate::lab_world::CLAUDE_EGRESS_HOSTS;
+
 const LAB_WORK_DIR: &str = "work";
 const LAB_SCRATCH_DIR: &str = "scratch";
 const EXEC_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -31,7 +34,7 @@ const KILL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
 const SCRATCH_EXCLUDE: &str = "/.jgf-claude-home/";
 
 pub(crate) struct ClaudeSandbox {
-    state_dir: PathBuf,
+    world: LabWorld,
     binary: PathBuf,
     backend: NamespaceBackend,
     live: Mutex<Option<LiveSandbox>>,
@@ -39,7 +42,7 @@ pub(crate) struct ClaudeSandbox {
 
 struct LiveSandbox {
     handle: SandboxHandle,
-    proxy: EgressProxy,
+    proxy: Option<EgressProxy>,
     lab_dir: PathBuf,
     work_tree: PathBuf,
     scratch_root: PathBuf,
@@ -55,9 +58,36 @@ pub(crate) struct ChildRun {
 }
 
 impl ClaudeSandbox {
+    #[cfg(test)]
     pub(crate) fn new(state_dir: impl Into<PathBuf>, binary: impl Into<PathBuf>) -> Self {
+        let state_dir = state_dir.into();
+        let audit_dir = state_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| state_dir.clone());
+        let lab_id = state_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("claude-lab")
+            .to_string();
+        Self::new_with_audit(
+            state_dir,
+            binary,
+            audit_dir,
+            lab_id,
+            EndOfLifePolicy::KeepOnFailure,
+        )
+    }
+
+    pub(crate) fn new_with_audit(
+        state_dir: impl Into<PathBuf>,
+        binary: impl Into<PathBuf>,
+        audit_dir: impl Into<PathBuf>,
+        lab_id: impl Into<String>,
+        policy: EndOfLifePolicy,
+    ) -> Self {
         Self {
-            state_dir: state_dir.into(),
+            world: LabWorld::new(state_dir, audit_dir, lab_id, policy),
             binary: binary.into(),
             backend: NamespaceBackend::new(),
             live: Mutex::new(None),
@@ -66,6 +96,15 @@ impl ClaudeSandbox {
 
     pub(crate) fn scratch_dir(lab_dir: &Path) -> PathBuf {
         lab_dir.join(LAB_SCRATCH_DIR)
+    }
+
+    pub(crate) fn finish(&self, outcome: &RunOutcome) -> Result<(), String> {
+        let outcome = match outcome {
+            RunOutcome::Delivered => RunEnd::Success,
+            RunOutcome::Killed => RunEnd::Killed,
+            RunOutcome::Failed { .. } | RunOutcome::BudgetExhausted => RunEnd::Failure,
+        };
+        self.world.finish(outcome, || self.destroy())
     }
 
     /// Creates the one isolated world used by both Claude workers in this run.
@@ -93,21 +132,32 @@ impl ClaudeSandbox {
         if work_tree != lab_dir.join(LAB_WORK_DIR) {
             return Err("Claude work tree must be the lab's work directory".to_string());
         }
-        fs::create_dir_all(&self.state_dir).map_err(|error| {
+        let scratch_root = Self::scratch_dir(&lab_dir);
+        let created = self
+            .world
+            .create(&lab_dir, &work_tree, &scratch_root, |world_spec| {
+                self.create_world(world_spec)
+            })?;
+        *live = Some(created);
+        Ok(())
+    }
+
+    fn create_world(&self, world_spec: &LabWorldSpec) -> Result<LiveSandbox, String> {
+        debug_assert_eq!(world_spec.uid, 1000);
+        fs::create_dir_all(&world_spec.state_dir).map_err(|error| {
             format!(
                 "could not create jg-sandbox state directory at {}: {error}",
-                self.state_dir.display()
+                world_spec.state_dir.display()
             )
         })?;
-        let state_dir = fs::canonicalize(&self.state_dir).map_err(|error| {
+        let state_dir = fs::canonicalize(&world_spec.state_dir).map_err(|error| {
             format!(
                 "could not resolve jg-sandbox state directory at {}: {error}",
-                self.state_dir.display()
+                world_spec.state_dir.display()
             )
         })?;
-        child::validate_git_directory(&work_tree)?;
-        let scratch_root = Self::scratch_dir(&lab_dir);
-        prepare_scratch_exclude(&work_tree)?;
+        child::validate_git_directory(&world_spec.work_tree)?;
+        prepare_scratch_exclude(&world_spec.work_tree)?;
         let host_home = real_home().map_err(|error| error.to_string())?;
         let host_home = fs::canonicalize(&host_home).map_err(|error| {
             format!(
@@ -127,31 +177,35 @@ impl ClaudeSandbox {
         }
         fs::DirBuilder::new()
             .mode(0o700)
-            .create(&scratch_root)
+            .create(&world_spec.scratch_home)
             .map_err(|error| {
                 format!(
                     "could not create Claude scratch directory at {}: {error}",
-                    scratch_root.display()
+                    world_spec.scratch_home.display()
                 )
             })?;
 
         let created = (|| {
             let proxy_path = state_dir.join("egress.sock");
-            let policy = EgressPolicy::with_ports(CLAUDE_EGRESS_HOSTS, [443])
-                .map_err(|error| format!("invalid Claude egress allowlist: {error}"))?;
+            let policy = EgressPolicy::with_ports(
+                world_spec.egress_hosts.iter().copied(),
+                world_spec.egress_ports.iter().copied(),
+            )
+            .map_err(|error| format!("invalid Claude egress allowlist: {error}"))?;
             let proxy = EgressProxy::start(&proxy_path, policy, Arc::new(log_egress))
                 .map_err(|error| format!("could not start the jg-sandbox egress proxy: {error}"))?;
             let runtime = child::runtime_layout(
                 &self.binary,
                 &state_dir,
-                &work_tree,
-                &scratch_root,
+                &world_spec.work_tree,
+                &world_spec.scratch_home,
                 &host_home,
             )?;
             let spec = build_sandbox_spec(
                 &state_dir,
-                &lab_dir,
-                &work_tree,
+                &world_spec.lab_dir,
+                &world_spec.work_tree,
+                &world_spec.read_only_git,
                 &credentials_file,
                 &proxy,
                 &runtime,
@@ -163,22 +217,19 @@ impl ClaudeSandbox {
 
             Ok(LiveSandbox {
                 handle,
-                proxy,
-                lab_dir,
-                work_tree,
-                scratch_root: scratch_root.clone(),
+                proxy: Some(proxy),
+                lab_dir: world_spec.lab_dir.clone(),
+                work_tree: world_spec.work_tree.clone(),
+                scratch_root: world_spec.scratch_home.clone(),
                 credentials_file,
                 runtime,
             })
         })();
         match created {
-            Ok(world) => {
-                *live = Some(world);
-                Ok(())
-            }
+            Ok(world) => Ok(world),
             Err(error) => {
                 let state_cleanup = fs::remove_dir(&state_dir);
-                let scratch_cleanup = fs::remove_dir(&scratch_root);
+                let scratch_cleanup = fs::remove_dir(&world_spec.scratch_home);
                 if let Err(cleanup) = state_cleanup
                     && cleanup.kind() != std::io::ErrorKind::NotFound
                 {
@@ -267,10 +318,16 @@ impl ClaudeSandbox {
             };
         }
         if kill.is_some_and(|kill| kill.killed()) {
-            return ChildRun {
+            drop(live_guard);
+            let destroy_error = self.world.finish(RunEnd::Killed, || self.destroy()).err();
+            let mut result = ChildRun {
                 killed: true,
                 ..ChildRun::default()
             };
+            if let Some(error) = destroy_error {
+                result.spawn_error = Some(format!("could not stop jg-sandbox after kill: {error}"));
+            }
+            return result;
         }
 
         if scratch.credentials_file() != live.credentials_file {
@@ -300,6 +357,13 @@ impl ClaudeSandbox {
         let handle = live.handle.clone();
         let backend = self.backend;
         drop(live_guard);
+        if let Err(error) = self.world.start_run() {
+            return ChildRun {
+                spawn_error: Some(error),
+                ..ChildRun::default()
+            };
+        }
+        let _running = RunningWorld(&self.world);
 
         let (sender, receiver) = mpsc::sync_channel(1);
         thread::spawn(move || {
@@ -333,7 +397,8 @@ impl ClaudeSandbox {
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if kill.is_some_and(|kill| kill.killed()) {
-                        let destroy_error = self.destroy().err();
+                        let destroy_error =
+                            self.world.finish(RunEnd::Killed, || self.destroy()).err();
                         let _ = receiver.recv_timeout(KILL_WAIT_TIMEOUT);
                         let mut result = ChildRun {
                             killed: true,
@@ -352,53 +417,74 @@ impl ClaudeSandbox {
 
     /// Destroys the world and removes the private child home; safe to call more than once.
     pub(crate) fn destroy(&self) -> Result<(), String> {
-        let live = self
-            .live
-            .lock()
-            .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?
-            .take();
-        let Some(live) = live else {
-            return Ok(());
-        };
-        let result = self
-            .backend
-            .destroy(&live.handle)
-            .map_err(|error| format!("could not destroy jg-sandbox world: {error}"));
-        drop(live.proxy);
-        let state_result = match fs::remove_dir(live.handle.state_dir()) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!(
-                "could not remove jg-sandbox state directory at {}: {error}",
-                live.handle.state_dir().display()
-            )),
-        };
-        let scratch_result = match fs::symlink_metadata(&live.scratch_root) {
-            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
-                fs::remove_dir_all(&live.scratch_root).map_err(|error| {
-                    format!(
-                        "could not remove Claude scratch home at {}: {error}",
-                        live.scratch_root.display()
-                    )
-                })
-            }
-            Ok(_) => Err(format!(
-                "refusing to remove unexpected Claude scratch path {}",
-                live.scratch_root.display()
-            )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!(
-                "could not inspect Claude scratch home at {}: {error}",
-                live.scratch_root.display()
-            )),
-        };
-        result.and(state_result).and(scratch_result)
+        self.world.destroy(|| {
+            let mut live = self
+                .live
+                .lock()
+                .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
+            let Some(active) = live.as_mut() else {
+                return Ok(());
+            };
+            let state_dir = active.handle.state_dir().to_path_buf();
+            let result = self
+                .backend
+                .destroy(&active.handle)
+                .map_err(|error| format!("could not destroy jg-sandbox world: {error}"));
+            cleanup_after_destroy(result, &mut active.proxy, &state_dir, &active.scratch_root)
+        })
+    }
+}
+
+fn cleanup_after_destroy(
+    result: Result<(), String>,
+    proxy: &mut Option<EgressProxy>,
+    state_dir: &Path,
+    scratch_root: &Path,
+) -> Result<(), String> {
+    drop(proxy.take());
+
+    let state_result = match fs::remove_dir(state_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not remove jg-sandbox state directory at {}: {error}",
+            state_dir.display()
+        )),
+    };
+    let scratch_result = match fs::symlink_metadata(scratch_root) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+            fs::remove_dir_all(scratch_root).map_err(|error| {
+                format!(
+                    "could not remove Claude scratch home at {}: {error}",
+                    scratch_root.display()
+                )
+            })
+        }
+        Ok(_) => Err(format!(
+            "refusing to remove unexpected Claude scratch path {}",
+            scratch_root.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "could not inspect Claude scratch home at {}: {error}",
+            scratch_root.display()
+        )),
+    };
+
+    result.and(state_result).and(scratch_result)
+}
+
+struct RunningWorld<'a>(&'a LabWorld);
+
+impl Drop for RunningWorld<'_> {
+    fn drop(&mut self) {
+        self.0.end_run();
     }
 }
 
 impl Drop for ClaudeSandbox {
     fn drop(&mut self) {
-        let _ = self.destroy();
+        let _ = self.world.destroy_if_not_kept(|| self.destroy());
     }
 }
 
@@ -406,7 +492,7 @@ impl fmt::Debug for ClaudeSandbox {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ClaudeSandbox")
-            .field("state_dir", &self.state_dir)
+            .field("state_dir", &self.world.state_dir())
             .field("binary", &self.binary)
             .finish_non_exhaustive()
     }
@@ -416,6 +502,7 @@ fn build_sandbox_spec(
     state_dir: &Path,
     lab_dir: &Path,
     work_tree: &Path,
+    read_only_git: &Path,
     credentials_file: &Path,
     proxy: &EgressProxy,
     runtime: &RuntimeLayout,
@@ -434,7 +521,7 @@ fn build_sandbox_spec(
     ro_binds.sort();
     ro_binds.dedup();
     spec.ro_binds = ro_binds;
-    spec.lab_ro_binds.push(work_tree.join(".git"));
+    spec.lab_ro_binds.push(read_only_git.to_path_buf());
     spec.egress = Some(EgressSpec::new(proxy.socket_path()));
     spec.validate()
         .map_err(|error| format!("invalid Claude jg-sandbox spec: {error}"))?;
@@ -572,6 +659,7 @@ mod tests {
             &state_dir,
             &lab_dir,
             &work_tree,
+            &git,
             &credentials,
             &proxy,
             &runtime,
@@ -673,6 +761,32 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("refusing to run Claude unsandboxed"))
         );
+    }
+
+    #[test]
+    fn backend_destroy_failure_still_drops_proxy_and_removes_scratch_home() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state_dir = temp.path().join("state");
+        let scratch_root = temp.path().join("scratch");
+        let socket_path = temp.path().join("egress.sock");
+        fs::create_dir(&state_dir).expect("state directory");
+        fs::create_dir_all(scratch_root.join("home")).expect("scratch home");
+        let policy = EgressPolicy::with_ports(CLAUDE_EGRESS_HOSTS, [443]).expect("policy");
+        let mut proxy =
+            Some(EgressProxy::start(&socket_path, policy, Arc::new(|_| {})).expect("proxy"));
+
+        let result = cleanup_after_destroy(
+            Err("backend destroy failed".to_string()),
+            &mut proxy,
+            &state_dir,
+            &scratch_root,
+        );
+
+        assert_eq!(result, Err("backend destroy failed".to_string()));
+        assert!(proxy.is_none());
+        assert!(!socket_path.exists());
+        assert!(!state_dir.exists());
+        assert!(!scratch_root.exists());
     }
 
     #[test]
