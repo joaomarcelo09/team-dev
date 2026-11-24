@@ -13,6 +13,17 @@ rule, the replacement and the reason. A silent difference from this pack is a re
 - Apply the checklists as written; do not invent extra architecture around them.
 - The tester derives checks from the spec, not from this pack. The reviewer checks this pack.
 
+## Versioning
+
+- [ ] The pack follows Semantic Versioning (`MAJOR.MINOR.PATCH`); the current version is in
+      `VERSION`, next to this file.
+- [ ] Bump `MAJOR` when an existing project can no longer comply without a change of its own,
+      `MINOR` when a rule or a required section is added, and `PATCH` for wording or
+      clarifications that change no rule.
+- [ ] Any change to a rule updates `VERSION` in the same change.
+- [ ] Templates record the pack version they follow in `factory-templates/STANDARDS_VERSION` and
+      name it in their README; a pack bump updates that file too.
+
 ## Design system
 
 - [ ] Shared design tokens for color, spacing, type, radius and dark/light, as a Tailwind theme
