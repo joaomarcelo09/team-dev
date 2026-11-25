@@ -4,6 +4,7 @@ pub mod broker;
 mod child;
 pub mod coder;
 pub mod e2e;
+pub mod lab_runtime;
 mod lab_world;
 pub mod mail;
 pub mod reviewer;

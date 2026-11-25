@@ -670,6 +670,31 @@ impl Scheduler {
         })
     }
 
+    /// Starts the next eligible review only if it matches `ticket`.
+    ///
+    /// Unlike [`Scheduler::start_review`], this leaves the queue unchanged when a concurrent
+    /// scheduler update makes another review eligible first.
+    pub fn start_review_if_next(&self, ticket: &ReviewTicket) -> Result<bool, SchedulerError> {
+        self.mutate(|state| {
+            if state.switch != Switch::Running || state.running_review.is_some() {
+                return Ok(false);
+            }
+            let Some(index) = state
+                .reviews
+                .iter()
+                .position(|queued| !project_has_coder(state, &queued.project))
+            else {
+                return Ok(false);
+            };
+            if state.reviews[index] != *ticket {
+                return Ok(false);
+            }
+            let ticket = state.reviews.remove(index);
+            state.running_review = Some(ticket);
+            Ok(true)
+        })
+    }
+
     /// Finishes the running review and returns it, when one was running.
     pub fn finish_review(&self) -> Result<Option<ReviewTicket>, SchedulerError> {
         self.mutate(|state| Ok(state.running_review.take()))
@@ -1369,6 +1394,63 @@ mod tests {
         scheduler.release(alpha_coder.id).expect("release");
         let alpha = scheduler.start_review().expect("start").expect("granted");
         assert_eq!(alpha.project, project("alpha"));
+    }
+
+    #[test]
+    fn start_review_if_next_does_not_start_a_different_eligible_ticket() {
+        let root = TempRoot::new();
+        let scheduler = open(&root);
+        let alpha = scheduler
+            .request_review(project("alpha"), "ALPHA-1")
+            .expect("queue alpha");
+        let beta = scheduler
+            .request_review(project("beta"), "BETA-1")
+            .expect("queue beta");
+        let alpha_coder = granted(
+            scheduler
+                .acquire_coder(project("alpha"), "backend")
+                .expect("acquire alpha coder"),
+        );
+
+        assert!(
+            !scheduler
+                .start_review_if_next(&alpha)
+                .expect("alpha is no longer eligible")
+        );
+        assert!(
+            scheduler
+                .running_review()
+                .expect("running review")
+                .is_none()
+        );
+        assert_eq!(
+            scheduler.review_queue().expect("queue"),
+            [alpha.clone(), beta.clone()]
+        );
+
+        assert!(
+            scheduler
+                .start_review_if_next(&beta)
+                .expect("beta is next eligible")
+        );
+        assert_eq!(
+            scheduler.running_review().expect("running review"),
+            Some(beta.clone())
+        );
+        assert_eq!(
+            scheduler.review_queue().expect("queue").as_slice(),
+            std::slice::from_ref(&alpha)
+        );
+        assert_eq!(scheduler.finish_review().expect("finish beta"), Some(beta));
+
+        scheduler
+            .release(alpha_coder.id)
+            .expect("release alpha coder");
+        assert!(scheduler.start_review_if_next(&alpha).expect("start alpha"));
+        assert_eq!(
+            scheduler.finish_review().expect("finish alpha"),
+            Some(alpha)
+        );
     }
 
     #[test]
