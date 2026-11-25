@@ -558,6 +558,25 @@ impl Router {
         Ok(acked)
     }
 
+    /// Marks messages through `message_id` as read without acknowledging later deliveries.
+    ///
+    /// This is useful when a consumer processes a snapshot while new messages may arrive.
+    pub fn ack_through(&self, role: &Role, message_id: u64) -> Result<usize, RoutingError> {
+        role.validate()?;
+        let _lock = self.lock_exclusive()?;
+        let messages = self.read_messages(role)?;
+        let cursor = self.read_cursor(role, messages.len())?;
+        let Some(index) = messages.iter().position(|message| message.id == message_id) else {
+            return Ok(0);
+        };
+        let target = index + 1;
+        if target <= cursor {
+            return Ok(0);
+        }
+        self.write_cursor(role, target)?;
+        Ok(target - cursor)
+    }
+
     /// Whether the Lab Coordinator has an unread wake message.
     ///
     /// Only the Lab Coordinator's inbox has a wake notion; every other role
@@ -1569,6 +1588,37 @@ mod tests {
             .expect("third");
         assert_eq!(third.id, 3);
         assert_eq!(reopened.inbox(&lab()).expect("inbox")[0].id, third.id);
+    }
+
+    #[test]
+    fn ack_through_preserves_messages_delivered_after_the_snapshot() {
+        let root = TempRoot::new();
+        let router = open(&root);
+        router
+            .send(draft(user(), lab(), MessageKind::UserRequest))
+            .expect("first");
+        let second = router
+            .send(draft(user(), lab(), MessageKind::UserRequest))
+            .expect("second");
+        let snapshot_last_id = second.id;
+
+        let third = router
+            .send(draft(user(), lab(), MessageKind::UserRequest))
+            .expect("third");
+
+        assert_eq!(
+            router.ack_through(&lab(), snapshot_last_id).expect("ack"),
+            2
+        );
+        assert_eq!(
+            router
+                .inbox(&lab())
+                .expect("unread after snapshot ack")
+                .iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>(),
+            [third.id]
+        );
     }
 
     #[test]

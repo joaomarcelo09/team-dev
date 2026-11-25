@@ -20,11 +20,31 @@ use crate::{
 pub trait RoleLaunchService {
     /// Starts the prepared role and waits for its child to finish.
     fn launch(&self, request: &RoleLaunch, kill: Option<&dyn KillSwitch>) -> ChildRun;
+
+    /// Starts a session-persistent role, optionally resuming the supplied Claude session.
+    fn launch_with_session(
+        &self,
+        request: &RoleLaunch,
+        resume_session: Option<&str>,
+        kill: Option<&dyn KillSwitch>,
+    ) -> ChildRun {
+        let _ = resume_session;
+        self.launch(request, kill)
+    }
 }
 
 impl RoleLaunchService for RoleLauncher<'_> {
     fn launch(&self, request: &RoleLaunch, kill: Option<&dyn KillSwitch>) -> ChildRun {
         RoleLauncher::launch(self, request, kill)
+    }
+
+    fn launch_with_session(
+        &self,
+        request: &RoleLaunch,
+        resume_session: Option<&str>,
+        kill: Option<&dyn KillSwitch>,
+    ) -> ChildRun {
+        RoleLauncher::launch_with_session(self, request, resume_session, kill)
     }
 }
 
@@ -81,6 +101,9 @@ pub enum LabRuntimeError {
         /// Required role name.
         expected: &'static str,
     },
+    /// The scheduler has not granted this project a team slot.
+    #[error("the scheduler has not granted project {0}")]
+    ProjectNotGranted(String),
     /// The launch request does not contain a valid project identifier.
     #[error("invalid project identifier: {0}")]
     InvalidProject(#[source] ModelError),
@@ -121,6 +144,69 @@ impl<L: RoleLaunchService> LabRuntime<L> {
     /// The scheduler can be configured by the lab coordinator before launches begin.
     pub fn scheduler(&self) -> &Scheduler {
         &self.scheduler
+    }
+
+    /// Starts a Lab Coordinator turn only while the lab scheduler allows new work.
+    pub fn launch_coordinator(
+        &self,
+        request: &RoleLaunch,
+        resume_session: Option<&str>,
+        kill: Option<&dyn KillSwitch>,
+    ) -> Result<ChildRun, LabRuntimeError> {
+        if request.role != Role::LabCoordinator {
+            return Err(LabRuntimeError::WrongRole {
+                expected: "lab coordinator",
+            });
+        }
+        let switch = self.scheduler.switch()?;
+        if switch != Switch::Running {
+            let error = match switch {
+                Switch::Paused => SchedulerError::Paused,
+                Switch::Killed => SchedulerError::Killed,
+                Switch::Running => unreachable!("switch checked above"),
+            };
+            return Err(self.map_scheduler_error(
+                error,
+                "coordinator_launch",
+                Some(&request.project_id),
+                Some(&request.worker_id),
+            )?);
+        }
+        Ok(self
+            .launcher
+            .launch_with_session(request, resume_session, kill))
+    }
+
+    /// Starts a Co-coordinator turn only for a project granted by the scheduler.
+    pub fn launch_co_coordinator(
+        &self,
+        request: &RoleLaunch,
+        project_id: &str,
+        resume_session: Option<&str>,
+        kill: Option<&dyn KillSwitch>,
+    ) -> Result<ChildRun, LabRuntimeError> {
+        if request.role != Role::CoCoordinator || request.project_id != project_id {
+            return Err(LabRuntimeError::WrongRole {
+                expected: "co-coordinator",
+            });
+        }
+        let project = ProjectId::parse(project_id).map_err(LabRuntimeError::InvalidProject)?;
+        match self.scheduler.switch()? {
+            Switch::Running => {}
+            Switch::Paused => return Err(LabRuntimeError::Paused),
+            Switch::Killed => return Err(LabRuntimeError::Killed),
+        }
+        let has_slot = self
+            .scheduler
+            .coder_slots()?
+            .iter()
+            .any(|slot| slot.project == project);
+        if !has_slot && self.scheduler.next_to_start()?.as_ref() != Some(&project) {
+            return Err(LabRuntimeError::ProjectNotGranted(project_id.to_string()));
+        }
+        Ok(self
+            .launcher
+            .launch_with_session(request, resume_session, kill))
     }
 
     /// Acquires a coder slot before invoking the launcher.

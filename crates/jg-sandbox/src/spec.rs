@@ -106,6 +106,9 @@ pub struct SandboxSpec {
     pub state_dir: PathBuf,
     /// Host directory bind-mounted read-write at `/lab`.
     pub lab_dir: PathBuf,
+    /// Host projects directory bind-mounted at `/font` for scoped execs.
+    #[serde(default)]
+    pub font_dir: Option<PathBuf>,
     /// Host paths bind-mounted read-only at the same path inside the sandbox.
     pub ro_binds: Vec<PathBuf>,
     /// Directories inside the read-write lab that are over-mounted read-only
@@ -148,6 +151,7 @@ impl SandboxSpec {
         Self {
             state_dir: state_dir.into(),
             lab_dir: lab_dir.into(),
+            font_dir: None,
             ro_binds: default_ro_binds(),
             lab_ro_binds: Vec::new(),
             allowed_sockets: Vec::new(),
@@ -170,6 +174,9 @@ impl SandboxSpec {
             )));
         }
         validate_dir(&self.lab_dir, "lab dir")?;
+        if let Some(font_dir) = &self.font_dir {
+            validate_font_dir(font_dir)?;
+        }
 
         if path_is_root(&self.state_dir) {
             return Err(SandboxError::invalid("state dir must not be /"));
@@ -307,6 +314,24 @@ fn validate_dir(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_font_dir(path: &Path) -> Result<()> {
+    validate_path(path, "font dir")?;
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            SandboxError::invalid(format!("font dir {} does not exist", path.display()))
+        } else {
+            SandboxError::io(path, source)
+        }
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(SandboxError::invalid(format!(
+            "font dir {} must be a plain directory",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_path(path: &Path, what: &str) -> Result<()> {
     if !path.is_absolute() {
         return Err(SandboxError::invalid(format!(
@@ -435,7 +460,25 @@ mod tests {
         assert_eq!(spec.cgroup_parent, None);
         assert_eq!(spec.egress, None);
         assert_eq!(spec.hub_socket, None);
+        assert_eq!(spec.font_dir, None);
         assert!(spec.lab_ro_binds.is_empty());
+    }
+
+    #[test]
+    fn font_dir_must_be_a_plain_host_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab = temp.path().join("lab");
+        let font = temp.path().join("font");
+        std::fs::create_dir_all(&lab).expect("lab directory");
+        std::fs::create_dir(&font).expect("font directory");
+        let mut spec = SandboxSpec::new(temp.path().join("state"), &lab);
+        spec.font_dir = Some(font.clone());
+        assert!(spec.validate().is_ok());
+
+        let link = temp.path().join("font-link");
+        std::os::unix::fs::symlink(&font, &link).expect("font symlink");
+        spec.font_dir = Some(link);
+        assert!(spec.validate().is_err());
     }
 
     #[test]

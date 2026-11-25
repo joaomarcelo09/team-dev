@@ -2,17 +2,21 @@
 //! only the worktree (at `/workspace`), its git metadata and a private `/tmp`
 //! are visible.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::{
+    fd::{AsRawFd, OwnedFd},
+    unix::fs::MetadataExt,
+};
 use std::path::{Path, PathBuf};
 
 use nix::fcntl::{OFlag, open};
+use nix::mount::{MntFlags, umount2};
 use nix::sched::{CloneFlags, unshare};
-use nix::sys::stat::Mode;
+use nix::sys::stat::{Mode, fstat};
 
 use crate::error::{Result, SandboxError};
 use crate::namespace::util;
 use crate::scope::{
-    ExecScope, LAB_ROOT, SCOPED_HOME, ScopeAccess, TMP_DIR, WORKSPACE, is_below_lab,
+    ExecScope, FONT_ROOT, LAB_ROOT, SCOPED_HOME, ScopeAccess, TMP_DIR, WORKSPACE, is_below_lab,
 };
 
 /// Replace the lab-wide view of the current process with the scoped one.
@@ -23,6 +27,7 @@ use crate::scope::{
 pub(crate) fn enter_scope(scope: &ExecScope) -> Result<()> {
     scope.validate()?;
     let scratch_home = open_scratch_home(scope)?;
+    let font_project = open_font_project(scope)?;
     unshare(CloneFlags::CLONE_NEWNS)
         .map_err(|source| SandboxError::nix("unshare scoped mount namespace", source))?;
     // The new namespace must not propagate mounts back to the sandbox.
@@ -44,6 +49,7 @@ pub(crate) fn enter_scope(scope: &ExecScope) -> Result<()> {
         util::verify_read_only_tree(workspace)?;
     }
     cover_lab(&git_mounts, scope.access)?;
+    apply_font_access(scope.font_access, font_project)?;
     mount_private_tmp(scope)?;
     mount_scratch_home(scratch_home)
 }
@@ -96,6 +102,59 @@ struct GitMount {
     /// The source, opened before the cover hides it.
     source: OwnedFd,
     writable: bool,
+}
+
+struct FontProjectMount {
+    target: PathBuf,
+    source_path: PathBuf,
+    _source: OwnedFd,
+}
+
+fn open_font_project(scope: &ExecScope) -> Result<Option<FontProjectMount>> {
+    let Some(project) = scope.font_project.as_deref() else {
+        return Ok(None);
+    };
+    let font = Path::new(FONT_ROOT);
+    let font_metadata =
+        std::fs::symlink_metadata(font).map_err(|source| SandboxError::io(font, source))?;
+    if !font_metadata.is_dir() || font_metadata.file_type().is_symlink() {
+        return Err(scope_error(format!(
+            "{} is not a plain directory",
+            font.display()
+        )));
+    }
+    let target = font.join(project);
+    let metadata =
+        std::fs::symlink_metadata(&target).map_err(|source| SandboxError::io(&target, source))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(scope_error(format!(
+            "font project {} is not a plain directory",
+            target.display()
+        )));
+    }
+    let canonical_font =
+        std::fs::canonicalize(font).map_err(|source| SandboxError::io(font, source))?;
+    let canonical_target =
+        std::fs::canonicalize(&target).map_err(|source| SandboxError::io(&target, source))?;
+    if canonical_target.parent() != Some(canonical_font.as_path()) {
+        return Err(scope_error(format!(
+            "font project {} escapes {}",
+            target.display(),
+            font.display()
+        )));
+    }
+    let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+    let source = open(&canonical_target, flags, Mode::empty()).map_err(|errno| {
+        scope_error(format!(
+            "open font project {}: {errno}",
+            canonical_target.display()
+        ))
+    })?;
+    Ok(Some(FontProjectMount {
+        target,
+        source_path: canonical_target,
+        _source: source,
+    }))
 }
 
 /// Resolve and open the git directories while the whole lab is still visible.
@@ -200,6 +259,64 @@ fn cover_lab(git_mounts: &[GitMount], access: ScopeAccess) -> Result<()> {
         mount_git(git, access)?;
     }
     Ok(())
+}
+
+/// Apply the role's project-directory access inside its private mount namespace.
+fn apply_font_access(access: Option<ScopeAccess>, project: Option<FontProjectMount>) -> Result<()> {
+    let font = Path::new(FONT_ROOT);
+    let metadata =
+        std::fs::symlink_metadata(font).map_err(|source| SandboxError::io(font, source))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(scope_error(format!(
+            "{} is not a plain directory",
+            font.display()
+        )));
+    }
+
+    if let Some(project) = project {
+        let target = &project.target;
+        let staging = Path::new(TMP_DIR).join(".jgf-font-project");
+        std::fs::create_dir(&staging).map_err(|source| SandboxError::io(&staging, source))?;
+        let pinned = fstat(&project._source)
+            .map_err(|source| SandboxError::nix("inspect font project", source))?;
+        let current = std::fs::metadata(&project.source_path)
+            .map_err(|source| SandboxError::io(&project.source_path, source))?;
+        if pinned.st_dev as u64 != current.dev() || pinned.st_ino as u64 != current.ino() {
+            return Err(scope_error(
+                "font project changed while preparing its scoped mount".to_string(),
+            ));
+        }
+        util::bind_non_recursive(&project.source_path, &staging)?;
+        util::mount_tmpfs(font, "mode=0755,size=64k")?;
+        std::fs::create_dir_all(target).map_err(|source| SandboxError::io(target, source))?;
+        util::bind_non_recursive(&staging, target)?;
+        umount2(&staging, MntFlags::MNT_DETACH)
+            .map_err(|source| SandboxError::nix("unmount staged font project", source))?;
+        std::fs::remove_dir(&staging).map_err(|source| SandboxError::io(&staging, source))?;
+        util::remount_read_only_keeping_flags(font)?;
+        util::verify_read_only(font)?;
+        if access == Some(ScopeAccess::ReadOnly) {
+            util::remount_read_only_keeping_flags(target)?;
+            util::verify_read_only(target)?;
+        }
+        return Ok(());
+    }
+
+    match access {
+        Some(ScopeAccess::ReadWrite) => Ok(()),
+        Some(ScopeAccess::ReadOnly) => {
+            util::remount_read_only_keeping_flags(font)?;
+            util::verify_read_only(font)?;
+            // The rootfs binds /font non-recursively, so it has no inherited submounts.
+            Ok(())
+        }
+        None => {
+            util::mount_tmpfs(font, "mode=0555,size=64k")?;
+            util::remount_read_only_keeping_flags(font)?;
+            util::verify_read_only(font)?;
+            Ok(())
+        }
+    }
 }
 
 fn mount_git(git: &GitMount, access: ScopeAccess) -> Result<()> {

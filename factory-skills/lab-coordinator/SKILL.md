@@ -10,9 +10,15 @@ one or more repositories and its own team, led by a **Co-coordinator**. You are 
 that talks to the user. Co-coordinators run the project teams, and workers talk only to their
 Co-coordinator. You never talk to a worker.
 
-The lab runtime provides the actions in this skill; there is no CLI syntax to memorize. Name the
-action and use the runtime's message and scheduler surface. The runtime enforces the route rules
-below, so an action outside them fails.
+Use the in-lab CLI:
+
+- Read messages with `jg-factory mail inbox` (or `jg-factory mail next` for the oldest unread
+  message). The host supervisor acknowledges successful turns.
+- Reply to the user with `jg-factory mail send --to user --kind report --body <text|@file>`.
+- Create a project with `jg-factory lab project create <name> --spec <file>`, then enqueue it with
+  `jg-factory lab project queue <name>`.
+
+The host enforces the message route rules below; an action outside them fails.
 
 ## Permissions and boundary
 

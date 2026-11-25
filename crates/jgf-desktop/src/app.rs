@@ -10,6 +10,7 @@
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -28,7 +29,7 @@ use jgf_desktop::{
     settings_view::{
         FieldEdit, SettingsForm, SettingsRow, apply_edit, effort_options, harness_options,
     },
-    snapshot::{LabSnapshot, ROLES_FILE},
+    snapshot::{CoordinatorState, LAB_ID, LabSnapshot, ROLES_FILE},
 };
 use jgf_hub::{MessageKind, OutgoingMessage, Role, Router};
 
@@ -39,6 +40,16 @@ const TICK_SECS: u64 = 2;
 
 /// Routing store directory under the data directory, passed to `Router::open`.
 const ROUTING_DIR: &str = "routing";
+
+type CoordinatorSpawner =
+    Box<dyn Fn(PathBuf, String, CoordinatorAction) -> Result<(), String> + Send + Sync>;
+
+/// A request to start or stop the Lab Coordinator supervisor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoordinatorAction {
+    Start,
+    Stop,
+}
 
 /// The four sections of the shell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +112,10 @@ pub enum Message {
     SettingsSaveFinished(Result<(), String>, RoleConfig),
     /// The Settings Revert button was pressed.
     SettingsRevertPressed,
+    /// The coordinator Start button was pressed.
+    CoordinatorStartPressed,
+    /// The coordinator Stop button was pressed.
+    CoordinatorStopPressed,
 }
 
 /// The window state: the active tab, the latest snapshot and the chat draft.
@@ -133,6 +148,10 @@ pub struct App {
     pub settings_saved: bool,
     /// Whether a save is in flight.
     pub saving_settings: bool,
+    /// Error from the latest coordinator command, shown in the Chat status line.
+    coordinator_error: Option<String>,
+    /// Function used to invoke the coordinator CLI; replaceable in tests.
+    coordinator_spawner: CoordinatorSpawner,
 }
 
 impl App {
@@ -147,6 +166,13 @@ impl App {
 
     /// Builds the window state around an already loaded snapshot.
     pub fn from_snapshot(snapshot: LabSnapshot) -> Self {
+        Self::from_snapshot_with_spawner(snapshot, Box::new(spawn_coordinator))
+    }
+
+    fn from_snapshot_with_spawner(
+        snapshot: LabSnapshot,
+        coordinator_spawner: CoordinatorSpawner,
+    ) -> Self {
         Self {
             tab: Tab::Chat,
             errors_visible: !snapshot.errors.is_empty(),
@@ -162,6 +188,8 @@ impl App {
             settings_error: None,
             settings_saved: false,
             saving_settings: false,
+            coordinator_error: None,
+            coordinator_spawner,
         }
     }
 
@@ -247,7 +275,16 @@ impl App {
                 self.revert_settings();
                 Task::none()
             }
+            Message::CoordinatorStartPressed => self.coordinator_command(CoordinatorAction::Start),
+            Message::CoordinatorStopPressed => self.coordinator_command(CoordinatorAction::Stop),
         }
+    }
+
+    /// Invokes the supervisor command without taking over chat input or the polling loop.
+    fn coordinator_command(&mut self, action: CoordinatorAction) -> Task<Message> {
+        self.coordinator_error =
+            (self.coordinator_spawner)(self.data_dir.clone(), LAB_ID.to_string(), action).err();
+        Task::none()
     }
 
     /// Validates the draft and starts a background send; a second press is ignored.
@@ -488,11 +525,31 @@ impl App {
             }
         }
 
+        let mut co_coordinators = column![].spacing(4).width(Fill);
+        for coordinator in &self.snapshot.co_coordinators {
+            if coordinator.coordinator.state == CoordinatorState::Stopped {
+                continue;
+            }
+            let state = match coordinator.coordinator.state {
+                CoordinatorState::Running => "running",
+                CoordinatorState::Idle => "idle",
+                CoordinatorState::Backoff => "backing off",
+                CoordinatorState::Stopped => "stopped",
+            };
+            let mut line = format!("Co-coordinator {}: {state}", coordinator.project);
+            if let Some(error) = coordinator.coordinator.last_error.as_deref() {
+                line.push_str(" — ");
+                line.push_str(error);
+            }
+            co_coordinators = co_coordinators.push(text(line).size(12).style(style::muted_text));
+        }
+
         column![
             row![state_dot, text(lab.state_label).size(26)]
                 .spacing(10)
                 .align_y(Alignment::Center),
             meters,
+            co_coordinators,
         ]
         .spacing(18)
         .width(Fill)
@@ -580,18 +637,82 @@ impl App {
 
     /// The chat with the Lab Coordinator: the message log over the draft input.
     fn chat_tab(&self) -> Element<'_, Message> {
-        column![self.chat_log(), self.chat_input()]
+        column![
+            self.coordinator_control(),
+            self.chat_log(),
+            self.chat_input()
+        ]
+        .spacing(8)
+        .width(Fill)
+        .height(Fill)
+        .into()
+    }
+
+    /// The coordinator state and the matching Start or Stop action.
+    fn coordinator_control(&self) -> Element<'_, Message> {
+        let mut status = text(self.coordinator_status_line());
+        if self.coordinator_error.is_some() || self.snapshot.coordinator.last_error.is_some() {
+            status = status.style(style::error_text);
+        } else {
+            status = status.style(style::muted_text);
+        }
+
+        let action = match self.coordinator_control_action() {
+            CoordinatorAction::Start => button(text("Start"))
+                .on_press(Message::CoordinatorStartPressed)
+                .style(button::primary),
+            CoordinatorAction::Stop => button(text("Stop"))
+                .on_press(Message::CoordinatorStopPressed)
+                .style(button::secondary),
+        };
+
+        row![status.width(Fill), action.padding([6, 14])]
             .spacing(8)
+            .align_y(Alignment::Center)
             .width(Fill)
-            .height(Fill)
             .into()
+    }
+
+    /// A stopped coordinator has no fresh heartbeat, so it can be started again.
+    fn coordinator_control_action(&self) -> CoordinatorAction {
+        match self.snapshot.coordinator.state {
+            CoordinatorState::Running | CoordinatorState::Idle | CoordinatorState::Backoff => {
+                CoordinatorAction::Stop
+            }
+            CoordinatorState::Stopped => CoordinatorAction::Start,
+        }
+    }
+
+    /// Status text combines the persisted supervisor error and any command error.
+    fn coordinator_status_line(&self) -> String {
+        let state = match self.snapshot.coordinator.state {
+            CoordinatorState::Stopped => "stopped",
+            CoordinatorState::Running => "running",
+            CoordinatorState::Idle => "idle",
+            CoordinatorState::Backoff => "backing off",
+        };
+        let mut line = format!("Coordinator: {state}");
+        if let Some(error) = self.snapshot.coordinator.last_error.as_deref() {
+            line.push_str(" — ");
+            line.push_str(error);
+        }
+        if let Some(error) = self.coordinator_error.as_deref() {
+            line.push_str(" — ");
+            line.push_str(error);
+        }
+        line
     }
 
     /// The scrollable message log.
     fn chat_log(&self) -> Element<'_, Message> {
         let mut log = column![].spacing(6).width(Fill);
         if self.snapshot.chat.lines.is_empty() {
-            log = log.push(text("No messages yet. Say hello to the Lab Coordinator."));
+            let hint = if self.snapshot.coordinator.state == CoordinatorState::Stopped {
+                "Messages will wait until the Lab Coordinator is started."
+            } else {
+                "No messages yet. Say hello to the Lab Coordinator."
+            };
+            log = log.push(text(hint));
         } else {
             for line in &self.snapshot.chat.lines {
                 log = log.push(chat_line(line));
@@ -870,6 +991,72 @@ fn status_text(lab: &LabView, unread: usize) -> String {
     }
 }
 
+/// Starts or asks the coordinator supervisor to stop via the adjacent CLI or PATH.
+fn spawn_coordinator(
+    state_dir: PathBuf,
+    lab: String,
+    action: CoordinatorAction,
+) -> Result<(), String> {
+    let binary = jg_factory_binary();
+    let command_name = match action {
+        CoordinatorAction::Start => "run",
+        CoordinatorAction::Stop => "stop",
+    };
+    let mut command = Command::new(binary);
+    command
+        .arg("coordinator")
+        .arg(command_name)
+        .arg("--state-dir")
+        .arg(state_dir)
+        .arg("--lab")
+        .arg(lab);
+
+    match action {
+        CoordinatorAction::Start => command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map(|_| ())
+            .map_err(|error| format!("Could not start coordinator: {error}")),
+        CoordinatorAction::Stop => {
+            let output = command
+                .output()
+                .map_err(|error| format!("Could not stop coordinator: {error}"))?;
+            if output.status.success() {
+                Ok(())
+            } else {
+                let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                if detail.is_empty() {
+                    Err(format!(
+                        "Coordinator stop command failed with {}",
+                        output.status
+                    ))
+                } else {
+                    Err(detail)
+                }
+            }
+        }
+    }
+}
+
+/// Finds `jg-factory` beside the desktop executable, then falls back to PATH lookup.
+fn jg_factory_binary() -> PathBuf {
+    let name = if cfg!(windows) {
+        "jg-factory.exe"
+    } else {
+        "jg-factory"
+    };
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(|parent| parent.join(name)));
+    if let Some(sibling) = sibling.filter(|path| path.is_file()) {
+        sibling
+    } else {
+        PathBuf::from(name)
+    }
+}
+
 /// The current unix time in seconds.
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -880,6 +1067,8 @@ pub fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use jgf_core::ProjectId;
     use jgf_hub::{
         MessageKind, OutgoingMessage, Role, Router,
@@ -930,6 +1119,67 @@ mod tests {
             Tab::ALL.map(Tab::label),
             ["Chat", "Board", "Lab", "Settings"]
         );
+    }
+
+    #[test]
+    fn coordinator_start_and_stop_messages_use_the_injected_spawner() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded_calls = Arc::clone(&calls);
+        let mut app = App::from_snapshot_with_spawner(
+            LabSnapshot::default(),
+            Box::new(move |state_dir, lab, action| {
+                recorded_calls
+                    .lock()
+                    .expect("spawner calls lock")
+                    .push((state_dir, lab, action));
+                Ok(())
+            }),
+        );
+        let dir = tempfile::tempdir().expect("temp dir");
+        app.data_dir = dir.path().to_path_buf();
+
+        let _ = app.update(Message::CoordinatorStartPressed);
+        let _ = app.update(Message::CoordinatorStopPressed);
+
+        assert_eq!(
+            *calls.lock().expect("spawner calls lock"),
+            [
+                (
+                    dir.path().to_path_buf(),
+                    LAB_ID.to_string(),
+                    CoordinatorAction::Start
+                ),
+                (
+                    dir.path().to_path_buf(),
+                    LAB_ID.to_string(),
+                    CoordinatorAction::Stop
+                ),
+            ]
+        );
+        assert_eq!(app.coordinator_error, None);
+    }
+
+    #[test]
+    fn coordinator_spawn_failure_is_shown_in_the_status_line() {
+        let mut app = App::from_snapshot_with_spawner(
+            LabSnapshot::default(),
+            Box::new(|_, _, _| Err("spawn denied".to_string())),
+        );
+
+        let _ = app.update(Message::CoordinatorStartPressed);
+
+        assert!(
+            app.coordinator_status_line()
+                .contains("Coordinator: stopped")
+        );
+        assert!(app.coordinator_status_line().contains("spawn denied"));
+    }
+
+    #[test]
+    fn stopped_coordinator_offers_start_control() {
+        let app = App::from_snapshot(LabSnapshot::default());
+
+        assert_eq!(app.coordinator_control_action(), CoordinatorAction::Start);
     }
 
     #[test]

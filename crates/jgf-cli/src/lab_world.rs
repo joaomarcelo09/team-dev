@@ -1,6 +1,7 @@
 //! Lifecycle and configuration for a persistent, isolated lab world.
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -8,7 +9,11 @@ use std::{
 use jgf_core::{AuditKind, AuditLog};
 use jgf_hub::ShimAuditEvent;
 
+use crate::roles::validate_identifier;
+
 const LAB_WORK_DIR: &str = "work";
+const LABS_DIR: &str = "labs";
+const LAB_FONT_DIR: &str = "font";
 
 /// The non-root uid used inside a lab world.
 pub(crate) const LAB_UID: u32 = 1000;
@@ -53,6 +58,7 @@ pub(crate) struct LabWorldSpec {
     pub state_dir: PathBuf,
     pub lab_dir: PathBuf,
     pub work_tree: PathBuf,
+    pub font_dir: PathBuf,
     pub scratch_home: PathBuf,
     pub read_only_git: PathBuf,
     pub uid: u32,
@@ -341,16 +347,62 @@ impl LabWorld {
         if self.state_dir.starts_with(scratch_home) || scratch_home.starts_with(&self.state_dir) {
             return Err("lab state directory must be separate from scratch HOME".to_string());
         }
+        let font_dir = self.prepare_font_dir()?;
+        if font_dir.starts_with(lab_dir) || lab_dir.starts_with(&font_dir) {
+            return Err(
+                "lab projects directory must be separate from the lab run directory".to_string(),
+            );
+        }
+        if font_dir.starts_with(scratch_home) || scratch_home.starts_with(&font_dir) {
+            return Err("lab projects directory must be separate from scratch HOME".to_string());
+        }
+        if font_dir.starts_with(&self.state_dir) || self.state_dir.starts_with(&font_dir) {
+            return Err("lab projects directory must be separate from sandbox state".to_string());
+        }
         Ok(LabWorldSpec {
             state_dir: self.state_dir.clone(),
             lab_dir: lab_dir.to_path_buf(),
             work_tree: work_tree.to_path_buf(),
+            font_dir,
             scratch_home: scratch_home.to_path_buf(),
             read_only_git: work_tree.join(".git"),
             uid: LAB_UID,
             egress_hosts: &CLAUDE_EGRESS_HOSTS,
             egress_ports: &CLAUDE_EGRESS_PORTS,
         })
+    }
+
+    fn prepare_font_dir(&self) -> Result<PathBuf, String> {
+        validate_identifier("lab id", &self.lab_id)?;
+        fs::create_dir_all(&self.audit_dir).map_err(|error| {
+            format!(
+                "could not create lab state directory at {}: {error}",
+                self.audit_dir.display()
+            )
+        })?;
+        let state_root = fs::canonicalize(&self.audit_dir).map_err(|error| {
+            format!(
+                "could not resolve lab state directory at {}: {error}",
+                self.audit_dir.display()
+            )
+        })?;
+
+        let mut font_dir = state_root.clone();
+        for component in [LABS_DIR, self.lab_id.as_str(), LAB_FONT_DIR] {
+            font_dir.push(component);
+            ensure_plain_directory(&font_dir)?;
+        }
+
+        let canonical_font_dir = fs::canonicalize(&font_dir).map_err(|error| {
+            format!(
+                "could not resolve lab projects directory at {}: {error}",
+                font_dir.display()
+            )
+        })?;
+        if canonical_font_dir != font_dir || !canonical_font_dir.starts_with(&state_root) {
+            return Err("lab projects directory escapes the lab state directory".to_string());
+        }
+        Ok(canonical_font_dir)
     }
 
     fn keep_requested(&self) -> Result<bool, String> {
@@ -403,6 +455,42 @@ impl LabWorld {
     }
 }
 
+fn ensure_plain_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(()),
+        Ok(_) => Err(format!(
+            "lab projects path {} must be a plain directory",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(path).map_err(|error| {
+                format!(
+                    "could not create lab projects directory at {}: {error}",
+                    path.display()
+                )
+            })?;
+            let metadata = fs::symlink_metadata(path).map_err(|error| {
+                format!(
+                    "could not inspect lab projects directory at {}: {error}",
+                    path.display()
+                )
+            })?;
+            if metadata.is_dir() && !metadata.file_type().is_symlink() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "lab projects path {} must be a plain directory",
+                    path.display()
+                ))
+            }
+        }
+        Err(error) => Err(format!(
+            "could not inspect lab projects path at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 fn combine_errors(result: Result<(), String>, additional: Option<String>) -> Result<(), String> {
     match (result, additional) {
         (Ok(()), None) => Ok(()),
@@ -440,6 +528,7 @@ mod tests {
                 assert_eq!(spec.egress_hosts, ["api.anthropic.com"]);
                 assert_eq!(spec.egress_ports, [443]);
                 assert_eq!(spec.read_only_git, work_tree.join(".git"));
+                assert!(spec.font_dir.ends_with("labs/test-lab/font"));
                 Ok(spec.clone())
             })
             .expect("create world")
@@ -496,8 +585,32 @@ mod tests {
 
         assert_eq!(world.status(), WorldStatus::Created);
         assert_eq!(spec.state_dir, temp.path().join("state"));
+        assert_eq!(spec.font_dir, temp.path().join("audit/labs/test-lab/font"));
+        assert!(spec.font_dir.is_dir());
         assert_eq!(spec.scratch_home, scratch);
         assert_eq!(audit_tags(&temp.path().join("audit")), ["lab_world:create"]);
+    }
+
+    #[test]
+    fn create_rejects_a_symlinked_lab_projects_path() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let (world, lab_dir, work_tree, scratch) =
+            fixture(temp.path(), EndOfLifePolicy::DestroyOnKill);
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside");
+        let labs = temp.path().join("audit/labs");
+        fs::create_dir_all(labs.parent().expect("audit parent")).expect("audit directory");
+        std::os::unix::fs::symlink(&outside, &labs).expect("labs symlink");
+
+        let result = world.create::<()>(&lab_dir, &work_tree, &scratch, |_| Ok(()));
+
+        assert!(result.is_err());
+        assert!(
+            fs::read_dir(&outside)
+                .expect("outside remains empty")
+                .next()
+                .is_none()
+        );
     }
 
     #[test]
