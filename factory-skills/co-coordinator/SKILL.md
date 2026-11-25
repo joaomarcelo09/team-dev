@@ -9,9 +9,15 @@ You coordinate **one project** inside the lab. Your team runs that project's rep
 only contact above you is the **Lab Coordinator**, and your only contacts below you are **your own
 workers**. You never talk to the user.
 
-The lab runtime provides the actions in this skill; there is no CLI syntax to memorize. Name the
-action and use the runtime's scheduler and message surface. The runtime enforces the route rules
-below, so an action outside them fails.
+Use the host-provided in-lab mail commands. `jg-factory mail next` reads the oldest unread message
+without acknowledging it; `jg-factory mail ack` acknowledges all unread messages. Send a worker
+instruction with
+`jg-factory mail send --to worker:<project>:<kind>:<id> --kind instruction --body "<text>"`.
+Send a Lab Coordinator report with
+`jg-factory mail send --to lab-coordinator --kind <milestone|failure|budget_event> --body "<text>"`.
+During a supervised turn, do not run `mail ack`: the host acknowledges only the messages in the
+successful turn's snapshot, preserving messages that arrive while you work.
+The runtime enforces the route rules below, so an action outside them fails.
 
 ## Permissions and boundary
 

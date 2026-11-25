@@ -1,4 +1,4 @@
-//! Per-exec project scope: `/workspace` mount, role access and lab hiding.
+//! Per-exec project scope: `/workspace` and `/font` mounts, role access and lab hiding.
 
 mod support;
 
@@ -124,6 +124,121 @@ fn reviewer_scope_is_read_only() {
         std::fs::read_to_string(worktree.join("existing.txt")).expect("untouched"),
         "from-host"
     );
+}
+
+#[test]
+fn font_mount_obeys_role_access_and_hides_other_projects_from_coders() {
+    let mut lab = fixture();
+    std::fs::create_dir_all(lab.spec.lab_dir.join("proj-a")).expect("worktree");
+    let font_dir = lab.temp.path().join("font");
+    let project = font_dir.join("project-a");
+    std::fs::create_dir_all(&project).expect("font project");
+    std::fs::write(project.join("existing.txt"), "from-host").expect("seed project file");
+    lab.spec.font_dir = Some(font_dir.clone());
+    let backend = NamespaceBackend::new();
+    let Some(guard) = create_or_skip(backend, &lab.spec) else {
+        return;
+    };
+
+    let coordinator = run_scoped(
+        backend,
+        guard.handle(),
+        coder("/lab/proj-a").with_font_access(ScopeAccess::ReadWrite),
+        "echo from-coordinator > /font/project-a/new.txt && cat /font/project-a/existing.txt",
+    );
+    assert_eq!(
+        coordinator.exit_code,
+        Some(0),
+        "{}",
+        coordinator.stderr_text()
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.join("new.txt")).expect("coordinator write"),
+        "from-coordinator\n"
+    );
+
+    let reviewer = run_scoped(
+        backend,
+        guard.handle(),
+        reviewer("/lab/proj-a").with_font_access(ScopeAccess::ReadOnly),
+        "cat /font/project-a/existing.txt && echo x > /font/project-a/reviewer.txt",
+    );
+    assert_ne!(reviewer.exit_code, Some(0));
+    assert!(reviewer.stdout_text().contains("from-host"));
+    assert!(
+        reviewer.stderr_text().contains("Read-only file system"),
+        "{}",
+        reviewer.stderr_text()
+    );
+    assert!(!project.join("reviewer.txt").exists());
+
+    let coder = run_scoped(
+        backend,
+        guard.handle(),
+        coder("/lab/proj-a"),
+        "ls -A /font; cat /font/project-a/existing.txt",
+    );
+    assert!(
+        !coder.stdout_text().contains("from-host"),
+        "font content leaked to a coder: {}",
+        coder.stdout_text()
+    );
+    assert!(
+        coder.stderr_text().contains("project-a"),
+        "coder unexpectedly accessed /font: {}",
+        coder.stderr_text()
+    );
+}
+
+#[test]
+fn project_scoped_font_mount_exposes_only_the_selected_project_read_write() {
+    let mut lab = fixture();
+    std::fs::create_dir_all(lab.spec.lab_dir.join("proj-a")).expect("worktree");
+    let font_dir = lab.temp.path().join("font");
+    let project = font_dir.join("project-a");
+    let other_project = font_dir.join("project-b");
+    std::fs::create_dir_all(&project).expect("selected project");
+    std::fs::create_dir_all(&other_project).expect("other project");
+    std::fs::write(project.join("SPEC.md"), "project-a spec").expect("selected spec");
+    std::fs::write(other_project.join("SPEC.md"), "project-b spec").expect("other spec");
+    lab.spec.font_dir = Some(font_dir.clone());
+    let backend = NamespaceBackend::new();
+    let Some(guard) = create_or_skip(backend, &lab.spec) else {
+        return;
+    };
+    let scope = coder("/lab/proj-a")
+        .with_font_access(ScopeAccess::ReadWrite)
+        .with_font_project("project-a");
+
+    let output = run_scoped(
+        backend,
+        guard.handle(),
+        scope,
+        "cat /font/project-a/SPEC.md && test ! -e /font/project-b/SPEC.md && echo updated > /font/project-a/notes.txt",
+    );
+
+    assert_eq!(output.exit_code, Some(0), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "project-a spec");
+    assert_eq!(
+        std::fs::read_to_string(project.join("notes.txt")).expect("selected write"),
+        "updated\n"
+    );
+    assert!(!other_project.join("notes.txt").exists());
+}
+
+#[test]
+fn font_project_scope_rejects_traversal_and_cross_project_mismatch() {
+    let traversal = coder("/lab/project-a")
+        .with_project("project-a")
+        .with_font_access(ScopeAccess::ReadWrite)
+        .with_font_project("../project-b");
+    assert!(traversal.validate().is_err());
+
+    let mismatch = coder("/lab/project-a")
+        .with_project("project-a")
+        .with_font_access(ScopeAccess::ReadWrite)
+        .with_font_project("project-b");
+    assert!(mismatch.validate().is_err());
 }
 
 #[test]

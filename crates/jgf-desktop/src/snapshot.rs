@@ -14,6 +14,7 @@ use jgf_hub::{
     board::Task,
     scheduler::MAX_CODERS,
     usage::{LabState, Level, Policy, Provider, Reading, Window, lab_state},
+    watchdog::HEARTBEAT_TTL_SECS,
 };
 use serde::Deserialize;
 
@@ -43,6 +44,17 @@ const USER_MAILBOX: &str = "user.jsonl";
 const LAB_MAILBOX: &str = "lab-coordinator.jsonl";
 const USER_CURSOR: &str = "user.cursor";
 
+/// Lab selected by the desktop shell.
+pub const LAB_ID: &str = "default";
+
+/// Coordinator status file below the selected lab directory.
+const COORDINATOR_STATUS_FILE: &str = "coordinator/status.json";
+/// Directory containing the per-project Co-coordinator states.
+const CO_COORDINATORS_DIR: &str = "coordinators";
+
+/// Watchdog heartbeat file below the selected lab directory.
+const COORDINATOR_HEARTBEAT_FILE: &str = "watchdog/watchdog.json";
+
 /// Schema version written by the usage meter.
 const USAGE_VERSION: u32 = 1;
 
@@ -58,6 +70,10 @@ pub struct LabSnapshot {
     pub windows: Vec<(Provider, Window)>,
     /// What the lab is doing at the moment of the load.
     pub lab_state: LabState,
+    /// The Lab Coordinator supervisor state.
+    pub coordinator: CoordinatorSnapshot,
+    /// Per-project Co-coordinator supervisor states.
+    pub co_coordinators: Vec<CoCoordinatorSnapshot>,
     /// Role configuration, or the defaults when no file was written.
     pub roles: RoleConfig,
     /// The user's conversation with the Lab Coordinator.
@@ -66,12 +82,60 @@ pub struct LabSnapshot {
     pub errors: Vec<String>,
 }
 
+/// Status of one project's Co-coordinator supervisor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoCoordinatorSnapshot {
+    /// Project identifier.
+    pub project: String,
+    /// Persisted supervisor state.
+    pub coordinator: CoordinatorSnapshot,
+}
+
+/// The supervisor state shown by the desktop shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoordinatorState {
+    /// A coordinator turn is running.
+    Running,
+    /// The supervisor is waiting for work.
+    Idle,
+    /// A failed turn is waiting before retry.
+    Backoff,
+    /// No fresh supervisor is running.
+    Stopped,
+}
+
+/// Coordinator status and its latest safe diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoordinatorSnapshot {
+    /// Current supervisor state.
+    pub state: CoordinatorState,
+    /// Unix milliseconds when the last turn finished.
+    pub last_turn_at_ms: Option<u64>,
+    /// Safe diagnostic from the most recent failed turn.
+    pub last_error: Option<String>,
+    /// Remaining delay before a retry, when backing off.
+    pub backoff_secs: Option<u64>,
+}
+
+impl Default for CoordinatorSnapshot {
+    fn default() -> Self {
+        Self {
+            state: CoordinatorState::Stopped,
+            last_turn_at_ms: None,
+            last_error: None,
+            backoff_secs: None,
+        }
+    }
+}
+
 impl Default for LabSnapshot {
     fn default() -> Self {
         Self {
             tasks: Vec::new(),
             windows: Vec::new(),
             lab_state: LabState::Idle,
+            coordinator: CoordinatorSnapshot::default(),
+            co_coordinators: Vec::new(),
             roles: RoleConfig::defaults(),
             chat: ChatView::default(),
             errors: Vec::new(),
@@ -123,6 +187,9 @@ impl LabSnapshot {
         let (chat, chat_errors) = load_chat(data_dir);
         errors.extend(chat_errors);
 
+        let coordinator = load_coordinator(data_dir, now, &mut errors);
+        let co_coordinators = load_co_coordinators(data_dir, now, &mut errors);
+
         let windows = usage
             .iter()
             .map(|entry| (entry.provider.clone(), entry.reading.window))
@@ -133,6 +200,8 @@ impl LabSnapshot {
             tasks,
             windows,
             lab_state,
+            coordinator,
+            co_coordinators,
             roles,
             chat,
             errors,
@@ -178,6 +247,191 @@ struct SchedulerFile {
     slots: Vec<serde_json::Value>,
     #[serde(default)]
     projects: Vec<ProjectId>,
+}
+
+/// On-disk form of the coordinator status file.
+#[derive(Deserialize)]
+struct CoordinatorStatusFile {
+    status: String,
+    #[serde(default)]
+    last_turn_at_ms: Option<u64>,
+    #[serde(default)]
+    last_error: Option<String>,
+    #[serde(default)]
+    backoff_secs: Option<u64>,
+}
+
+/// The last heartbeat written by the supervisor's watchdog.
+#[derive(Deserialize)]
+struct CoordinatorHeartbeatFile {
+    #[serde(default)]
+    last_beat: Option<u64>,
+}
+
+/// Reads the supervisor status, treating an absent or stale supervisor as stopped.
+fn load_coordinator(data_dir: &Path, now: u64, errors: &mut Vec<String>) -> CoordinatorSnapshot {
+    let lab_dir = data_dir.join("labs").join(LAB_ID);
+    let status_path = lab_dir.join(COORDINATOR_STATUS_FILE);
+    let bytes = match read_or_missing(&status_path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return CoordinatorSnapshot::default(),
+        Err(error) => {
+            errors.push(format!("{COORDINATOR_STATUS_FILE}: {error}"));
+            return CoordinatorSnapshot::default();
+        }
+    };
+    let status = match serde_json::from_slice::<CoordinatorStatusFile>(&bytes) {
+        Ok(status) => status,
+        Err(error) => {
+            errors.push(format!("{COORDINATOR_STATUS_FILE}: {error}"));
+            return CoordinatorSnapshot::default();
+        }
+    };
+    let state = match status.status.as_str() {
+        "running" => CoordinatorState::Running,
+        "idle" => CoordinatorState::Idle,
+        "backoff" => CoordinatorState::Backoff,
+        "stopped" => CoordinatorState::Stopped,
+        _ => {
+            errors.push(format!(
+                "{COORDINATOR_STATUS_FILE}: unknown status {:?}",
+                status.status
+            ));
+            return CoordinatorSnapshot::default();
+        }
+    };
+
+    let state = if state != CoordinatorState::Stopped
+        && !coordinator_heartbeat_is_fresh(&lab_dir.join(COORDINATOR_HEARTBEAT_FILE), now, errors)
+    {
+        CoordinatorState::Stopped
+    } else {
+        state
+    };
+
+    CoordinatorSnapshot {
+        state,
+        last_turn_at_ms: status.last_turn_at_ms,
+        last_error: status.last_error,
+        backoff_secs: status.backoff_secs,
+    }
+}
+
+/// Reads each project's status without opening a router or creating state.
+fn load_co_coordinators(
+    data_dir: &Path,
+    now: u64,
+    errors: &mut Vec<String>,
+) -> Vec<CoCoordinatorSnapshot> {
+    let root = data_dir.join("labs").join(LAB_ID).join(CO_COORDINATORS_DIR);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            errors.push(format!("{CO_COORDINATORS_DIR}: {error}"));
+            return Vec::new();
+        }
+    };
+
+    let mut coordinators = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!("{CO_COORDINATORS_DIR}: {error}"));
+                continue;
+            }
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) => {
+                errors.push(format!("{CO_COORDINATORS_DIR}: {error}"));
+                continue;
+            }
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(project) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if ProjectId::parse(&project).is_err() {
+            errors.push(format!("{CO_COORDINATORS_DIR}: invalid project directory"));
+            continue;
+        }
+        let relative_status = format!("{CO_COORDINATORS_DIR}/{project}/status.json");
+        let status_path = entry.path().join("status.json");
+        let bytes = match read_or_missing(&status_path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => continue,
+            Err(error) => {
+                errors.push(format!("{relative_status}: {error}"));
+                continue;
+            }
+        };
+        let status = match serde_json::from_slice::<CoordinatorStatusFile>(&bytes) {
+            Ok(status) => status,
+            Err(error) => {
+                errors.push(format!("{relative_status}: {error}"));
+                continue;
+            }
+        };
+        let mut state = match status.status.as_str() {
+            "running" => CoordinatorState::Running,
+            "idle" => CoordinatorState::Idle,
+            "backoff" => CoordinatorState::Backoff,
+            "stopped" => CoordinatorState::Stopped,
+            _ => {
+                errors.push(format!(
+                    "{relative_status}: unknown status {:?}",
+                    status.status
+                ));
+                continue;
+            }
+        };
+        if state != CoordinatorState::Stopped
+            && !coordinator_heartbeat_is_fresh(
+                &entry.path().join("watchdog/watchdog.json"),
+                now,
+                errors,
+            )
+        {
+            state = CoordinatorState::Stopped;
+        }
+        coordinators.push(CoCoordinatorSnapshot {
+            project,
+            coordinator: CoordinatorSnapshot {
+                state,
+                last_turn_at_ms: status.last_turn_at_ms,
+                last_error: status.last_error,
+                backoff_secs: status.backoff_secs,
+            },
+        });
+    }
+    coordinators.sort_by(|left, right| left.project.cmp(&right.project));
+    coordinators
+}
+
+/// Applies the watchdog's heartbeat freshness window without opening or changing its files.
+fn coordinator_heartbeat_is_fresh(path: &Path, now: u64, errors: &mut Vec<String>) -> bool {
+    let bytes = match read_or_missing(path) {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => return false,
+        Err(error) => {
+            errors.push(format!("{COORDINATOR_HEARTBEAT_FILE}: {error}"));
+            return false;
+        }
+    };
+    let heartbeat = match serde_json::from_slice::<CoordinatorHeartbeatFile>(&bytes) {
+        Ok(heartbeat) => heartbeat,
+        Err(error) => {
+            errors.push(format!("{COORDINATOR_HEARTBEAT_FILE}: {error}"));
+            return false;
+        }
+    };
+    heartbeat
+        .last_beat
+        .is_some_and(|last_beat| now.saturating_sub(last_beat) <= HEARTBEAT_TTL_SECS)
 }
 
 /// Reads `board.json`, or an empty Board when it does not exist.
@@ -463,6 +717,73 @@ mod tests {
             .expect("record usage");
     }
 
+    fn write_coordinator_status(dir: &Path, status: &str, last_error: Option<&str>) {
+        let path = dir.join("labs").join(LAB_ID).join(COORDINATOR_STATUS_FILE);
+        fs::create_dir_all(path.parent().expect("status parent")).expect("create status dir");
+        fs::write(
+            path,
+            serde_json::json!({
+                "status": status,
+                "last_turn_at_ms": 1234,
+                "last_error": last_error,
+                "backoff_secs": (status == "backoff").then_some(5),
+            })
+            .to_string(),
+        )
+        .expect("write coordinator status");
+    }
+
+    fn write_coordinator_heartbeat(dir: &Path, last_beat: u64) {
+        let path = dir
+            .join("labs")
+            .join(LAB_ID)
+            .join(COORDINATOR_HEARTBEAT_FILE);
+        fs::create_dir_all(path.parent().expect("heartbeat parent")).expect("create heartbeat dir");
+        fs::write(
+            path,
+            serde_json::json!({"version": 1, "last_beat": last_beat}).to_string(),
+        )
+        .expect("write coordinator heartbeat");
+    }
+
+    fn write_co_coordinator_status(dir: &Path, project: &str, status: &str) {
+        let path = dir
+            .join("labs")
+            .join(LAB_ID)
+            .join(CO_COORDINATORS_DIR)
+            .join(project)
+            .join("status.json");
+        fs::create_dir_all(path.parent().expect("coordinator status parent"))
+            .expect("create project coordinator directory");
+        fs::write(
+            path,
+            serde_json::json!({
+                "status": status,
+                "last_turn_at_ms": 2345,
+                "last_error": null,
+                "backoff_secs": null,
+            })
+            .to_string(),
+        )
+        .expect("write project coordinator status");
+    }
+
+    fn write_co_coordinator_heartbeat(dir: &Path, project: &str, last_beat: u64) {
+        let path = dir
+            .join("labs")
+            .join(LAB_ID)
+            .join(CO_COORDINATORS_DIR)
+            .join(project)
+            .join("watchdog/watchdog.json");
+        fs::create_dir_all(path.parent().expect("coordinator heartbeat parent"))
+            .expect("create project watchdog directory");
+        fs::write(
+            path,
+            serde_json::json!({"version": 1, "last_beat": last_beat}).to_string(),
+        )
+        .expect("write project coordinator heartbeat");
+    }
+
     #[test]
     fn empty_directory_is_every_default() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -471,9 +792,99 @@ mod tests {
         assert!(snapshot.tasks.is_empty());
         assert!(snapshot.windows.is_empty());
         assert_eq!(snapshot.lab_state, LabState::Idle);
+        assert_eq!(snapshot.coordinator, CoordinatorSnapshot::default());
         assert_eq!(snapshot.roles, RoleConfig::defaults());
         assert_eq!(snapshot.chat, ChatView::default());
         assert!(snapshot.errors.is_empty());
+    }
+
+    #[test]
+    fn coordinator_status_parses_every_state_and_missing_file_as_stopped() {
+        let cases = [
+            ("running", CoordinatorState::Running),
+            ("idle", CoordinatorState::Idle),
+            ("backoff", CoordinatorState::Backoff),
+            ("stopped", CoordinatorState::Stopped),
+        ];
+
+        for (status, expected) in cases {
+            let dir = tempfile::tempdir().expect("temp dir");
+            write_coordinator_status(dir.path(), status, Some("last failure"));
+            if matches!(
+                expected,
+                CoordinatorState::Running | CoordinatorState::Idle | CoordinatorState::Backoff
+            ) {
+                write_coordinator_heartbeat(
+                    dir.path(),
+                    10_000u64.saturating_sub(HEARTBEAT_TTL_SECS),
+                );
+            }
+
+            let snapshot = LabSnapshot::load(dir.path(), 10_000);
+
+            assert_eq!(snapshot.coordinator.state, expected, "{status}");
+            assert_eq!(snapshot.coordinator.last_turn_at_ms, Some(1234));
+            assert_eq!(
+                snapshot.coordinator.last_error.as_deref(),
+                Some("last failure")
+            );
+            assert_eq!(
+                snapshot.coordinator.backoff_secs,
+                (status == "backoff").then_some(5)
+            );
+            assert!(
+                snapshot.errors.is_empty(),
+                "{status}: {:?}",
+                snapshot.errors
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let snapshot = LabSnapshot::load(dir.path(), 10_000);
+        assert_eq!(snapshot.coordinator.state, CoordinatorState::Stopped);
+        assert_eq!(snapshot.coordinator.last_error, None);
+        assert!(snapshot.errors.is_empty());
+    }
+
+    #[test]
+    fn project_coordinator_statuses_are_loaded_read_only_and_sorted() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        write_co_coordinator_status(dir.path(), "project-b", "running");
+        write_co_coordinator_status(dir.path(), "project-a", "idle");
+        write_co_coordinator_heartbeat(dir.path(), "project-b", 10_000);
+        write_co_coordinator_heartbeat(dir.path(), "project-a", 10_000);
+
+        let snapshot = LabSnapshot::load(dir.path(), 10_000);
+
+        assert_eq!(
+            snapshot
+                .co_coordinators
+                .iter()
+                .map(|coordinator| (coordinator.project.as_str(), coordinator.coordinator.state))
+                .collect::<Vec<_>>(),
+            [
+                ("project-a", CoordinatorState::Idle),
+                ("project-b", CoordinatorState::Running)
+            ]
+        );
+        assert!(snapshot.errors.is_empty());
+    }
+
+    #[test]
+    fn running_idle_and_backoff_with_stale_heartbeats_are_stopped() {
+        for status in ["running", "idle", "backoff"] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            write_coordinator_status(dir.path(), status, None);
+            write_coordinator_heartbeat(
+                dir.path(),
+                10_000u64.saturating_sub(HEARTBEAT_TTL_SECS + 1),
+            );
+
+            let snapshot = LabSnapshot::load(dir.path(), 10_000);
+
+            assert_eq!(snapshot.coordinator.state, CoordinatorState::Stopped);
+            assert!(snapshot.errors.is_empty());
+        }
     }
 
     #[test]

@@ -48,7 +48,7 @@ impl Role {
         }
     }
 
-    fn worktree_access(self) -> ScopeAccess {
+    pub(crate) fn worktree_access(self) -> ScopeAccess {
         match self {
             Self::Coder | Self::GitCoder => ScopeAccess::ReadWrite,
             Self::LabCoordinator
@@ -56,6 +56,14 @@ impl Role {
             | Self::Reviewer
             | Self::Tester
             | Self::WakeUp => ScopeAccess::ReadOnly,
+        }
+    }
+
+    pub(crate) fn font_access(self) -> Option<ScopeAccess> {
+        match self {
+            Self::LabCoordinator | Self::CoCoordinator => Some(ScopeAccess::ReadWrite),
+            Self::Reviewer | Self::Tester | Self::WakeUp => Some(ScopeAccess::ReadOnly),
+            Self::Coder | Self::GitCoder => None,
         }
     }
 }
@@ -233,6 +241,8 @@ impl fmt::Debug for BrokerSurface {
 pub trait RoleLaunchExecutor {
     /// Returns the active lab directory or fails when the world is unavailable.
     fn lab_dir(&self) -> Result<PathBuf, String>;
+    /// Returns the active lab projects directory or fails when the world is unavailable.
+    fn font_dir(&self) -> Result<PathBuf, String>;
     /// Writes the single tagged role-start audit event.
     fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String>;
     /// Starts the role in the requested scoped exec.
@@ -280,7 +290,27 @@ impl<'a> RoleLauncher<'a> {
 
     /// Loads the skill and standards, records the start, and runs the role.
     pub fn launch(&self, request: &RoleLaunch, kill: Option<&dyn KillSwitch>) -> ChildRun {
-        let execution = match self.prepare(request) {
+        self.launch_inner(request, None, false, kill)
+    }
+
+    /// Runs a session-persistent invocation, optionally resuming the supplied Claude session.
+    pub fn launch_with_session(
+        &self,
+        request: &RoleLaunch,
+        resume_session: Option<&str>,
+        kill: Option<&dyn KillSwitch>,
+    ) -> ChildRun {
+        self.launch_inner(request, resume_session, true, kill)
+    }
+
+    fn launch_inner(
+        &self,
+        request: &RoleLaunch,
+        resume_session: Option<&str>,
+        persist_session: bool,
+        kill: Option<&dyn KillSwitch>,
+    ) -> ChildRun {
+        let execution = match self.prepare(request, resume_session, persist_session) {
             Ok(execution) => execution,
             Err(error) => return failed_launch(error),
         };
@@ -336,20 +366,31 @@ impl<'a> RoleLauncher<'a> {
         result
     }
 
-    fn prepare(&self, request: &RoleLaunch) -> Result<RoleExecution, String> {
+    fn prepare(
+        &self,
+        request: &RoleLaunch,
+        resume_session: Option<&str>,
+        persist_session: bool,
+    ) -> Result<RoleExecution, String> {
         validate_identifier("project id", &request.project_id)?;
         validate_identifier("worker id", &request.worker_id)?;
         validate_identifier("worktree name", &request.worktree_name)?;
 
         let lab_dir = fs::canonicalize(self.executor.lab_dir()?)
             .map_err(|error| format!("could not resolve role lab directory: {error}"))?;
-        let project_environment = self
-            .executor
-            .project_environment(&request.project_id)
-            .map_err(|_| "could not load project environment".to_string())?
-            .into_iter()
-            .filter(|(key, _)| !is_reserved_role_environment_key(key))
-            .collect();
+        if request.role.font_access().is_some() {
+            validate_font_projects(&self.executor.font_dir()?)?;
+        }
+        let project_environment = if request.role == Role::LabCoordinator {
+            BTreeMap::new()
+        } else {
+            self.executor
+                .project_environment(&request.project_id)
+                .map_err(|_| "could not load project environment".to_string())?
+                .into_iter()
+                .filter(|(key, _)| !is_reserved_role_environment_key(key))
+                .collect()
+        };
         let skill = fs::read_to_string(
             self.skills_dir
                 .join(request.role.skill_directory())
@@ -395,11 +436,20 @@ impl<'a> RoleLauncher<'a> {
         .with_scratch_home(guest_scratch);
 
         let system_prompt = format!("{skill}\n\n---\n\n# Lab standards\n\n{standards}");
-        let argv = vec![
+        let mut argv = vec![
             "claude".to_string(),
             "-p".to_string(),
             "--dangerously-skip-permissions".to_string(),
-            "--no-session-persistence".to_string(),
+        ];
+        if persist_session {
+            argv.extend(["--output-format".to_string(), "json".to_string()]);
+            if let Some(session) = resume_session {
+                argv.extend(["--resume".to_string(), session.to_string()]);
+            }
+        } else {
+            argv.push("--no-session-persistence".to_string());
+        }
+        argv.extend([
             "--max-turns".to_string(),
             request.max_turns.to_string(),
             "--max-budget-usd".to_string(),
@@ -407,7 +457,7 @@ impl<'a> RoleLauncher<'a> {
             "--append-system-prompt".to_string(),
             system_prompt,
             request.prompt.clone(),
-        ];
+        ]);
 
         Ok(RoleExecution {
             role: request.role,
@@ -490,7 +540,7 @@ fn is_reserved_role_environment_key(key: &str) -> bool {
     )
 }
 
-fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
+pub(crate) fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 64
         || value == "."
@@ -506,6 +556,51 @@ fn validate_identifier(name: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_font_projects(font_dir: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(font_dir)
+        .map_err(|error| format!("could not inspect lab projects directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err("lab projects directory must be a plain directory".to_string());
+    }
+    let font_dir = fs::canonicalize(font_dir)
+        .map_err(|error| format!("could not resolve lab projects directory: {error}"))?;
+    let entries = fs::read_dir(&font_dir)
+        .map_err(|error| format!("could not read lab projects directory: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("could not read lab project entry: {error}"))?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| "lab project name is not valid UTF-8".to_string())?;
+        validate_font_project(&font_dir, &name)?;
+    }
+    Ok(())
+}
+
+fn validate_font_project(font_dir: &Path, project_name: &str) -> Result<PathBuf, String> {
+    validate_identifier("font project name", project_name)?;
+    let project_dir = font_dir.join(project_name);
+    let metadata = fs::symlink_metadata(&project_dir)
+        .map_err(|error| format!("could not inspect lab project directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "lab project {} must be a plain directory",
+            project_name
+        ));
+    }
+    let canonical_font = fs::canonicalize(font_dir)
+        .map_err(|error| format!("could not resolve lab projects directory: {error}"))?;
+    let canonical_project = fs::canonicalize(&project_dir)
+        .map_err(|error| format!("could not resolve lab project directory: {error}"))?;
+    if !canonical_project.starts_with(&canonical_font) {
+        return Err(format!(
+            "lab project {} escapes the lab projects directory",
+            project_name
+        ));
+    }
+    Ok(canonical_project)
+}
+
 fn build_role_scope(
     role: Role,
     project: &str,
@@ -515,6 +610,12 @@ fn build_role_scope(
 ) -> Result<ExecScope, String> {
     let mut scope =
         ExecScope::new(role.worktree_access(), guest_worktree).with_project(project.to_string());
+    if let Some(access) = role.font_access() {
+        scope = scope.with_font_access(access);
+        if role == Role::CoCoordinator {
+            scope = scope.with_font_project(project.to_string());
+        }
+    }
     let git_entry = worktree.join(".git");
     let metadata = match fs::symlink_metadata(&git_entry) {
         Ok(metadata) => metadata,
@@ -600,6 +701,10 @@ impl RoleLaunchExecutor for ClaudeSandbox {
         self.role_lab_dir()
     }
 
+    fn font_dir(&self) -> Result<PathBuf, String> {
+        self.role_font_dir()
+    }
+
     fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String> {
         self.audit_role_start(project, worker, role.skill_directory())
     }
@@ -663,6 +768,10 @@ mod tests {
             Ok(self.lab_dir.clone())
         }
 
+        fn font_dir(&self) -> Result<PathBuf, String> {
+            Ok(self.lab_dir.join("font"))
+        }
+
         fn record_role_start(&self, project: &str, worker: &str, role: Role) -> Result<(), String> {
             self.starts.lock().expect("start records").push((
                 project.to_string(),
@@ -709,6 +818,10 @@ mod tests {
     impl RoleLaunchExecutor for HubRecordingExecutor {
         fn lab_dir(&self) -> Result<PathBuf, String> {
             Ok(self.lab_dir.clone())
+        }
+
+        fn font_dir(&self) -> Result<PathBuf, String> {
+            Ok(self.lab_dir.join("font"))
         }
 
         fn record_role_start(
@@ -967,6 +1080,7 @@ mod tests {
             .path()
             .join("projects/project-a/repository/.git/worktrees/task-1");
         fs::create_dir_all(&worktree).expect("worktree");
+        fs::create_dir_all(lab.path().join("font")).expect("font directory");
         fs::create_dir_all(&git_dir).expect("worktree git directory");
         fs::write(
             worktree.join(".git"),
@@ -1042,6 +1156,18 @@ mod tests {
                 match role {
                     Role::Coder | Role::GitCoder => ScopeAccess::ReadWrite,
                     _ => ScopeAccess::ReadOnly,
+                }
+            );
+            assert_eq!(
+                execution.scope.font_access,
+                match role {
+                    Role::LabCoordinator | Role::CoCoordinator => {
+                        Some(ScopeAccess::ReadWrite)
+                    }
+                    Role::Reviewer | Role::Tester | Role::WakeUp => {
+                        Some(ScopeAccess::ReadOnly)
+                    }
+                    Role::Coder | Role::GitCoder => None,
                 }
             );
             assert_eq!(
@@ -1165,6 +1291,40 @@ mod tests {
         assert!(result.spawn_error.is_some());
         assert!(executor.launches.lock().expect("launches").is_empty());
         assert!(executor.starts.lock().expect("starts").is_empty());
+    }
+
+    #[test]
+    fn font_project_names_reject_traversal_and_separators() {
+        let temp = tempfile::tempdir().expect("font root");
+        let font = temp.path().join("font");
+        fs::create_dir(&font).expect("font directory");
+        fs::create_dir(font.join("project-a")).expect("project directory");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+
+        assert_eq!(
+            validate_font_project(&font, "project-a").expect("valid project"),
+            fs::canonicalize(font.join("project-a")).expect("canonical project")
+        );
+        for name in ["..", "../outside", "project/a", "/outside"] {
+            assert!(
+                validate_font_project(&font, name).is_err(),
+                "{name:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn font_project_symlinks_cannot_escape_the_projects_directory() {
+        let temp = tempfile::tempdir().expect("font root");
+        let font = temp.path().join("font");
+        fs::create_dir(&font).expect("font directory");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        std::os::unix::fs::symlink(&outside, font.join("linked-project")).expect("project symlink");
+
+        assert!(validate_font_project(&font, "linked-project").is_err());
+        assert!(validate_font_projects(&font).is_err());
     }
 
     #[test]

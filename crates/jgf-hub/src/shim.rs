@@ -89,6 +89,25 @@ pub enum ShimError {
     #[error("invalid shim request")]
     InvalidRequest,
 
+    /// The Lab Coordinator mailbox is acknowledged by its host supervisor.
+    #[error("the Lab Coordinator mailbox is acknowledged by the host supervisor")]
+    HostAcknowledgementRequired,
+
+    /// Only the Lab Coordinator may enqueue a project.
+    #[error("only the Lab Coordinator may enqueue projects")]
+    LabCoordinatorRequired,
+
+    /// This shim was not configured with the lab scheduler.
+    #[error("the lab scheduler is unavailable")]
+    SchedulerUnavailable,
+
+    /// The scheduler refused the project request.
+    #[error("scheduler request failed: {message}")]
+    Scheduler {
+        /// Safe scheduler error description; never contains a launch token.
+        message: String,
+    },
+
     /// A non-route router error occurred.
     #[error("routing failed: {message}")]
     Routing {
@@ -97,7 +116,7 @@ pub enum ShimError {
     },
 }
 
-/// An audit event emitted for every accepted send and every refused request.
+/// An audit event emitted for accepted hub actions and refused requests.
 ///
 /// Launch tokens and message bodies are intentionally absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +143,13 @@ pub enum ShimAuditEvent {
         kind: Option<MessageKind>,
         /// Stable typed error code.
         error: ShimError,
+    },
+    /// A project queue request was accepted.
+    ProjectQueued {
+        /// Project requested by the Lab Coordinator.
+        project: ProjectId,
+        /// Whether the project was newly appended to the queue.
+        added: bool,
     },
 }
 
@@ -152,6 +178,9 @@ impl ShimAuditEvent {
                     .unwrap_or_else(|| "unknown".to_string()),
                 kind
             ),
+            Self::ProjectQueued { project, added } => {
+                format!("hub_project_queued:{project}:added={added}")
+            }
         }
     }
 }
@@ -161,6 +190,7 @@ type AuditCallback = Arc<dyn Fn(ShimAuditEvent) + Send + Sync + 'static>;
 struct ShimState {
     router: Router,
     tokens: Mutex<HashMap<String, Role>>,
+    scheduler: Option<crate::scheduler::Scheduler>,
     audit: AuditCallback,
 }
 
@@ -179,7 +209,25 @@ impl HubShim {
         router: Router,
         audit: impl Fn(ShimAuditEvent) + Send + Sync + 'static,
     ) -> io::Result<Self> {
-        let socket_path = socket_path.into();
+        Self::start_inner(socket_path.into(), router, None, audit)
+    }
+
+    /// Binds a socket and serves message and Lab Coordinator scheduler requests.
+    pub fn start_with_scheduler(
+        socket_path: impl Into<PathBuf>,
+        router: Router,
+        scheduler: crate::scheduler::Scheduler,
+        audit: impl Fn(ShimAuditEvent) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        Self::start_inner(socket_path.into(), router, Some(scheduler), audit)
+    }
+
+    fn start_inner(
+        socket_path: PathBuf,
+        router: Router,
+        scheduler: Option<crate::scheduler::Scheduler>,
+        audit: impl Fn(ShimAuditEvent) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
         if let Some(parent) = socket_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -200,6 +248,7 @@ impl HubShim {
         let state = Arc::new(ShimState {
             router,
             tokens: Mutex::new(HashMap::new()),
+            scheduler,
             audit: Arc::new(audit),
         });
         let stop = Arc::new(AtomicBool::new(false));
@@ -361,6 +410,17 @@ impl HubClient {
         }
     }
 
+    /// Enqueues a project through the host-owned scheduler.
+    pub fn enqueue(&self, project: ProjectId) -> Result<bool, HubClientError> {
+        match self.request(WireRequest::Enqueue {
+            token: self.token.expose().to_string(),
+            project,
+        })? {
+            WireOutput::Enqueued { added } => Ok(added),
+            _ => Err(HubClientError::Protocol),
+        }
+    }
+
     fn request(&self, request: WireRequest) -> Result<WireOutput, HubClientError> {
         let mut stream = UnixStream::connect(&self.socket_path)
             .map_err(|error| HubClientError::Socket(error.to_string()))?;
@@ -425,6 +485,10 @@ enum WireRequest {
     Ack {
         token: String,
     },
+    Enqueue {
+        token: String,
+        project: ProjectId,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -441,6 +505,7 @@ enum WireOutput {
     Inbox(Vec<Message>),
     Next(Option<Message>),
     Ack { count: usize },
+    Enqueued { added: bool },
 }
 
 fn serve(listener: UnixListener, state: Arc<ShimState>, stop: Arc<AtomicBool>) {
@@ -554,9 +619,12 @@ fn dispatch(state: &ShimState, request: WireRequest) -> WireResponse {
                 WireResponse::Error { error }
             }
         },
-        WireRequest::Ack { token } => match resolve_role(state, &token)
-            .and_then(|role| state.router.ack(&role).map_err(map_routing_error))
-        {
+        WireRequest::Ack { token } => match resolve_role(state, &token).and_then(|role| {
+            if role == Role::LabCoordinator {
+                return Err(ShimError::HostAcknowledgementRequired);
+            }
+            state.router.ack(&role).map_err(map_routing_error)
+        }) {
             Ok(count) => WireResponse::Ok {
                 output: WireOutput::Ack { count },
             },
@@ -565,6 +633,40 @@ fn dispatch(state: &ShimState, request: WireRequest) -> WireResponse {
                 WireResponse::Error { error }
             }
         },
+        WireRequest::Enqueue { token, project } => {
+            let role = match resolve_role(state, &token) {
+                Ok(role) => role,
+                Err(error) => {
+                    audit_refusal(state, None, None, None, error.clone());
+                    return WireResponse::Error { error };
+                }
+            };
+            if role != Role::LabCoordinator {
+                let error = ShimError::LabCoordinatorRequired;
+                audit_refusal(state, Some(role), None, None, error.clone());
+                return WireResponse::Error { error };
+            }
+            let Some(scheduler) = state.scheduler.as_ref() else {
+                let error = ShimError::SchedulerUnavailable;
+                audit_refusal(state, Some(role), None, None, error.clone());
+                return WireResponse::Error { error };
+            };
+            match scheduler.enqueue(project.clone()) {
+                Ok(added) => {
+                    (state.audit)(ShimAuditEvent::ProjectQueued { project, added });
+                    WireResponse::Ok {
+                        output: WireOutput::Enqueued { added },
+                    }
+                }
+                Err(error) => {
+                    let error = ShimError::Scheduler {
+                        message: error.to_string(),
+                    };
+                    audit_refusal(state, Some(role), None, None, error.clone());
+                    WireResponse::Error { error }
+                }
+            }
+        }
     }
 }
 
@@ -635,6 +737,92 @@ mod tests {
 
     fn client(shim: &HubShim, token: LaunchToken) -> HubClient {
         HubClient::new(shim.socket_path(), token)
+    }
+
+    #[test]
+    fn scheduler_enabled_shim_supports_mail_and_coordinator_enqueue() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        let scheduler =
+            crate::scheduler::Scheduler::open(temp.path().join("scheduler")).expect("scheduler");
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let audit_events = Arc::clone(&events);
+        let shim = HubShim::start_with_scheduler(
+            temp.path().join("hub.sock"),
+            router,
+            scheduler,
+            move |event| audit_events.lock().expect("events").push(event),
+        )
+        .expect("shim");
+        let coordinator = client(
+            &shim,
+            shim.register_role(Role::LabCoordinator)
+                .expect("coordinator token"),
+        );
+        let user = client(&shim, shim.register_role(Role::User).expect("user token"));
+
+        let sent = coordinator
+            .send(
+                Role::User,
+                MessageKind::Report,
+                None,
+                "Progress",
+                "Project queued.",
+            )
+            .expect("send report");
+        assert_eq!(user.next().expect("next message"), Some(sent.clone()));
+        assert_eq!(user.inbox().expect("inbox"), vec![sent]);
+        assert_eq!(user.ack().expect("acknowledge"), 1);
+        assert!(user.inbox().expect("empty inbox").is_empty());
+
+        assert!(coordinator.enqueue(project("project-a")).expect("enqueue"));
+        assert!(
+            !coordinator
+                .enqueue(project("project-a"))
+                .expect("duplicate")
+        );
+        let scheduler = crate::scheduler::Scheduler::open(temp.path().join("scheduler"))
+            .expect("reopened scheduler");
+        assert_eq!(
+            scheduler.queued_projects().expect("queued projects"),
+            vec![project("project-a")]
+        );
+        let events = events.lock().expect("events");
+        let queued_event = events.iter().find(|event| {
+            matches!(
+                event,
+                ShimAuditEvent::ProjectQueued {
+                    project: queued,
+                    added: true
+                } if queued == &project("project-a")
+            )
+        });
+        assert_eq!(
+            queued_event.map(ShimAuditEvent::audit_summary).as_deref(),
+            Some("hub_project_queued:project-a:added=true")
+        );
+    }
+
+    #[test]
+    fn only_lab_coordinator_can_enqueue_projects() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        let scheduler =
+            crate::scheduler::Scheduler::open(temp.path().join("scheduler")).expect("scheduler");
+        let shim =
+            HubShim::start_with_scheduler(temp.path().join("hub.sock"), router, scheduler, |_| {})
+                .expect("shim");
+        let user = client(&shim, shim.register_role(Role::User).expect("user token"));
+
+        assert!(matches!(
+            user.enqueue(project("project-a")),
+            Err(HubClientError::Shim(ShimError::LabCoordinatorRequired))
+        ));
+        let unknown = client(&shim, LaunchToken::from_raw("unknown-token".to_string()));
+        assert!(matches!(
+            unknown.enqueue(project("project-a")),
+            Err(HubClientError::Shim(ShimError::UnknownToken))
+        ));
     }
 
     #[test]
@@ -809,6 +997,34 @@ mod tests {
         assert_eq!(worker.next().expect("next"), unread.first().cloned());
         assert_eq!(worker.ack().expect("ack"), 1);
         assert!(worker.inbox().expect("empty inbox").is_empty());
+    }
+
+    #[test]
+    fn lab_coordinator_cannot_ack_before_its_host_turn_succeeds() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        router
+            .send(OutgoingMessage::new(
+                Role::User,
+                Role::LabCoordinator,
+                MessageKind::UserRequest,
+                "request",
+                "do work",
+            ))
+            .expect("message");
+        let shim =
+            HubShim::start(temp.path().join("hub.sock"), router.clone(), |_| {}).expect("shim");
+        let coordinator = client(
+            &shim,
+            shim.register_role(Role::LabCoordinator)
+                .expect("coordinator token"),
+        );
+
+        assert!(matches!(
+            coordinator.ack(),
+            Err(HubClientError::Shim(ShimError::HostAcknowledgementRequired))
+        ));
+        assert_eq!(router.inbox(&Role::LabCoordinator).expect("inbox").len(), 1);
     }
 
     #[test]

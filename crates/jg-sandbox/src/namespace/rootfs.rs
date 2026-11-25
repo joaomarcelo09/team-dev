@@ -13,6 +13,7 @@ use crate::namespace::util::{
 };
 use crate::namespace::{EGRESS_SOCKET_PATH, HUB_SOCKET_PATH};
 use crate::namespace::{SANDBOX_GID, SANDBOX_UID};
+use crate::scope::FONT_ROOT;
 use crate::spec::SandboxSpec;
 
 const DEVICE_NODES: [&str; 5] = ["null", "zero", "full", "random", "urandom"];
@@ -25,7 +26,7 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
     make_mounts_private()?;
     mount_tmpfs(&root, &format!("mode=0755,size={}", spec.disk.root_bytes))?;
 
-    for dir in ["usr", "etc", "proc", "dev", "tmp", "lab"] {
+    for dir in ["usr", "etc", "proc", "dev", "tmp", "lab", "font"] {
         create_dir(root.join(dir))?;
     }
 
@@ -46,6 +47,9 @@ pub(crate) fn setup_rootfs(spec: &SandboxSpec) -> Result<()> {
 
     bind_rw(&spec.lab_dir, &root.join("lab"))?;
     bind_lab_read_only(&spec.lab_dir, &spec.lab_ro_binds, &root)?;
+    if let Some(font_dir) = &spec.font_dir {
+        bind_non_recursive(font_dir, &root.join(strip_root(Path::new(FONT_ROOT))))?;
+    }
     create_usr_symlinks(&root)?;
     write_etc(&root, spec)?;
 

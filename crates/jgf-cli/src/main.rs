@@ -7,7 +7,10 @@ use std::{
 };
 
 use clap::{Args, Parser, Subcommand};
+use jgf_cli::coordinator::{self, CoordinatorConfig};
 use jgf_cli::e2e::{self, E2eConfig, RunOutcome};
+use jgf_cli::lab::{self, LabArgs};
+use jgf_cli::mail::{self, MailArgs};
 use jgf_hub::BrokerAction;
 
 /// Dark Factory: autonomous lab for building software from specs.
@@ -24,6 +27,12 @@ enum Command {
     E2e(E2eArgs),
     /// Submit one JSON GitHub action to the host broker from an in-lab role.
     Broker(BrokerArgs),
+    /// Read or send messages through the host-owned lab router.
+    Mail(MailArgs),
+    /// Create or queue a lab project.
+    Lab(LabArgs),
+    /// Supervise the Lab Coordinator or one project's Co-coordinator.
+    Coordinator(CoordinatorArgs),
 }
 
 #[derive(Args)]
@@ -31,6 +40,56 @@ struct BrokerArgs {
     /// JSON action object (owner and project are resolved by the host).
     #[arg(long, value_name = "JSON")]
     request: String,
+}
+
+#[derive(Args)]
+struct CoordinatorArgs {
+    #[command(subcommand)]
+    action: CoordinatorAction,
+}
+
+#[derive(Subcommand)]
+enum CoordinatorAction {
+    /// Run the selected coordinator supervisor until stopped.
+    Run(CoordinatorRunArgs),
+    /// Ask the selected coordinator supervisor to stop.
+    Stop(CoordinatorStateArgs),
+    /// Print the selected coordinator supervisor status.
+    Status(CoordinatorStateArgs),
+}
+
+#[derive(Args)]
+struct CoordinatorRunArgs {
+    /// Dark Factory data directory.
+    #[arg(long = "state-dir")]
+    state_dir: Option<PathBuf>,
+
+    /// Lab identifier.
+    #[arg(long, required = true)]
+    lab: String,
+
+    /// Run the Co-coordinator for this project instead of the Lab Coordinator.
+    #[arg(long)]
+    project: Option<String>,
+
+    /// Run with a fake role launcher and no network access.
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct CoordinatorStateArgs {
+    /// Dark Factory data directory.
+    #[arg(long = "state-dir")]
+    state_dir: Option<PathBuf>,
+
+    /// Lab identifier.
+    #[arg(long, required = true)]
+    lab: String,
+
+    /// Select one project's Co-coordinator.
+    #[arg(long)]
+    project: Option<String>,
 }
 
 #[derive(Args)]
@@ -88,6 +147,9 @@ fn main() -> ExitCode {
     match cli.command {
         Some(Command::E2e(args)) => run_e2e(args),
         Some(Command::Broker(args)) => run_broker(args),
+        Some(Command::Mail(args)) => run_mail(args),
+        Some(Command::Lab(args)) => run_lab(args),
+        Some(Command::Coordinator(args)) => run_coordinator(args),
         None => {
             println!(
                 "jg-factory: state dir {}",
@@ -95,6 +157,98 @@ fn main() -> ExitCode {
             );
             ExitCode::SUCCESS
         }
+    }
+}
+
+fn run_mail(args: MailArgs) -> ExitCode {
+    run_in_lab_command("mail", mail::run(args))
+}
+
+fn run_lab(args: LabArgs) -> ExitCode {
+    run_in_lab_command("lab", lab::run(args))
+}
+
+fn run_in_lab_command(name: &str, result: Result<(), String>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("jg-factory {name}: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_coordinator(args: CoordinatorArgs) -> ExitCode {
+    match args.action {
+        CoordinatorAction::Run(args) => {
+            let config = match coordinator_config(args.state_dir, args.lab, args.project) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("jg-factory coordinator: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match coordinator::run_cli(&config, args.dry_run) {
+                Ok(()) => {
+                    println!("coordinator: stopped");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("jg-factory coordinator: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        CoordinatorAction::Stop(args) => {
+            let config = match coordinator_config(args.state_dir, args.lab, args.project) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("jg-factory coordinator: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match coordinator::stop(&config) {
+                Ok(path) => {
+                    println!("coordinator stop requested at {}", path.display());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("jg-factory coordinator: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        CoordinatorAction::Status(args) => {
+            let config = match coordinator_config(args.state_dir, args.lab, args.project) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("jg-factory coordinator: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match coordinator::status(&config) {
+                Ok(status) => {
+                    println!("{}", status.to_json());
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("jg-factory coordinator: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+fn coordinator_config(
+    state_dir: Option<PathBuf>,
+    lab: String,
+    project: Option<String>,
+) -> Result<CoordinatorConfig, jgf_cli::coordinator::CoordinatorError> {
+    let state_dir = state_dir.unwrap_or_else(jgf_core::paths::data_dir);
+    match project {
+        Some(project) => CoordinatorConfig::for_project(state_dir, lab, project),
+        None => CoordinatorConfig::new(state_dir, lab),
     }
 }
 
@@ -252,5 +406,123 @@ mod tests {
             serde_json::from_str(&args.request).expect("parse broker action");
         assert_eq!(action.action, jgf_core::GithubAction::CreateRepo);
         assert_eq!(action.repo, "sample");
+    }
+
+    #[test]
+    fn coordinator_run_parses_lab_state_dir_and_dry_run() {
+        let cli = Cli::try_parse_from([
+            "jg-factory",
+            "coordinator",
+            "run",
+            "--lab",
+            "alpha",
+            "--state-dir",
+            "/tmp/jgf-state",
+            "--dry-run",
+        ])
+        .expect("parse coordinator command");
+
+        let Some(Command::Coordinator(CoordinatorArgs {
+            action: CoordinatorAction::Run(args),
+        })) = cli.command
+        else {
+            panic!("expected coordinator run command");
+        };
+        assert_eq!(args.lab, "alpha");
+        assert_eq!(args.state_dir, Some(PathBuf::from("/tmp/jgf-state")));
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn coordinator_project_commands_parse_for_each_action() {
+        let run = Cli::try_parse_from([
+            "jg-factory",
+            "coordinator",
+            "run",
+            "--lab",
+            "alpha",
+            "--project",
+            "project-a",
+            "--dry-run",
+        ])
+        .expect("parse project run");
+        let Some(Command::Coordinator(CoordinatorArgs {
+            action: CoordinatorAction::Run(args),
+        })) = run.command
+        else {
+            panic!("expected coordinator run command");
+        };
+        assert_eq!(args.project.as_deref(), Some("project-a"));
+
+        for action in ["stop", "status"] {
+            let parsed = Cli::try_parse_from([
+                "jg-factory",
+                "coordinator",
+                action,
+                "--lab",
+                "alpha",
+                "--project",
+                "project-a",
+            ])
+            .expect("parse project state command");
+            let Some(Command::Coordinator(CoordinatorArgs { action })) = parsed.command else {
+                panic!("expected coordinator command");
+            };
+            match action {
+                CoordinatorAction::Stop(args) | CoordinatorAction::Status(args) => {
+                    assert_eq!(args.project.as_deref(), Some("project-a"));
+                }
+                CoordinatorAction::Run(_) => panic!("expected state command"),
+            }
+        }
+    }
+
+    #[test]
+    fn mail_commands_parse_the_documented_forms() {
+        for command in [
+            vec!["jg-factory", "mail", "inbox"],
+            vec!["jg-factory", "mail", "next"],
+            vec!["jg-factory", "mail", "ack"],
+            vec![
+                "jg-factory",
+                "mail",
+                "send",
+                "--to",
+                "user",
+                "--kind",
+                "report",
+                "--body",
+                "Queued.",
+            ],
+        ] {
+            assert!(
+                matches!(
+                    Cli::try_parse_from(command)
+                        .expect("parse mail command")
+                        .command,
+                    Some(Command::Mail(_))
+                ),
+                "expected mail command"
+            );
+        }
+    }
+
+    #[test]
+    fn lab_project_create_and_queue_parse() {
+        let create = Cli::try_parse_from([
+            "jg-factory",
+            "lab",
+            "project",
+            "create",
+            "project-a",
+            "--spec",
+            "/tmp/spec.md",
+        ])
+        .expect("parse project create");
+        assert!(matches!(create.command, Some(Command::Lab(_))));
+
+        let queue = Cli::try_parse_from(["jg-factory", "lab", "project", "queue", "project-a"])
+            .expect("parse project queue");
+        assert!(matches!(queue.command, Some(Command::Lab(_))));
     }
 }

@@ -7,6 +7,8 @@ use crate::spec::MIN_DISK_BYTES;
 
 /// The lab directory inside the sandbox; every scope path lives below it.
 pub const LAB_ROOT: &str = "/lab";
+/// The lab's projects directory at the sandbox root.
+pub const FONT_ROOT: &str = "/font";
 /// Where a scoped exec sees its worktree.
 pub const WORKSPACE: &str = "/workspace";
 /// The private `/tmp` every scoped exec gets.
@@ -46,6 +48,10 @@ pub struct ProjectLimits {
 pub struct ExecScope {
     /// Read-write for a coder, read-only for a reviewer or tester.
     pub access: ScopeAccess,
+    /// How this exec may access the lab's project directory; `None` hides it.
+    pub font_access: Option<ScopeAccess>,
+    /// Restrict the font mount to one project directory.
+    pub font_project: Option<String>,
     /// The project worktree, mounted at `/workspace`.
     pub worktree: PathBuf,
     /// The worktree's own git directory (`<common>/worktrees/<name>`).
@@ -67,6 +73,8 @@ impl ExecScope {
     pub fn new(access: ScopeAccess, worktree: impl Into<PathBuf>) -> Self {
         Self {
             access,
+            font_access: None,
+            font_project: None,
             worktree: worktree.into(),
             git_dir: None,
             common_dir: None,
@@ -92,6 +100,18 @@ impl ExecScope {
     /// Set the scratch home mounted at `/tmp/home` inside this scoped exec.
     pub fn with_scratch_home(mut self, scratch_home: impl Into<PathBuf>) -> Self {
         self.scratch_home = Some(scratch_home.into());
+        self
+    }
+
+    /// Set access to the lab's project directory at `/font`.
+    pub fn with_font_access(mut self, access: ScopeAccess) -> Self {
+        self.font_access = Some(access);
+        self
+    }
+
+    /// Limit the font mount to one project's directory.
+    pub fn with_font_project(mut self, project: impl Into<String>) -> Self {
+        self.font_project = Some(project.into());
         self
     }
 
@@ -143,6 +163,23 @@ impl ExecScope {
                 ));
             }
             None => {}
+        }
+        if let Some(font_project) = &self.font_project {
+            validate_project_name(font_project)?;
+            if self.font_access.is_none() {
+                return Err(scope_error(
+                    "a font project requires font access".to_string(),
+                ));
+            }
+            if self
+                .project
+                .as_deref()
+                .is_some_and(|project| project != font_project)
+            {
+                return Err(scope_error(
+                    "font project must match the scoped project".to_string(),
+                ));
+            }
         }
         if let Some(limits) = &self.limits {
             validate_project_limits(limits)?;

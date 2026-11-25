@@ -15,12 +15,12 @@ use std::{
 use jg_sandbox::scope::{SCOPED_HOME, WORKSPACE};
 use jg_sandbox::{
     Backend, EgressEvent, EgressPolicy, EgressProxy, EgressSpec, ExecOutput, ExecRequest,
-    ExecScope, NamespaceBackend, SandboxHandle, SandboxSpec, default_ro_binds,
+    ExecScope, NamespaceBackend, SandboxHandle, SandboxSpec, ScopeAccess, default_ro_binds,
 };
 use jgf_core::{AuditKind, AuditLog, GithubGrant, ProjectId};
 use jgf_hub::{
     Broker, BrokerShim, BrokerShimAuditEvent, GhCliBackend, HubShim, Role as HubRole, Router,
-    ShimAuditEvent,
+    Scheduler, ShimAuditEvent,
 };
 
 use crate::{
@@ -47,6 +47,8 @@ pub(crate) struct ClaudeSandbox {
     live: Mutex<Option<LiveSandbox>>,
     broker_config: Option<BrokerRuntimeConfig>,
     project_root: PathBuf,
+    router_dir: Option<PathBuf>,
+    scheduler_dir: Option<PathBuf>,
 }
 
 struct LiveSandbox {
@@ -56,6 +58,7 @@ struct LiveSandbox {
     broker: Option<BrokerShim<GhCliBackend, jgf_core::FileSecretStore>>,
     lab_dir: PathBuf,
     work_tree: PathBuf,
+    font_dir: PathBuf,
     scratch_root: PathBuf,
     credentials_file: PathBuf,
     runtime: RuntimeLayout,
@@ -80,6 +83,7 @@ struct ClaudeExec<'a> {
     scratch: &'a ScratchHome,
     timeout: Duration,
     scope: Option<ExecScope>,
+    expected_scope_access: Option<(ScopeAccess, Option<ScopeAccess>)>,
     message_environment: &'a BTreeMap<String, String>,
     kill: Option<&'a dyn KillSwitch>,
 }
@@ -132,12 +136,24 @@ impl ClaudeSandbox {
             live: Mutex::new(None),
             broker_config: None,
             project_root: state_dir,
+            router_dir: None,
+            scheduler_dir: None,
         }
     }
 
     pub(crate) fn with_broker(mut self, config: BrokerRuntimeConfig) -> Self {
         self.project_root = config.secret_dir.clone();
         self.broker_config = Some(config);
+        self
+    }
+
+    pub(crate) fn with_router_dir(mut self, router_dir: impl Into<PathBuf>) -> Self {
+        self.router_dir = Some(router_dir.into());
+        self
+    }
+
+    pub(crate) fn with_scheduler_dir(mut self, scheduler_dir: impl Into<PathBuf>) -> Self {
+        self.scheduler_dir = Some(scheduler_dir.into());
         self
     }
 
@@ -253,18 +269,37 @@ impl ClaudeSandbox {
                 &host_home,
             )?;
             let hub_socket_path = state_dir.join("hub.sock");
-            let router = Router::open(state_dir.join("mail"))
+            let router_dir = self
+                .router_dir
+                .clone()
+                .unwrap_or_else(|| state_dir.join("mail"));
+            let router = Router::open(router_dir)
                 .map_err(|error| format!("could not open lab message router: {error}"))?;
-            let audit_world = Arc::clone(&self.world);
-            let hub = HubShim::start(&hub_socket_path, router, move |event: ShimAuditEvent| {
-                let _ = audit_world.record_hub_event(&event);
-            })
+            let hub = if let Some(scheduler_dir) = &self.scheduler_dir {
+                let scheduler = Scheduler::open(scheduler_dir)
+                    .map_err(|error| format!("could not open lab scheduler: {error}"))?;
+                let audit_world = Arc::clone(&self.world);
+                HubShim::start_with_scheduler(
+                    &hub_socket_path,
+                    router,
+                    scheduler,
+                    move |event: ShimAuditEvent| {
+                        let _ = audit_world.record_hub_event(&event);
+                    },
+                )
+            } else {
+                let audit_world = Arc::clone(&self.world);
+                HubShim::start(&hub_socket_path, router, move |event: ShimAuditEvent| {
+                    let _ = audit_world.record_hub_event(&event);
+                })
+            }
             .map_err(|error| format!("could not start the lab hub shim: {error}"))?;
             let broker = self.start_broker_shim(&state_dir)?;
             let spec = build_sandbox_spec(
                 &state_dir,
                 &world_spec.lab_dir,
                 &world_spec.work_tree,
+                &world_spec.font_dir,
                 &world_spec.read_only_git,
                 &credentials_file,
                 &proxy,
@@ -283,6 +318,7 @@ impl ClaudeSandbox {
                 broker,
                 lab_dir: world_spec.lab_dir.clone(),
                 work_tree: world_spec.work_tree.clone(),
+                font_dir: world_spec.font_dir.clone(),
                 scratch_root: world_spec.scratch_home.clone(),
                 credentials_file,
                 runtime,
@@ -371,6 +407,7 @@ impl ClaudeSandbox {
             scratch,
             timeout,
             scope: None,
+            expected_scope_access: None,
             message_environment: &BTreeMap::new(),
             kill,
         })
@@ -453,8 +490,15 @@ impl ClaudeSandbox {
             let expected_scope_path = relative_work_tree.map(|path| Path::new("/lab").join(path));
             let relative_scratch = execution.scratch.root().strip_prefix(&live.lab_dir).ok();
             let expected_scratch_path = relative_scratch.map(|path| Path::new("/lab").join(path));
+            let access_mismatch =
+                execution
+                    .expected_scope_access
+                    .is_some_and(|(worktree, font)| {
+                        scope.access != worktree || scope.font_access != font
+                    });
             if expected_scope_path.as_ref() != Some(&scope.worktree)
                 || expected_scratch_path.as_ref() != scope.scratch_home.as_ref()
+                || access_mismatch
                 || scope.validate().is_err()
             {
                 return ChildRun {
@@ -589,6 +633,19 @@ impl ClaudeSandbox {
             .ok_or_else(|| "jg-sandbox world is missing; refusing to launch a role".to_string())
     }
 
+    pub(crate) fn role_font_dir(&self) -> Result<PathBuf, String> {
+        if self.world.status() == WorldStatus::Destroyed {
+            return Err("jg-sandbox world is destroyed; refusing to launch a role".to_string());
+        }
+        let live = self
+            .live
+            .lock()
+            .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
+        live.as_ref()
+            .map(|live| live.font_dir.clone())
+            .ok_or_else(|| "jg-sandbox world is missing; refusing to launch a role".to_string())
+    }
+
     pub(crate) fn audit_role_start(
         &self,
         project: &str,
@@ -688,6 +745,10 @@ impl ClaudeSandbox {
             .collect();
         message_environment.extend(execution.message_environment());
         message_environment.extend(execution.broker_environment());
+        let expected_scope_access = Some((
+            execution.role.worktree_access(),
+            execution.role.font_access(),
+        ));
         self.run_claude_with_scope(ClaudeExec {
             binary: &self.binary,
             argv: &execution.argv,
@@ -695,6 +756,7 @@ impl ClaudeSandbox {
             scratch: &scratch,
             timeout: execution.timeout,
             scope: Some(execution.scope),
+            expected_scope_access,
             message_environment: &message_environment,
             kill,
         })
@@ -807,6 +869,7 @@ fn build_sandbox_spec(
     state_dir: &Path,
     lab_dir: &Path,
     work_tree: &Path,
+    font_dir: &Path,
     read_only_git: &Path,
     credentials_file: &Path,
     proxy: &EgressProxy,
@@ -817,10 +880,18 @@ fn build_sandbox_spec(
         .map_err(|error| format!("could not resolve jg-sandbox lab directory: {error}"))?;
     let work_tree = fs::canonicalize(work_tree)
         .map_err(|error| format!("could not resolve Claude work tree: {error}"))?;
+    let font_metadata = fs::symlink_metadata(font_dir)
+        .map_err(|error| format!("could not inspect lab projects directory: {error}"))?;
+    if !font_metadata.is_dir() || font_metadata.file_type().is_symlink() {
+        return Err("lab projects directory must be a plain directory".to_string());
+    }
+    let font_dir = fs::canonicalize(font_dir)
+        .map_err(|error| format!("could not resolve lab projects directory: {error}"))?;
     if work_tree != lab_dir.join(LAB_WORK_DIR) {
         return Err("Claude work tree must be the lab's work directory".to_string());
     }
     let mut spec = SandboxSpec::new(state_dir, &lab_dir);
+    spec.font_dir = Some(font_dir);
     let mut ro_binds = default_ro_binds();
     ro_binds.extend(runtime.directories.iter().cloned());
     ro_binds.push(credentials_file.to_path_buf());
@@ -959,9 +1030,11 @@ mod tests {
         let temp = tempfile::tempdir().expect("temp dir");
         let lab_dir = temp.path().join("lab");
         let work_tree = lab_dir.join(LAB_WORK_DIR);
+        let font_dir = temp.path().join("font");
         let git = work_tree.join(".git");
         let host_home = temp.path().join("host-home");
         fs::create_dir_all(&git).expect("git directory");
+        fs::create_dir_all(&font_dir).expect("font directory");
         fs::create_dir_all(host_home.join(".claude")).expect("claude directory");
         let credentials = host_home.join(".claude/.credentials.json");
         fs::write(&credentials, "placeholder").expect("placeholder credentials");
@@ -985,6 +1058,7 @@ mod tests {
             &state_dir,
             &lab_dir,
             &work_tree,
+            &font_dir,
             &git,
             &credentials,
             &proxy,
@@ -994,6 +1068,7 @@ mod tests {
         .expect("sandbox spec");
 
         assert_eq!(spec.lab_dir, lab_dir);
+        assert_eq!(spec.font_dir.as_deref(), Some(font_dir.as_path()));
         assert_eq!(spec.lab_ro_binds, vec![git.clone()]);
         assert_eq!(spec.egress.as_ref().map(|egress| egress.port), Some(3128));
         assert!(spec.ro_binds.contains(&credentials));
@@ -1005,6 +1080,7 @@ mod tests {
             &state_dir,
             &lab_dir,
             &work_tree,
+            &font_dir,
             &git,
             &credentials,
             &proxy,
