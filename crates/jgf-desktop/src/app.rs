@@ -1224,6 +1224,34 @@ fn status_text(lab: &LabView, unread: usize) -> String {
     }
 }
 
+/// Largest supervisor log kept before it is restarted empty.
+const SUPERVISOR_LOG_MAX_BYTES: u64 = 1024 * 1024;
+
+/// Opens the owner-only log that receives the supervisor's diagnostics.
+///
+/// The supervisor reports why a turn failed on stderr, never in status.json.
+/// Without this file those diagnostics were discarded. It is mode 0600 because
+/// the diagnostics come from the lab's own output, and it starts over once it
+/// grows past [`SUPERVISOR_LOG_MAX_BYTES`].
+fn supervisor_log(state_dir: &Path, lab: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = state_dir.join("labs").join(lab).join("coordinator");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("supervisor.log");
+    let too_large = std::fs::metadata(&path)
+        .map(|metadata| metadata.len() > SUPERVISOR_LOG_MAX_BYTES)
+        .unwrap_or(false);
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).mode(0o600);
+    if too_large {
+        options.write(true).truncate(true);
+    } else {
+        options.append(true);
+    }
+    options.open(path)
+}
+
 /// Starts or asks the coordinator supervisor to stop via the adjacent CLI or PATH.
 fn spawn_coordinator(
     state_dir: PathBuf,
@@ -1235,6 +1263,7 @@ fn spawn_coordinator(
         CoordinatorAction::Start => "run",
         CoordinatorAction::Stop => "stop",
     };
+    let log = supervisor_log(&state_dir, &lab);
     let mut command = Command::new(binary);
     command
         .arg("coordinator")
@@ -1248,7 +1277,7 @@ fn spawn_coordinator(
         CoordinatorAction::Start => command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(log.map_or_else(|_| Stdio::null(), Stdio::from))
             .spawn()
             .map(|_| ())
             .map_err(|error| format!("Could not start coordinator: {error}")),
@@ -1310,6 +1339,34 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn supervisor_log_is_owner_only_and_restarts_when_too_large() {
+        use std::{io::Write, os::unix::fs::PermissionsExt};
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let mut log = supervisor_log(temp.path(), "default").expect("open log");
+        writeln!(log, "first").expect("write log");
+        let path = temp.path().join("labs/default/coordinator/supervisor.log");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let mut log = supervisor_log(temp.path(), "default").expect("reopen log");
+        writeln!(log, "second").expect("append log");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("read"),
+            "first\nsecond\n"
+        );
+
+        std::fs::write(&path, vec![b'x'; SUPERVISOR_LOG_MAX_BYTES as usize + 1]).expect("grow");
+        let mut log = supervisor_log(temp.path(), "default").expect("restart log");
+        writeln!(log, "fresh").expect("write fresh");
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "fresh\n");
+    }
 
     fn task(key: &str) -> Task {
         task_in(key, "alpha", Column::Backlog)
