@@ -171,7 +171,7 @@ impl ClaudeSandbox {
             RunOutcome::Killed => RunEnd::Killed,
             RunOutcome::Failed { .. } | RunOutcome::BudgetExhausted => RunEnd::Failure,
         };
-        self.world.finish(outcome, || self.destroy())
+        self.world.finish(outcome, || self.teardown())
     }
 
     /// Creates the one isolated world used by both Claude workers in this run.
@@ -509,7 +509,7 @@ impl ClaudeSandbox {
         }
         if execution.kill.is_some_and(|kill| kill.killed()) {
             drop(live_guard);
-            let destroy_error = self.world.finish(RunEnd::Killed, || self.destroy()).err();
+            let destroy_error = self.world.finish(RunEnd::Killed, || self.teardown()).err();
             let mut result = ChildRun {
                 killed: true,
                 ..ChildRun::default()
@@ -595,7 +595,7 @@ impl ClaudeSandbox {
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if execution.kill.is_some_and(|kill| kill.killed()) {
                         let destroy_error =
-                            self.world.finish(RunEnd::Killed, || self.destroy()).err();
+                            self.world.finish(RunEnd::Killed, || self.teardown()).err();
                         let _ = receiver.recv_timeout(KILL_WAIT_TIMEOUT);
                         let mut result = ChildRun {
                             killed: true,
@@ -755,29 +755,38 @@ impl ClaudeSandbox {
     }
 
     /// Destroys the world and removes the private child home; safe to call more than once.
+    #[cfg(test)]
     pub(crate) fn destroy(&self) -> Result<(), String> {
-        self.world.destroy(|| {
-            let mut live = self
-                .live
-                .lock()
-                .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
-            let Some(active) = live.as_mut() else {
-                return Ok(());
-            };
-            let state_dir = active.handle.state_dir().to_path_buf();
-            let result = self
-                .backend
-                .destroy(&active.handle)
-                .map_err(|error| format!("could not destroy jg-sandbox world: {error}"));
-            cleanup_after_destroy(
-                result,
-                &mut active.hub,
-                &mut active.broker,
-                &mut active.proxy,
-                &state_dir,
-                &active.scratch_root,
-            )
-        })
+        self.world.destroy(|| self.teardown())
+    }
+
+    /// Tears down the live sandbox and its host services.
+    ///
+    /// This is the closure handed to `LabWorld::destroy` and `LabWorld::finish`,
+    /// which already hold the world's destroying state. It must not go through
+    /// `destroy`: re-entering `LabWorld::destroy` fails with "lab world is
+    /// already changing state" and leaves the sandbox init running.
+    fn teardown(&self) -> Result<(), String> {
+        let mut live = self
+            .live
+            .lock()
+            .map_err(|_| "jg-sandbox state lock is poisoned".to_string())?;
+        let Some(active) = live.as_mut() else {
+            return Ok(());
+        };
+        let state_dir = active.handle.state_dir().to_path_buf();
+        let result = self
+            .backend
+            .destroy(&active.handle)
+            .map_err(|error| format!("could not destroy jg-sandbox world: {error}"));
+        cleanup_after_destroy(
+            result,
+            &mut active.hub,
+            &mut active.broker,
+            &mut active.proxy,
+            &state_dir,
+            &active.scratch_root,
+        )
     }
 }
 
@@ -842,7 +851,7 @@ impl Drop for RunningWorld<'_> {
 
 impl Drop for ClaudeSandbox {
     fn drop(&mut self) {
-        let _ = self.world.destroy_if_not_kept(|| self.destroy());
+        let _ = self.world.destroy_if_not_kept(|| self.teardown());
     }
 }
 
@@ -1343,6 +1352,54 @@ mod tests {
         assert!(!socket_path.exists());
         assert!(!state_dir.exists());
         assert!(!scratch_root.exists());
+    }
+
+    #[test]
+    fn killed_finish_tears_down_the_live_world() {
+        let has_credentials = real_home()
+            .map(|home| home.join(".claude/.credentials.json").is_file())
+            .unwrap_or(false);
+        if !has_credentials {
+            eprintln!("skipping: no Claude credentials file to bind into the sandbox");
+            return;
+        }
+        let temp = tempfile::tempdir().expect("temp dir");
+        let lab_dir = temp.path().join("lab");
+        let work_tree = lab_dir.join(LAB_WORK_DIR);
+        fs::create_dir_all(work_tree.join(".git/info")).expect("git info directory");
+        fs::write(work_tree.join(".git/info/exclude"), "").expect("git exclude");
+        let state_dir = temp.path().join("sandbox");
+        let sandbox = ClaudeSandbox::new(&state_dir, "claude");
+        if let Err(error) = sandbox.create(&lab_dir, &work_tree) {
+            eprintln!("skipping: jg-sandbox world unavailable: {error}");
+            return;
+        }
+        let init_pid = {
+            let live = sandbox.live.lock().expect("live lock");
+            live.as_ref().expect("live world").handle.init_pid()
+        };
+
+        sandbox
+            .finish(&RunOutcome::Killed)
+            .expect("a killed run destroys its world");
+
+        assert!(
+            !state_dir.join("state.json").exists(),
+            "sandbox state is removed"
+        );
+        assert!(
+            !state_dir.join("hub.sock").exists(),
+            "hub socket is removed"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{init_pid}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sandbox init {init_pid} still runs after a killed finish"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        sandbox.destroy().expect("a second destroy is a no-op");
     }
 
     #[test]
