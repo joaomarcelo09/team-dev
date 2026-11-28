@@ -1,5 +1,6 @@
 //! Launches factory roles inside a scoped lab-world exec.
 
+use jgf_core::roles::{FactoryRole, Harness, RoleConfig, RoleSettings};
 use std::{
     collections::BTreeMap,
     fmt, fs,
@@ -35,6 +36,19 @@ pub enum Role {
 }
 
 impl Role {
+    /// The matching role in the user's role settings (`roles.toml`).
+    pub fn factory_role(self) -> FactoryRole {
+        match self {
+            Self::LabCoordinator => FactoryRole::LabCoordinator,
+            Self::CoCoordinator => FactoryRole::CoCoordinator,
+            Self::Coder => FactoryRole::Coder,
+            Self::Reviewer => FactoryRole::Reviewer,
+            Self::Tester => FactoryRole::Tester,
+            Self::GitCoder => FactoryRole::GitCoder,
+            Self::WakeUp => FactoryRole::WakeUp,
+        }
+    }
+
     /// Directory name containing this role's `SKILL.md`.
     pub fn skill_directory(self) -> &'static str {
         match self {
@@ -277,15 +291,47 @@ pub trait RoleLaunchExecutor {
 pub struct RoleLauncher<'a> {
     skills_dir: PathBuf,
     executor: &'a dyn RoleLaunchExecutor,
+    role_settings: Option<PathBuf>,
 }
 
 impl<'a> RoleLauncher<'a> {
     /// Creates a launcher for skill files beneath `skills_dir`.
+    ///
+    /// Roles run with the built-in role settings until
+    /// [`Self::with_role_settings`] points the launcher at a `roles.toml`.
     pub fn new(skills_dir: impl Into<PathBuf>, executor: &'a dyn RoleLaunchExecutor) -> Self {
         Self {
             skills_dir: skills_dir.into(),
             executor,
+            role_settings: None,
         }
+    }
+
+    /// Reads each role's harness, model and effort from `path` at every launch,
+    /// so changes saved in the desktop's Settings apply to the next turn. A
+    /// missing file means the built-in defaults.
+    pub fn with_role_settings(mut self, path: impl Into<PathBuf>) -> Self {
+        self.role_settings = Some(path.into());
+        self
+    }
+
+    fn settings_for(&self, role: Role) -> Result<RoleSettings, String> {
+        let config = match &self.role_settings {
+            Some(path) => RoleConfig::load(path)
+                .map_err(|error| format!("could not load role settings: {error}"))?,
+            None => RoleConfig::defaults(),
+        };
+        let factory_role = role.factory_role();
+        let settings = config.resolve(factory_role, &[]);
+        if settings.harness != Harness::ClaudeCode {
+            return Err(format!(
+                "{} is set to the {} harness, which the factory cannot run yet; \
+                 set it to claude-code in Settings",
+                factory_role.as_str(),
+                settings.harness.as_str()
+            ));
+        }
+        Ok(settings)
     }
 
     /// Loads the skill and standards, records the start, and runs the role.
@@ -375,6 +421,7 @@ impl<'a> RoleLauncher<'a> {
         validate_identifier("project id", &request.project_id)?;
         validate_identifier("worker id", &request.worker_id)?;
         validate_identifier("worktree name", &request.worktree_name)?;
+        let settings = self.settings_for(request.role)?;
 
         let lab_dir = fs::canonicalize(self.executor.lab_dir()?)
             .map_err(|error| format!("could not resolve role lab directory: {error}"))?;
@@ -450,6 +497,10 @@ impl<'a> RoleLauncher<'a> {
             argv.push("--no-session-persistence".to_string());
         }
         argv.extend([
+            "--model".to_string(),
+            settings.model,
+            "--effort".to_string(),
+            settings.effort.as_str().to_string(),
             "--max-turns".to_string(),
             request.max_turns.to_string(),
             "--max-budget-usd".to_string(),
@@ -1070,6 +1121,84 @@ mod tests {
         assert!(!debug.contains("untrusted-proxy-value"));
     }
 
+    fn lab_with_task_worktree() -> tempfile::TempDir {
+        let lab = tempfile::tempdir().expect("lab directory");
+        let worktree = lab.path().join("projects/project-a/worktrees/task-1");
+        let git_dir = lab
+            .path()
+            .join("projects/project-a/repository/.git/worktrees/task-1");
+        fs::create_dir_all(&worktree).expect("worktree");
+        fs::create_dir_all(lab.path().join("font")).expect("font directory");
+        fs::create_dir_all(&git_dir).expect("worktree git directory");
+        fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("git pointer");
+        fs::write(git_dir.join("commondir"), "../..\n").expect("common git directory");
+        lab
+    }
+
+    #[test]
+    fn role_settings_choose_the_claude_model_and_effort() {
+        let lab = lab_with_task_worktree();
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let settings = lab.path().join("roles.toml");
+        fs::write(
+            &settings,
+            "[coder]\nharness = \"claude-code\"\nmodel = \"opus\"\neffort = \"xhigh\"\n",
+        )
+        .expect("role settings");
+        let executor = RecordingExecutor {
+            lab_dir: lab.path().to_path_buf(),
+            ..RecordingExecutor::default()
+        };
+        let launcher = RoleLauncher::new(&skills_dir, &executor).with_role_settings(&settings);
+
+        let result = launcher.launch(&request(Role::Coder), None);
+
+        assert!(result.spawn_error.is_none(), "{:?}", result.spawn_error);
+        let launches = executor.launches.lock().expect("launches");
+        assert_eq!(
+            launches[0].argv[4..8],
+            ["--model", "opus", "--effort", "xhigh"].map(String::from)
+        );
+    }
+
+    #[test]
+    fn a_role_on_a_harness_the_factory_cannot_run_is_refused() {
+        let lab = lab_with_task_worktree();
+        let skills_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("factory-skills");
+        let settings = lab.path().join("roles.toml");
+        fs::write(
+            &settings,
+            "[coder]\nharness = \"opencode\"\nmodel = \"deepseek-v4.1-flash\"\neffort = \"high\"\n",
+        )
+        .expect("role settings");
+        let executor = RecordingExecutor {
+            lab_dir: lab.path().to_path_buf(),
+            ..RecordingExecutor::default()
+        };
+        let launcher = RoleLauncher::new(&skills_dir, &executor).with_role_settings(&settings);
+
+        let result = launcher.launch(&request(Role::Coder), None);
+
+        let error = result.spawn_error.expect("a non-Claude harness is refused");
+        assert!(
+            error.contains("coder is set to the opencode harness"),
+            "{error}"
+        );
+        assert!(
+            error.contains("set it to claude-code in Settings"),
+            "{error}"
+        );
+        assert!(executor.launches.lock().expect("launches").is_empty());
+    }
+
     #[test]
     fn every_role_loads_its_skill_and_launches_with_full_allow_and_expected_scope() {
         let lab = tempfile::tempdir().expect("lab directory");
@@ -1117,7 +1246,7 @@ mod tests {
                     .expect("role skill");
             let standards =
                 fs::read_to_string(skills_dir.join("standards/STANDARDS.md")).expect("standards");
-            let system_prompt = execution.argv.get(9).expect("appended system prompt");
+            let system_prompt = execution.argv.get(13).expect("appended system prompt");
             assert!(system_prompt.contains(&skill));
             assert!(system_prompt.contains(&standards));
             assert!(
@@ -1125,14 +1254,24 @@ mod tests {
                     .argv
                     .contains(&"--dangerously-skip-permissions".to_string())
             );
+            let defaults = RoleConfig::defaults().resolve(role.factory_role(), &[]);
             assert_eq!(
-                execution.argv.get(4).map(String::as_str),
-                Some("--max-turns")
+                execution.argv[4..8],
+                [
+                    "--model".to_string(),
+                    defaults.model.clone(),
+                    "--effort".to_string(),
+                    defaults.effort.as_str().to_string(),
+                ]
             );
-            assert_eq!(execution.argv.get(5).map(String::as_str), Some("7"));
-            assert_eq!(execution.argv.get(7).map(String::as_str), Some("1.25"));
             assert_eq!(
                 execution.argv.get(8).map(String::as_str),
+                Some("--max-turns")
+            );
+            assert_eq!(execution.argv.get(9).map(String::as_str), Some("7"));
+            assert_eq!(execution.argv.get(11).map(String::as_str), Some("1.25"));
+            assert_eq!(
+                execution.argv.get(12).map(String::as_str),
                 Some("--append-system-prompt")
             );
             assert_eq!(

@@ -31,6 +31,8 @@ use crate::{
 
 const COORDINATOR_DIR: &str = "coordinator";
 const STATUS_FILE: &str = "status.json";
+/// Role settings saved by the desktop, at the root of the state directory.
+const ROLE_SETTINGS_FILE: &str = "roles.toml";
 const SESSION_FILE: &str = "session";
 const STOP_FILE: &str = "STOP";
 const LOCK_FILE: &str = "supervisor.lock";
@@ -410,7 +412,8 @@ pub fn run_cli(config: &CoordinatorConfig, dry_run: bool) -> Result<(), Coordina
         }
 
         let sandbox = prepare_real_sandbox(&config)?;
-        let launcher = RoleLauncher::new(skills_dir(), &sandbox);
+        let launcher = RoleLauncher::new(skills_dir(), &sandbox)
+            .with_role_settings(config.state_dir.join(ROLE_SETTINGS_FILE));
         let result = (|| {
             let world_dir = coordinator_world_dir(&config);
             sandbox
