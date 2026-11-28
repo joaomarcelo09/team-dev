@@ -603,6 +603,8 @@ impl<L: RoleLaunchService> Supervisor<L> {
             let reason = turn_failure(&child);
             if child.spawn_error.is_some() {
                 eprintln!("coordinator: {reason}");
+            } else if let Some(detail) = turn_failure_diagnostic(&child) {
+                eprintln!("coordinator: {reason}: {detail}");
             }
             return self.fail(&reason);
         }
@@ -1144,7 +1146,48 @@ fn turn_failure(child: &ChildRun) -> String {
         }
         return format!("coordinator turn could not start: {error}");
     }
-    "coordinator turn failed".to_string()
+    match child.output.as_ref().and_then(|output| output.exit_code) {
+        Some(code) => format!("coordinator turn failed (exit {code})"),
+        None => "coordinator turn failed".to_string(),
+    }
+}
+
+/// A sanitized, truncated summary of a failed turn's output for the
+/// supervisor's stderr. It is never written to status.json, which stays free
+/// of child output.
+fn turn_failure_diagnostic(child: &ChildRun) -> Option<String> {
+    let output = child.output.as_ref()?;
+    let detail = crate::child::sanitize_diagnostic(
+        &turn_failure_detail(&output.stdout_text(), &output.stderr_text()),
+        MAX_SPAWN_ERROR_CHARS,
+    );
+    (!detail.is_empty()).then_some(detail)
+}
+
+/// Picks the most useful part of a failed Claude turn's output.
+///
+/// `claude -p --output-format json` reports most errors as a JSON result on
+/// stdout; anything else (bad flags, a missing session) goes to stderr. The
+/// caller sanitizes and truncates the result before it reaches status.json.
+fn turn_failure_detail(stdout: &str, stderr: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        && let Some(result) = value
+            .get("result")
+            .and_then(serde_json::Value::as_str)
+            .filter(|result| !result.trim().is_empty())
+    {
+        return result.to_string();
+    }
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        let lines: Vec<&str> = stderr
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        let start = lines.len().saturating_sub(3);
+        return lines[start..].join(" | ");
+    }
+    stdout.trim().to_string()
 }
 
 fn extract_session_id(child: &ChildRun) -> Option<String> {
@@ -1404,6 +1447,26 @@ mod tests {
             }),
             ..ChildRun::default()
         }
+    }
+
+    #[test]
+    fn turn_failure_detail_prefers_the_json_result_then_the_stderr_tail() {
+        assert_eq!(
+            turn_failure_detail(
+                r#"{"is_error":true,"result":"usage limit reached"}"#,
+                "noise"
+            ),
+            "usage limit reached"
+        );
+        assert_eq!(
+            turn_failure_detail("", "one\n\ntwo\nthree\nfour\n"),
+            "two | three | four"
+        );
+        assert_eq!(turn_failure_detail("{}", ""), "{}");
+        assert_eq!(
+            turn_failure_diagnostic(&failed_child()).as_deref(),
+            Some("do not copy child output into status")
+        );
     }
 
     fn failed_child() -> ChildRun {
@@ -1787,7 +1850,7 @@ mod tests {
         assert_eq!(status.backoff_secs, Some(20));
         assert_eq!(
             status.last_error.as_deref(),
-            Some("coordinator turn failed")
+            Some("coordinator turn failed (exit 1)")
         );
         assert!(!status.to_json().contains("do not copy child output"));
 
