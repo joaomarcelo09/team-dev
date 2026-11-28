@@ -41,6 +41,7 @@ const MAX_BACKOFF_SECS: u64 = 5 * 60;
 const TURN_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const TURN_MAX_TURNS: u32 = 10;
 const TURN_MAX_BUDGET_USD: f64 = 0.5;
+const MAX_SPAWN_ERROR_CHARS: usize = 256;
 const COORDINATOR_PROJECT: &str = "lab-coordinator";
 const COORDINATOR_WORKER: &str = "lab-coordinator";
 const COORDINATOR_WORKTREE: &str = "main";
@@ -579,7 +580,11 @@ impl<L: RoleLaunchService> Supervisor<L> {
             return self.fail("could not refresh coordinator heartbeat");
         }
         if !turn_succeeded(&child) {
-            return self.fail(turn_failure(&child));
+            let reason = turn_failure(&child);
+            if child.spawn_error.is_some() {
+                eprintln!("coordinator: {reason}");
+            }
+            return self.fail(&reason);
         }
 
         if let Some(session_id) = extract_session_id(&child) {
@@ -1105,17 +1110,21 @@ fn resume_failed(child: &ChildRun) -> bool {
         || diagnostic.contains("could not resume")
 }
 
-fn turn_failure(child: &ChildRun) -> &'static str {
+fn turn_failure(child: &ChildRun) -> String {
     if child.killed {
-        return "coordinator turn was stopped";
+        return "coordinator turn was stopped".to_string();
     }
     if child.output.as_ref().is_some_and(|output| output.timed_out) {
-        return "coordinator turn timed out";
+        return "coordinator turn timed out".to_string();
     }
-    if child.spawn_error.is_some() {
-        return "coordinator turn could not start";
+    if let Some(error) = child.spawn_error.as_deref() {
+        let error = crate::child::sanitize_diagnostic(error, MAX_SPAWN_ERROR_CHARS);
+        if error.is_empty() {
+            return "coordinator turn could not start".to_string();
+        }
+        return format!("coordinator turn could not start: {error}");
     }
-    "coordinator turn failed"
+    "coordinator turn failed".to_string()
 }
 
 fn extract_session_id(child: &ChildRun) -> Option<String> {
@@ -1236,6 +1245,7 @@ mod tests {
     enum FakeTurn {
         Success(&'static str),
         Failure,
+        SpawnError(String),
         ResumeFailure,
         Timeout,
         Stop,
@@ -1342,6 +1352,10 @@ mod tests {
             match self.turns.lock().expect("turn queue").pop_front() {
                 Some(FakeTurn::Success(session_id)) => successful_child(session_id),
                 Some(FakeTurn::Failure) => failed_child(),
+                Some(FakeTurn::SpawnError(error)) => ChildRun {
+                    spawn_error: Some(error.to_string()),
+                    ..ChildRun::default()
+                },
                 Some(FakeTurn::ResumeFailure) => resume_failure_child(),
                 Some(FakeTurn::Timeout) => timed_out_child(),
                 Some(FakeTurn::Stop) => {
@@ -1763,6 +1777,28 @@ mod tests {
         }
         assert_eq!(delay, MAX_BACKOFF_SECS);
         assert_eq!(next_backoff(MAX_BACKOFF_SECS), MAX_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn spawn_error_is_sanitized_and_reported_in_status() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = make_config(root.path());
+        add_message(&config);
+        let secret = format!("ghp_{}", "A".repeat(24));
+        let error = format!("backend exec failed: {secret}\n{}", "x".repeat(400));
+        let executor = FakeRoleLaunchExecutor::new(root.path(), [FakeTurn::SpawnError(error)]);
+        let mut supervisor = supervisor(&config, &executor);
+
+        assert_eq!(run_single_poll(&mut supervisor), Duration::from_secs(5));
+
+        let status = CoordinatorStatus::read(&config).expect("status");
+        let last_error = status.last_error.expect("spawn error in status");
+        assert!(last_error.starts_with("coordinator turn could not start:"));
+        assert!(last_error.contains("backend exec failed"));
+        assert!(!last_error.contains(&secret));
+        assert!(!last_error.contains('\n'));
+        assert!(last_error.ends_with('…'));
+        assert!(last_error.chars().count() <= MAX_SPAWN_ERROR_CHARS + 40);
     }
 
     #[test]
