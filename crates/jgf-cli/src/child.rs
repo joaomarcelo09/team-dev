@@ -66,7 +66,7 @@ pub(crate) fn runtime_layout(
     validate_git_directory(&work_tree)?;
     let state_dir = canonical_dir(state_dir, "task state directory")?;
     let scratch = canonical_dir(scratch, "scratch home")?;
-    let executable = resolve_executable(binary, &work_tree)?;
+    let executable = resolve_executable(binary, &work_tree, host_home)?;
     let directories = runtime_dirs(&executable, &state_dir, &work_tree, &scratch, host_home)?;
     let path = child_path(&executable, &directories);
     Ok(RuntimeLayout {
@@ -234,18 +234,29 @@ fn canonical_dir(path: &Path, label: &str) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-fn resolve_executable(binary: &Path, work_tree: &Path) -> Result<PathBuf, String> {
+/// Where Claude Code's native installer puts its launcher, relative to HOME.
+const NATIVE_INSTALL_DIR: &str = ".local/bin";
+
+fn resolve_executable(
+    binary: &Path,
+    work_tree: &Path,
+    host_home: &Path,
+) -> Result<PathBuf, String> {
     let candidate = if binary.is_absolute() {
         binary.to_path_buf()
     } else if binary.components().count() > 1 {
         work_tree.join(binary)
     } else {
-        find_in_path(binary.as_os_str()).ok_or_else(|| {
-            format!(
-                "could not find Claude executable {:?} on PATH for jg-sandbox",
-                binary
-            )
-        })?
+        // The native install comes first: a desktop launcher's PATH often
+        // lacks ~/.local/bin and would pick an older system-wide copy instead.
+        find_native_install(host_home, binary.as_os_str())
+            .or_else(|| find_in_path(binary.as_os_str()))
+            .ok_or_else(|| {
+                format!(
+                    "could not find Claude executable {:?} in ~/{NATIVE_INSTALL_DIR} or on PATH for jg-sandbox",
+                    binary
+                )
+            })?
     };
     let executable = fs::canonicalize(&candidate)
         .map_err(|error| format!("could not resolve Claude executable for jg-sandbox: {error}"))?;
@@ -257,7 +268,33 @@ fn resolve_executable(binary: &Path, work_tree: &Path) -> Result<PathBuf, String
             executable.display()
         ));
     }
+    if is_script(&executable) {
+        return Err(format!(
+            "Claude executable {} is a launcher script; jg-sandbox only mounts the \
+             executable and its own directories, so the script's target would be \
+             missing. Install Claude Code natively (~/{NATIVE_INSTALL_DIR}/claude) \
+             or point the factory at the real binary",
+            executable.display()
+        ));
+    }
     Ok(executable)
+}
+
+fn find_native_install(host_home: &Path, binary: &OsStr) -> Option<PathBuf> {
+    let candidate = host_home.join(NATIVE_INSTALL_DIR).join(binary);
+    fs::metadata(&candidate)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .then_some(candidate)
+}
+
+/// Whether a file starts with a `#!` interpreter line.
+fn is_script(path: &Path) -> bool {
+    use std::io::Read;
+
+    let mut magic = [0_u8; 2];
+    fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut magic))
+        .is_ok_and(|()| &magic == b"#!")
 }
 
 fn find_in_path(binary: &OsStr) -> Option<PathBuf> {
@@ -368,6 +405,42 @@ fn child_path(executable: &Path, runtime_dirs: &[PathBuf]) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn executable_file(path: &Path, content: &[u8]) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::create_dir_all(path.parent().expect("parent")).expect("bin dir");
+        fs::write(path, content).expect("write executable");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+
+    #[test]
+    fn bare_claude_prefers_the_native_install_in_home() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let home = temp.path().join("home");
+        let native = home.join(".local/bin/claude");
+        executable_file(&native, b"\x7fELF native");
+
+        let resolved =
+            resolve_executable(Path::new("claude"), temp.path(), &home).expect("resolve");
+
+        assert_eq!(resolved, fs::canonicalize(&native).expect("canonical"));
+    }
+
+    #[test]
+    fn launcher_scripts_are_refused_with_a_clear_error() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let script = temp.path().join("bin/claude");
+        executable_file(
+            &script,
+            b"#!/bin/sh\nexec /opt/claude-code/bin/claude \"$@\"\n",
+        );
+
+        let error = resolve_executable(&script, temp.path(), temp.path())
+            .expect_err("a wrapper script cannot run inside the sandbox");
+
+        assert!(error.contains("launcher script"), "{error}");
+    }
 
     #[test]
     fn failure_output_is_scrubbed_and_tailed_on_character_boundaries() {
