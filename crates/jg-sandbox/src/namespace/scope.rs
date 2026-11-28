@@ -48,10 +48,12 @@ pub(crate) fn enter_scope(scope: &ExecScope) -> Result<()> {
         util::verify_read_only(workspace)?;
         util::verify_read_only_tree(workspace)?;
     }
-    cover_lab(&git_mounts, scope.access)?;
-    apply_font_access(scope.font_access, font_project)?;
+    // The private `/tmp` and the scratch home come before the lab cover: the
+    // scratch home is bound by its `/lab` path, which the cover hides.
     mount_private_tmp(scope)?;
-    mount_scratch_home(scratch_home)
+    mount_scratch_home(scratch_home)?;
+    cover_lab(&git_mounts, scope.access)?;
+    apply_font_access(scope.font_access, font_project)
 }
 
 /// Create the default `HOME` of a scoped exec on its private `/tmp`.
@@ -195,16 +197,22 @@ fn open_git_mounts(scope: &ExecScope) -> Result<Vec<GitMount>> {
     Ok(mounts)
 }
 
-/// Open the scratch home before the lab cover hides its `/lab` path.
-fn open_scratch_home(scope: &ExecScope) -> Result<Option<OwnedFd>> {
+/// A scratch home pinned by an `O_PATH` descriptor and its canonical `/lab` path.
+struct ScratchHome {
+    source: OwnedFd,
+    path: PathBuf,
+}
+
+/// Open the scratch home before the scoped mount namespace is created.
+fn open_scratch_home(scope: &ExecScope) -> Result<Option<ScratchHome>> {
     let Some(path) = scope.scratch_home.as_deref() else {
         return Ok(None);
     };
     let path = resolve_dir(path, "scope scratch home")?;
     let flags = OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
-    open(&path, flags, Mode::empty())
-        .map(Some)
-        .map_err(|errno| scope_error(format!("open scratch home {}: {errno}", path.display())))
+    let source = open(&path, flags, Mode::empty())
+        .map_err(|errno| scope_error(format!("open scratch home {}: {errno}", path.display())))?;
+    Ok(Some(ScratchHome { source, path }))
 }
 
 fn open_git_mount(path: PathBuf, writable: bool) -> Result<GitMount> {
@@ -340,7 +348,12 @@ fn mount_private_tmp(scope: &ExecScope) -> Result<()> {
 }
 
 /// Mount the per-role host scratch home over the scoped exec's private home.
-fn mount_scratch_home(scratch_home: Option<OwnedFd>) -> Result<()> {
+///
+/// The bind uses the `/lab` path inside the scoped mount namespace: the kernel
+/// refuses (`EINVAL`) to bind a descriptor whose mount belongs to the sandbox's
+/// previous namespace. The descriptor pins the directory, so a path swapped
+/// since it was opened is refused instead of mounted.
+fn mount_scratch_home(scratch_home: Option<ScratchHome>) -> Result<()> {
     let Some(scratch_home) = scratch_home else {
         return Ok(());
     };
@@ -354,6 +367,17 @@ fn mount_scratch_home(scratch_home: Option<OwnedFd>) -> Result<()> {
             target.display()
         )));
     }
-    let source = PathBuf::from(format!("/proc/self/fd/{}", scratch_home.as_raw_fd()));
-    util::bind_non_recursive(&source, target)
+    let pinned = fstat(&scratch_home.source)
+        .map_err(|source| SandboxError::nix("inspect scratch home", source))?;
+    let current = std::fs::symlink_metadata(&scratch_home.path)
+        .map_err(|source| SandboxError::io(&scratch_home.path, source))?;
+    if !current.is_dir()
+        || pinned.st_dev as u64 != current.dev()
+        || pinned.st_ino as u64 != current.ino()
+    {
+        return Err(scope_error(
+            "scratch home changed while preparing its scoped mount".to_string(),
+        ));
+    }
+    util::bind_non_recursive(&scratch_home.path, target)
 }
