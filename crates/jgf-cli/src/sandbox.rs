@@ -5,7 +5,7 @@ use std::{
     fmt,
     fs::{self, OpenOptions},
     io::Write,
-    os::unix::fs::DirBuilderExt,
+    os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -242,15 +242,7 @@ impl ClaudeSandbox {
                 ));
             }
         }
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&world_spec.scratch_home)
-            .map_err(|error| {
-                format!(
-                    "could not create Claude scratch directory at {}: {error}",
-                    world_spec.scratch_home.display()
-                )
-            })?;
+        ensure_scratch_directory(&world_spec.scratch_home)?;
 
         let created = (|| {
             let proxy_path = state_dir.join("egress.sock");
@@ -981,6 +973,42 @@ fn scratch_environment(
     Ok(env)
 }
 
+fn ensure_scratch_directory(path: &Path) -> Result<(), String> {
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(path)
+        .map_err(|error| {
+            format!(
+                "could not create Claude scratch directory at {}: {error}",
+                path.display()
+            )
+        })?;
+
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "could not inspect Claude scratch directory at {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "Claude scratch directory at {} must be a plain directory",
+            path.display()
+        ));
+    }
+
+    // SAFETY: geteuid has no preconditions and does not dereference memory.
+    let current_uid = unsafe { libc::geteuid() };
+    if metadata.uid() != current_uid || metadata.permissions().mode() & 0o7777 != 0o700 {
+        return Err(format!(
+            "Claude scratch directory at {} must be owned by the current user with mode 0700",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn prepare_scratch_exclude(work_tree: &Path) -> Result<(), String> {
     let exclude = work_tree.join(".git/info/exclude");
     let metadata = fs::symlink_metadata(&exclude).map_err(|error| {
@@ -1023,7 +1051,7 @@ fn log_egress(event: EgressEvent) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::{fs::symlink, net::UnixListener};
 
     #[test]
     fn the_claude_spec_exposes_only_the_runtime_and_credentials_and_protects_git() {
@@ -1246,6 +1274,45 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("refusing to run Claude unsandboxed"))
         );
+    }
+
+    #[test]
+    fn stale_claude_scratch_directory_is_reused_after_unclean_shutdown() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scratch_root = temp.path().join("world/scratch");
+
+        ensure_scratch_directory(&scratch_root).expect("initial scratch setup");
+        let stale_file = scratch_root.join("lab-coordinator/home/left-behind");
+        fs::create_dir_all(stale_file.parent().expect("scratch parent"))
+            .expect("stale scratch directories");
+        fs::write(&stale_file, "left behind by an unclean stop").expect("stale scratch file");
+
+        ensure_scratch_directory(&scratch_root).expect("restart with existing scratch");
+
+        assert_eq!(
+            fs::read_to_string(stale_file).expect("stale file remains"),
+            "left behind by an unclean stop"
+        );
+        let metadata = fs::symlink_metadata(&scratch_root).expect("scratch metadata");
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert_eq!(metadata.permissions().mode() & 0o7777, 0o700);
+    }
+
+    #[test]
+    fn scratch_directory_rejects_symlinks_and_unsafe_modes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let outside = temp.path().join("outside");
+        let linked_scratch = temp.path().join("linked-scratch");
+        fs::create_dir(&outside).expect("outside directory");
+        symlink(&outside, &linked_scratch).expect("scratch symlink");
+
+        assert!(ensure_scratch_directory(&linked_scratch).is_err());
+
+        let unsafe_scratch = temp.path().join("unsafe-scratch");
+        fs::create_dir(&unsafe_scratch).expect("unsafe scratch directory");
+        fs::set_permissions(&unsafe_scratch, fs::Permissions::from_mode(0o755))
+            .expect("unsafe scratch mode");
+        assert!(ensure_scratch_directory(&unsafe_scratch).is_err());
     }
 
     #[test]
