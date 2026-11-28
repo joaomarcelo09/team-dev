@@ -87,6 +87,38 @@ fn request_cwd_and_home_override_the_scoped_defaults() {
 }
 
 #[test]
+fn scratch_home_is_mounted_read_write_at_the_scoped_home() {
+    let lab = fixture();
+    std::fs::create_dir_all(lab.spec.lab_dir.join("proj-a")).expect("worktree");
+    let scratch = lab.spec.lab_dir.join("scratch/proj-a/coder");
+    std::fs::create_dir_all(&scratch).expect("scratch home");
+    std::fs::write(scratch.join("seed.txt"), "from-host").expect("seed scratch");
+    let backend = NamespaceBackend::new();
+    let Some(guard) = create_or_skip(backend, &lab.spec) else {
+        return;
+    };
+
+    let output = run_scoped(
+        backend,
+        guard.handle(),
+        coder("/lab/proj-a").with_scratch_home("/lab/scratch/proj-a/coder"),
+        "cat /tmp/home/seed.txt && echo from-coder > /tmp/home/new.txt && \
+         echo tmp > /tmp/other.txt && test ! -e /lab/scratch && echo $HOME",
+    );
+
+    assert_eq!(output.exit_code, Some(0), "{}", output.stderr_text());
+    assert_eq!(output.stdout_text(), "from-host/tmp/home\n");
+    assert_eq!(
+        std::fs::read_to_string(scratch.join("new.txt")).expect("host sees the write"),
+        "from-coder\n"
+    );
+    assert!(
+        !scratch.join("other.txt").exists(),
+        "only /tmp/home is the scratch home"
+    );
+}
+
+#[test]
 fn reviewer_scope_is_read_only() {
     let lab = fixture();
     let worktree = lab.spec.lab_dir.join("proj-a");
