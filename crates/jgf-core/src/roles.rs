@@ -15,6 +15,7 @@ use thiserror::Error;
 
 /// Default settings per role.
 ///
+/// Every role defaults to Claude Code, the only harness the factory launches.
 /// The model ids are stable aliases. Each is resolved to the provider's current model when the
 /// configuration is written, so this table is the only place that names a model.
 const DEFAULTS: [(FactoryRole, Harness, &str, Effort); 7] = [
@@ -26,20 +27,20 @@ const DEFAULTS: [(FactoryRole, Harness, &str, Effort); 7] = [
     ),
     (
         FactoryRole::CoCoordinator,
-        Harness::Gemini,
-        "gemini-flash",
+        Harness::ClaudeCode,
+        "sonnet",
         Effort::High,
     ),
     (
         FactoryRole::Coder,
-        Harness::Opencode,
-        "deepseek-v4.1-flash",
+        Harness::ClaudeCode,
+        "sonnet",
         Effort::High,
     ),
     (
         FactoryRole::Tester,
-        Harness::Gemini,
-        "gemini-flash",
+        Harness::ClaudeCode,
+        "sonnet",
         Effort::High,
     ),
     (
@@ -50,14 +51,14 @@ const DEFAULTS: [(FactoryRole, Harness, &str, Effort); 7] = [
     ),
     (
         FactoryRole::GitCoder,
-        Harness::Opencode,
-        "deepseek-v4.1-flash",
+        Harness::ClaudeCode,
+        "haiku",
         Effort::Low,
     ),
     (
         FactoryRole::WakeUp,
-        Harness::Opencode,
-        "deepseek-v4.1-flash",
+        Harness::ClaudeCode,
+        "haiku",
         Effort::Low,
     ),
 ];
@@ -730,22 +731,12 @@ mod tests {
             ),
             (
                 FactoryRole::CoCoordinator,
-                Harness::Gemini,
-                "gemini-flash",
+                Harness::ClaudeCode,
+                "sonnet",
                 Effort::High,
             ),
-            (
-                FactoryRole::Coder,
-                Harness::Opencode,
-                "deepseek-v4.1-flash",
-                Effort::High,
-            ),
-            (
-                FactoryRole::Tester,
-                Harness::Gemini,
-                "gemini-flash",
-                Effort::High,
-            ),
+            (FactoryRole::Coder, Harness::ClaudeCode, "sonnet", Effort::High),
+            (FactoryRole::Tester, Harness::ClaudeCode, "sonnet", Effort::High),
             (
                 FactoryRole::Reviewer,
                 Harness::ClaudeCode,
@@ -754,16 +745,11 @@ mod tests {
             ),
             (
                 FactoryRole::GitCoder,
-                Harness::Opencode,
-                "deepseek-v4.1-flash",
+                Harness::ClaudeCode,
+                "haiku",
                 Effort::Low,
             ),
-            (
-                FactoryRole::WakeUp,
-                Harness::Opencode,
-                "deepseek-v4.1-flash",
-                Effort::Low,
-            ),
+            (FactoryRole::WakeUp, Harness::ClaudeCode, "haiku", Effort::Low),
         ];
 
         assert_eq!(config.roles().len(), expected.len());
@@ -857,7 +843,7 @@ mod tests {
         let loaded = RoleConfig::load(&path).expect("load partial role");
         assert_eq!(
             loaded.get(FactoryRole::GitCoder),
-            Some(&settings(Harness::Opencode, "other-model", Effort::Low))
+            Some(&settings(Harness::ClaudeCode, "other-model", Effort::Low))
         );
     }
 
@@ -1028,7 +1014,7 @@ mod tests {
         );
         assert_eq!(
             model_only,
-            settings(Harness::Opencode, "other-model", Effort::High)
+            settings(Harness::ClaudeCode, "other-model", Effort::High)
         );
 
         let full = config.resolve(
