@@ -608,8 +608,9 @@ fn build_role_scope(
     worktree: &Path,
     guest_worktree: &Path,
 ) -> Result<ExecScope, String> {
-    let mut scope =
-        ExecScope::new(role.worktree_access(), guest_worktree).with_project(project.to_string());
+    // The role sandbox does not provision a lab cgroup; setting a scope project
+    // would make jg-sandbox reject the exec before the role could start.
+    let mut scope = ExecScope::new(role.worktree_access(), guest_worktree);
     if let Some(access) = role.font_access() {
         scope = scope.with_font_access(access);
         if role == Role::CoCoordinator {
@@ -1150,7 +1151,11 @@ mod tests {
                 execution.scope.scratch_home.as_deref(),
                 Some(Path::new("/lab/scratch/project-a/worker-1"))
             );
-            assert_eq!(execution.scope.project.as_deref(), Some("project-a"));
+            assert_eq!(execution.scope.project, None);
+            assert!(
+                execution.scope.validate().is_ok(),
+                "role scope must not require an unavailable lab cgroup"
+            );
             assert_eq!(
                 execution.scope.access,
                 match role {

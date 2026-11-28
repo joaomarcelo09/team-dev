@@ -32,6 +32,28 @@ pub(crate) fn failure_reason(summary: &str, stdout: &str, stderr: &str) -> Strin
     reason
 }
 
+/// Scrubs and bounds a diagnostic before it is written to supervisor status or logs.
+pub(crate) fn sanitize_diagnostic(text: &str, max_chars: usize) -> String {
+    let safe = scrub_sensitive_text(text);
+    let safe = safe
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let safe = safe.trim();
+    if safe.chars().count() <= max_chars {
+        return safe.to_string();
+    }
+
+    let visible_chars = max_chars.saturating_sub(1);
+    format!("{}…", safe.chars().take(visible_chars).collect::<String>())
+}
+
 /// Resolves Claude and its optional Node runtime without exposing task state or host secrets.
 pub(crate) fn runtime_layout(
     binary: &Path,
