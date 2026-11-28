@@ -1963,6 +1963,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "jg-ui"
+version = "0.1.0"
+dependencies = [
+ "iced",
+]
+
+[[package]]
 name = "jgf-cli"
 version = "0.1.0"
 dependencies = [
@@ -1995,6 +2002,7 @@ name = "jgf-desktop"
 version = "0.1.0"
 dependencies = [
  "iced",
+ "jg-ui",
  "jgf-core",
  "jgf-hub",
  "serde",
@@ -2002,6 +2010,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -2059,6 +2068,7 @@ dependencies = [
  "chrono",
  "futures",
  "iced",
+ "jg-ui",
  "jgt-core",
  "pulldown-cmark",
  "resvg",

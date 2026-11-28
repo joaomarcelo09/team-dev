@@ -1,61 +1,54 @@
-//! Window styling: Dark Factory uses iced's built-in dark theme.
-//!
-//! No custom palette, assets or images: widgets take their colors from the built-in theme.
+//! Factory-specific widget styling, using the active application theme's palette.
 
 use iced::{
     Color, Theme, border,
-    widget::{container, progress_bar, text},
+    widget::{progress_bar, text},
 };
 use jgf_hub::usage::{LabState, Level};
 
-/// The built-in dark theme.
-pub fn dark() -> Theme {
-    Theme::Dark
-}
-
-/// One Board column: a subtle panel with a border and rounded corners.
-pub fn board_column(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-    container::Style {
-        background: Some(palette.background.weak.color.into()),
-        border: border::rounded(6),
-        ..container::Style::default()
-    }
-}
-
-/// The small project badge pill shown on a Board card.
-pub fn project_badge(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-    container::Style {
-        background: Some(palette.primary.weak.color.into()),
-        border: border::rounded(9),
-        text_color: Some(palette.primary.weak.text),
-        ..container::Style::default()
-    }
-}
-
 /// A muted style for secondary lines such as an empty column.
 pub fn muted_text(theme: &Theme) -> text::Style {
-    let palette = theme.extended_palette();
     text::Style {
-        color: Some(palette.background.weak.text),
+        color: Some(jg_ui::muted(theme)),
+    }
+}
+
+/// Semantic state colors shared by Board task and coordinator-role indicators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskRoleState {
+    Running,
+    WaitingForUser,
+    Failed,
+    Done,
+    Queued,
+}
+
+/// The colour of a task or role state.
+pub fn task_role_state_color(theme: &Theme, state: TaskRoleState) -> Color {
+    let palette = jg_ui::ext(theme);
+    match state {
+        TaskRoleState::Running => palette.success.weak.color,
+        TaskRoleState::Done => palette.success.base.color,
+        TaskRoleState::WaitingForUser => palette.warning.base.color,
+        TaskRoleState::Failed => palette.danger.base.color,
+        TaskRoleState::Queued => palette.primary.base.color,
     }
 }
 
 /// The colour of a lab state dot.
 pub fn lab_state_color(theme: &Theme, state: LabState) -> Color {
-    let palette = theme.extended_palette();
+    let palette = jg_ui::ext(theme);
     match state {
         LabState::Running => palette.success.base.color,
         LabState::Throttled => palette.warning.base.color,
         LabState::PausedUntil(_) => palette.danger.base.color,
-        LabState::Idle => palette.background.strong.color,
+        LabState::Idle => jg_ui::muted(theme),
     }
 }
 
 /// The colour of a usage level: normal, soft (80%) or hard (95%).
 pub fn level_color(theme: &Theme, level: Level) -> Color {
-    let palette = theme.extended_palette();
+    let palette = jg_ui::ext(theme);
     match level {
         Level::Normal => palette.success.base.color,
         Level::Soft => palette.warning.base.color,
@@ -63,19 +56,10 @@ pub fn level_color(theme: &Theme, level: Level) -> Color {
     }
 }
 
-/// A small round dot filled with the colour of `state`.
-pub fn lab_state_dot(state: LabState) -> impl Fn(&Theme) -> container::Style {
-    move |theme| container::Style {
-        background: Some(lab_state_color(theme, state).into()),
-        border: border::rounded(7),
-        ..container::Style::default()
-    }
-}
-
 /// A progress bar tinted for `level`.
 pub fn level_progress_bar(level: Level) -> impl Fn(&Theme) -> progress_bar::Style {
     move |theme| {
-        let palette = theme.extended_palette();
+        let palette = jg_ui::ext(theme);
         progress_bar::Style {
             background: palette.background.strong.color.into(),
             bar: level_color(theme, level).into(),
@@ -93,16 +77,55 @@ pub fn level_text(level: Level) -> impl Fn(&Theme) -> text::Style {
 
 /// A red style for a rejected settings edit.
 pub fn error_text(theme: &Theme) -> text::Style {
-    let palette = theme.extended_palette();
     text::Style {
-        color: Some(palette.danger.base.color),
+        color: Some(jg_ui::ext(theme).danger.base.color),
     }
 }
 
 /// A green style for the short "Saved" note.
 pub fn success_text(theme: &Theme) -> text::Style {
-    let palette = theme.extended_palette();
     text::Style {
-        color: Some(palette.success.base.color),
+        color: Some(jg_ui::ext(theme).success.base.color),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_and_role_states_follow_the_semantic_palette_in_every_theme() {
+        let themes = [
+            jg_ui::dark(),
+            jg_ui::light(),
+            jg_ui::tokyo_night(),
+            jg_ui::dracula(),
+            jg_ui::violet(),
+        ];
+
+        for theme in themes {
+            let palette = jg_ui::ext(&theme);
+            let running = task_role_state_color(&theme, TaskRoleState::Running);
+            let waiting = task_role_state_color(&theme, TaskRoleState::WaitingForUser);
+            let failed = task_role_state_color(&theme, TaskRoleState::Failed);
+            let done = task_role_state_color(&theme, TaskRoleState::Done);
+            let queued = task_role_state_color(&theme, TaskRoleState::Queued);
+
+            assert_eq!(running, palette.success.weak.color);
+            assert_eq!(done, palette.success.base.color);
+            assert_eq!(waiting, palette.warning.base.color);
+            assert_eq!(failed, palette.danger.base.color);
+            assert_eq!(queued, palette.primary.base.color);
+            assert_ne!(running, waiting);
+            assert_ne!(running, failed);
+            assert_ne!(running, done);
+            assert_ne!(waiting, failed);
+            assert_ne!(waiting, done);
+            assert_ne!(failed, done);
+            assert_ne!(queued, running);
+            assert_ne!(queued, waiting);
+            assert_ne!(queued, failed);
+            assert_ne!(queued, done);
+        }
     }
 }
