@@ -213,3 +213,58 @@ fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[test]
+fn create_reclaims_the_state_of_a_dead_init() {
+    let lab = fixture();
+    let backend = NamespaceBackend::new();
+    let Some(first) = create_or_skip(backend, &lab.spec) else {
+        return;
+    };
+    let dead_pid = first.handle().init_pid();
+    kill(Pid::from_raw(dead_pid), Signal::SIGKILL).expect("kill init");
+    assert_process_gone(dead_pid);
+    // The creator "crashed": its state is left behind and never destroyed.
+    std::mem::forget(first);
+    assert!(lab.spec.state_dir.join("state.json").exists());
+    assert!(lab.spec.state_dir.join("rootfs").exists());
+
+    let second = create_or_skip(backend, &lab.spec).expect("create over dead state");
+    let handle = second.handle();
+
+    assert_ne!(handle.init_pid(), dead_pid);
+    run_ok(backend, handle, "true");
+}
+
+#[test]
+fn create_refuses_the_state_of_a_live_init() {
+    let lab = fixture();
+    let backend = NamespaceBackend::new();
+    let Some(guard) = create_or_skip(backend, &lab.spec) else {
+        return;
+    };
+
+    match backend.create(&lab.spec) {
+        Err(SandboxError::AlreadyExists(path)) => assert_eq!(path, lab.spec.state_dir),
+        other => panic!("create over a live sandbox must refuse, got {other:?}"),
+    }
+    run_ok(backend, guard.handle(), "true");
+}
+
+#[test]
+fn create_refuses_an_unreadable_state_file() {
+    let lab = fixture();
+    let backend = NamespaceBackend::new();
+    std::fs::create_dir_all(&lab.spec.state_dir).expect("state dir");
+    let state_path = lab.spec.state_dir.join("state.json");
+    std::fs::write(&state_path, "not json").expect("corrupt state");
+
+    match backend.create(&lab.spec) {
+        Err(SandboxError::AlreadyExists(path)) => assert_eq!(path, lab.spec.state_dir),
+        other => panic!("create over corrupt state must refuse, got {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(&state_path).expect("state kept"),
+        "not json"
+    );
+}
