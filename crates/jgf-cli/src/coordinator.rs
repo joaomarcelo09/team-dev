@@ -137,7 +137,7 @@ pub enum CoordinatorState {
     Idle,
     /// A turn failed and the supervisor is waiting before retrying.
     Backoff,
-    /// The stop file ended the supervisor.
+    /// The supervisor has stopped.
     Stopped,
 }
 
@@ -388,7 +388,11 @@ pub fn run<L: RoleLaunchService>(
     launcher: L,
 ) -> Result<(), CoordinatorError> {
     let lock = CoordinatorLock::acquire(config)?;
-    run_locked(config, launcher, lock)
+    let result = run_locked(config, launcher, &lock);
+    if let Err(error) = &result {
+        record_supervisor_failure(config, error);
+    }
+    result
 }
 
 /// Runs the real or dry-run supervisor and selects a network-free fake launcher when requested.
@@ -396,34 +400,40 @@ pub fn run_cli(config: &CoordinatorConfig, dry_run: bool) -> Result<(), Coordina
     let mut config = config.clone();
     config.dry_run = dry_run;
     let lock = CoordinatorLock::acquire(&config)?;
-    if dry_run {
-        let fake = DryRunRoleLaunchExecutor::new(&config)?;
-        let skills = skills_dir();
-        let launcher = RoleLauncher::new(skills, &fake);
-        return run_locked(&config, launcher, lock);
-    }
-
-    let sandbox = prepare_real_sandbox(&config)?;
-    let launcher = RoleLauncher::new(skills_dir(), &sandbox);
     let result = (|| {
-        let world_dir = coordinator_world_dir(&config);
-        sandbox
-            .create(&world_dir, &world_dir.join("work"))
-            .map_err(CoordinatorError::Sandbox)?;
-        run_locked(&config, launcher, lock)
+        if dry_run {
+            let fake = DryRunRoleLaunchExecutor::new(&config)?;
+            let skills = skills_dir();
+            let launcher = RoleLauncher::new(skills, &fake);
+            return run_locked(&config, launcher, &lock);
+        }
+
+        let sandbox = prepare_real_sandbox(&config)?;
+        let launcher = RoleLauncher::new(skills_dir(), &sandbox);
+        let result = (|| {
+            let world_dir = coordinator_world_dir(&config);
+            sandbox
+                .create(&world_dir, &world_dir.join("work"))
+                .map_err(CoordinatorError::Sandbox)?;
+            run_locked(&config, launcher, &lock)
+        })();
+        let finish = sandbox.finish(&crate::e2e::RunOutcome::Killed);
+        match (result, finish) {
+            (Err(error), _) => Err(error),
+            (Ok(()), Err(error)) => Err(CoordinatorError::Sandbox(error)),
+            (Ok(()), Ok(())) => Ok(()),
+        }
     })();
-    let finish = sandbox.finish(&crate::e2e::RunOutcome::Killed);
-    match (result, finish) {
-        (Err(error), _) => Err(error),
-        (Ok(()), Err(error)) => Err(CoordinatorError::Sandbox(error)),
-        (Ok(()), Ok(())) => Ok(()),
+    if let Err(error) = &result {
+        record_supervisor_failure(&config, error);
     }
+    result
 }
 
 fn run_locked<L: RoleLaunchService>(
     config: &CoordinatorConfig,
     launcher: L,
-    _lock: CoordinatorLock,
+    _lock: &CoordinatorLock,
 ) -> Result<(), CoordinatorError> {
     let dir = config.coordinator_dir();
     fs::create_dir_all(&dir).map_err(|source| io_error(&dir, source))?;
@@ -435,6 +445,16 @@ fn run_locked<L: RoleLaunchService>(
     }
 
     Supervisor::new(config, launcher)?.run()
+}
+
+fn record_supervisor_failure(config: &CoordinatorConfig, error: &CoordinatorError) {
+    let mut status =
+        CoordinatorStatus::read(config).unwrap_or_else(|_| CoordinatorStatus::initial());
+    status.state = CoordinatorState::Stopped;
+    status.last_error = Some(error.to_string());
+    status.backoff_secs = None;
+    let path = config.coordinator_dir().join(STATUS_FILE);
+    let _ = write_atomic(&path, status.to_json().as_bytes());
 }
 
 struct Supervisor<L> {
@@ -1798,7 +1818,7 @@ mod tests {
         executor.stop_on_child(config.coordinator_dir().join(STOP_FILE));
         add_message(&config);
         let launcher = RoleLauncher::new(skills_dir(), &executor);
-        run_locked(&config, launcher, lock).expect("run until stop");
+        run_locked(&config, launcher, &lock).expect("run until stop");
 
         assert_eq!(
             CoordinatorStatus::read(&config).expect("status").state,
@@ -1817,6 +1837,24 @@ mod tests {
         ));
         drop(first);
         assert!(CoordinatorLock::acquire(&config).is_ok());
+    }
+
+    #[test]
+    fn sandbox_setup_failure_is_written_to_status() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let config = make_config(root.path());
+        let world_dir = coordinator_world_dir(&config);
+        fs::create_dir_all(&world_dir).expect("coordinator world");
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).expect("outside directory");
+        std::os::unix::fs::symlink(&outside, world_dir.join("work")).expect("work symlink");
+
+        let error = run_cli(&config, false).expect_err("symlinked work directory");
+        let error_message = error.to_string();
+        let status = CoordinatorStatus::read(&config).expect("status");
+
+        assert_eq!(status.state, CoordinatorState::Stopped);
+        assert_eq!(status.last_error.as_deref(), Some(error_message.as_str()));
     }
 
     #[test]
