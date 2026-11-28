@@ -1,6 +1,7 @@
 //! jg-factory-desktop: the Dark Factory window.
 
 mod app;
+mod appearance;
 mod style;
 
 fn main() -> iced::Result {

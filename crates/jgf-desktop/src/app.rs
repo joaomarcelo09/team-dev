@@ -21,6 +21,7 @@ use iced::{
         text_input,
     },
 };
+use jg_ui::{ThemePref, ThemeStyle};
 use jgf_core::{FactoryRole, paths, roles::RoleConfig};
 use jgf_desktop::{
     board_view::{CardView, ColumnView, build_board, filter_choices, filter_for, project_choices},
@@ -31,9 +32,16 @@ use jgf_desktop::{
     },
     snapshot::{CoordinatorState, LAB_ID, LabSnapshot, ROLES_FILE},
 };
-use jgf_hub::{MessageKind, OutgoingMessage, Role, Router};
+use jgf_hub::{
+    MessageKind, OutgoingMessage, Role, Router,
+    board::Column,
+    usage::{LabState, Level},
+};
 
-use crate::style;
+use crate::{
+    appearance::{self, Appearance},
+    style,
+};
 
 /// Seconds between snapshot reloads.
 const TICK_SECS: u64 = 2;
@@ -88,6 +96,12 @@ pub enum Message {
     SnapshotLoaded(LabSnapshot),
     /// Two seconds passed: reload the snapshot.
     Tick,
+    /// The system appearance changed.
+    SystemTheme(iced::theme::Mode),
+    /// The preferred light/dark mode changed.
+    SetTheme(ThemePref),
+    /// The color palette changed.
+    SetStyle(ThemeStyle),
     /// The read errors banner was closed.
     DismissErrors,
     /// The chat draft was edited.
@@ -126,6 +140,12 @@ pub struct App {
     pub snapshot: LabSnapshot,
     /// Whether the read errors banner is open.
     pub errors_visible: bool,
+    /// The preferred light/dark mode.
+    pub theme_pref: ThemePref,
+    /// The selected color palette.
+    pub theme_style: ThemeStyle,
+    /// Latest appearance reported by the operating system.
+    pub system_mode: iced::theme::Mode,
     /// Data directory holding the routing store and the role configuration.
     data_dir: PathBuf,
     /// Chat text being typed.
@@ -161,7 +181,10 @@ impl App {
         let snapshot = LabSnapshot::load(&data_dir, now_secs());
         let mut app = Self::from_snapshot(snapshot);
         app.data_dir = data_dir;
-        (app, Task::none())
+        let appearance = appearance::load(&app.data_dir);
+        app.theme_pref = appearance.theme;
+        app.theme_style = appearance.style;
+        (app, iced::system::theme().map(Message::SystemTheme))
     }
 
     /// Builds the window state around an already loaded snapshot.
@@ -176,6 +199,9 @@ impl App {
         Self {
             tab: Tab::Chat,
             errors_visible: !snapshot.errors.is_empty(),
+            theme_pref: ThemePref::System,
+            theme_style: ThemeStyle::Default,
+            system_mode: iced::theme::Mode::Dark,
             data_dir: paths::data_dir(),
             settings_draft: snapshot.roles.clone(),
             snapshot,
@@ -198,14 +224,21 @@ impl App {
         "Dark Factory".to_string()
     }
 
-    /// The built-in dark theme.
+    /// The theme resolved from the user's preferences and current system appearance.
     pub fn theme(&self) -> Theme {
-        style::dark()
+        jg_ui::resolve_theme(
+            self.theme_pref,
+            self.theme_style,
+            self.system_mode == iced::theme::Mode::Light,
+        )
     }
 
-    /// Reloads the snapshot every two seconds.
+    /// Reloads the snapshot and tracks system appearance changes.
     pub fn subscription(&self) -> Subscription<Message> {
-        iced::time::every(Duration::from_secs(TICK_SECS)).map(|_| Message::Tick)
+        Subscription::batch([
+            iced::time::every(Duration::from_secs(TICK_SECS)).map(|_| Message::Tick),
+            iced::system::theme_changes().map(Message::SystemTheme),
+        ])
     }
 
     /// Applies one message.
@@ -220,6 +253,18 @@ impl App {
                 }
             }
             Message::Tick => reload_snapshot(self.data_dir.clone()),
+            Message::SystemTheme(mode) => {
+                self.system_mode = mode;
+                Task::none()
+            }
+            Message::SetTheme(pref) => {
+                self.theme_pref = pref;
+                self.save_appearance()
+            }
+            Message::SetStyle(style) => {
+                self.theme_style = style;
+                self.save_appearance()
+            }
             Message::SnapshotLoaded(snapshot) => {
                 // A banner the user closed stays closed while the errors are the same.
                 if snapshot.errors != self.snapshot.errors {
@@ -278,6 +323,22 @@ impl App {
             Message::CoordinatorStartPressed => self.coordinator_command(CoordinatorAction::Start),
             Message::CoordinatorStopPressed => self.coordinator_command(CoordinatorAction::Stop),
         }
+    }
+
+    /// Saves the currently selected appearance and reports failures through the settings banner.
+    fn save_appearance(&mut self) -> Task<Message> {
+        let appearance = Appearance {
+            theme: self.theme_pref,
+            style: self.theme_style,
+        };
+        match appearance::save(&self.data_dir, appearance) {
+            Ok(()) => self.settings_error = None,
+            Err(error) => {
+                self.settings_error = Some(format!("appearance not saved: {error}"));
+                self.errors_visible = true;
+            }
+        }
+        Task::none()
     }
 
     /// Invokes the supervisor command without taking over chat input or the polling loop.
@@ -446,6 +507,7 @@ impl App {
     /// The banner that lists read, chat and settings errors, with a dismiss button.
     fn error_banner(&self) -> Element<'_, Message> {
         let message = self.banner_message().unwrap_or_default();
+        let send_failed = self.send_error.is_some();
         container(
             row![
                 text(message).width(Fill),
@@ -459,7 +521,13 @@ impl App {
         )
         .width(Fill)
         .padding([6, 12])
-        .style(container::bordered_box)
+        .style(move |theme| {
+            if send_failed {
+                jg_ui::bubble_failed(theme)
+            } else {
+                jg_ui::banner(jg_ui::ext(theme).danger.base.color)(theme)
+            }
+        })
         .into()
     }
 
@@ -491,9 +559,10 @@ impl App {
             &self.snapshot.tasks,
             &filter_for(self.board_filter.as_deref()),
         );
+        let theme = self.theme();
         let mut columns = row![].spacing(8).height(Fill);
         for column in board.columns {
-            columns = columns.push(board_column(column));
+            columns = columns.push(board_column(column, &theme));
         }
 
         column![
@@ -511,17 +580,40 @@ impl App {
     /// The read-only Lab: the big state label over one usage meter per provider.
     fn lab_tab(&self) -> Element<'_, Message> {
         let lab = build_lab_view(self.snapshot.lab_state, &self.snapshot.windows, now_secs());
-        let state_dot = container(space())
-            .width(14)
-            .height(14)
-            .style(style::lab_state_dot(self.snapshot.lab_state));
+        let theme = self.theme();
+        let state_dot =
+            container(space())
+                .width(14)
+                .height(14)
+                .style(jg_ui::dot(style::lab_state_color(
+                    &theme,
+                    self.snapshot.lab_state,
+                )));
+
+        let notice = if matches!(self.snapshot.lab_state, LabState::PausedUntil(_))
+            || lab.usage.iter().any(|row| row.level == Level::Hard)
+        {
+            Some((
+                jg_ui::ext(&theme).danger.base.color,
+                "Usage limit reached. New work is paused.",
+            ))
+        } else if self.snapshot.lab_state == LabState::Throttled
+            || lab.usage.iter().any(|row| row.level == Level::Soft)
+        {
+            Some((
+                jg_ui::ext(&theme).warning.base.color,
+                "Usage is high. Concurrency is reduced.",
+            ))
+        } else {
+            None
+        };
 
         let mut meters = column![].spacing(10).width(Fill);
         if lab.usage.is_empty() {
             meters = meters.push(text("no usage data yet").size(13).style(style::muted_text));
         } else {
             for row in lab.usage {
-                meters = meters.push(usage_meter(row));
+                meters = meters.push(usage_meter(row, &theme));
             }
         }
 
@@ -530,6 +622,19 @@ impl App {
             if coordinator.coordinator.state == CoordinatorState::Stopped {
                 continue;
             }
+            let state_color = if coordinator.coordinator.last_error.is_some() {
+                style::task_role_state_color(&theme, style::TaskRoleState::Failed)
+            } else {
+                match coordinator.coordinator.state {
+                    CoordinatorState::Running => {
+                        style::task_role_state_color(&theme, style::TaskRoleState::Running)
+                    }
+                    CoordinatorState::Idle | CoordinatorState::Stopped => jg_ui::muted(&theme),
+                    CoordinatorState::Backoff => {
+                        style::task_role_state_color(&theme, style::TaskRoleState::WaitingForUser)
+                    }
+                }
+            };
             let state = match coordinator.coordinator.state {
                 CoordinatorState::Running => "running",
                 CoordinatorState::Idle => "idle",
@@ -541,21 +646,31 @@ impl App {
                 line.push_str(" — ");
                 line.push_str(error);
             }
-            co_coordinators = co_coordinators.push(text(line).size(12).style(style::muted_text));
+            co_coordinators = co_coordinators.push(text(line).size(12).style(move |_| {
+                iced::widget::text::Style {
+                    color: Some(state_color),
+                }
+            }));
         }
 
-        column![
+        let mut content = column![
             row![state_dot, text(lab.state_label).size(26)]
                 .spacing(10)
                 .align_y(Alignment::Center),
-            meters,
-            co_coordinators,
         ]
         .spacing(18)
         .width(Fill)
         .height(Fill)
-        .padding(24)
-        .into()
+        .padding(24);
+        if let Some((accent, message)) = notice {
+            content = content.push(
+                container(text(message))
+                    .width(Fill)
+                    .padding([8, 12])
+                    .style(jg_ui::banner(accent)),
+            );
+        }
+        content.push(meters).push(co_coordinators).into()
     }
 
     /// The Settings tab: one editable row per role over the Save and Revert actions.
@@ -566,7 +681,69 @@ impl App {
             rows = rows.push(self.settings_row(row));
         }
 
-        let save = button(text("Save")).style(button::primary).padding([6, 16]);
+        let theme_button = |label, pref| {
+            button(text(label))
+                .on_press(Message::SetTheme(pref))
+                .style(jg_ui::segment_button(self.theme_pref == pref))
+                .padding([4, 12])
+        };
+        let style_button = |label, selected| {
+            button(text(label))
+                .on_press(Message::SetStyle(selected))
+                .style(jg_ui::segment_button(self.theme_style == selected))
+                .padding([4, 12])
+        };
+        let theme_control = container(
+            row![
+                theme_button("System", ThemePref::System),
+                theme_button("Dark", ThemePref::Dark),
+                theme_button("Light", ThemePref::Light),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
+        )
+        .padding(3)
+        .style(jg_ui::segmented_container);
+        let style_control = container(
+            row![
+                style_button("Default", ThemeStyle::Default),
+                style_button("Violet", ThemeStyle::Violet),
+                style_button("Tokyo Night", ThemeStyle::TokyoNight),
+                style_button("Dracula", ThemeStyle::Dracula),
+            ]
+            .spacing(2)
+            .align_y(Alignment::Center),
+        )
+        .padding(3)
+        .style(jg_ui::segmented_container);
+        let appearance = container(
+            column![
+                text("Appearance").size(16),
+                row![text("Theme").width(100), theme_control]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                row![text("Style").width(100), style_control]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+            ]
+            .spacing(12)
+            .width(Fill),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(jg_ui::card(jg_ui::ext(&self.theme()).primary.base.color));
+        let role_settings = container(
+            column![text("Role settings").size(16), rows]
+                .spacing(12)
+                .width(Fill),
+        )
+        .padding(16)
+        .width(Fill)
+        .style(jg_ui::card(jg_ui::ext(&self.theme()).primary.base.color));
+
+        let save = button(text("Save"))
+            .style(jg_ui::primary_button)
+            .padding([6, 16]);
         let save = if self.saving_settings {
             save
         } else {
@@ -574,7 +751,7 @@ impl App {
         };
         let revert = button(text("Revert"))
             .on_press(Message::SettingsRevertPressed)
-            .style(button::secondary)
+            .style(jg_ui::ghost)
             .padding([6, 16]);
 
         let mut actions = row![save, revert].spacing(8).align_y(Alignment::Center);
@@ -582,12 +759,15 @@ impl App {
             actions = actions.push(text("Saved").size(12).style(style::success_text));
         }
 
-        column![scrollable(rows).height(Fill), actions]
-            .spacing(12)
-            .width(Fill)
-            .height(Fill)
-            .padding(24)
-            .into()
+        column![
+            scrollable(column![appearance, role_settings].spacing(16).width(Fill)).height(Fill),
+            actions
+        ]
+        .spacing(12)
+        .width(Fill)
+        .height(Fill)
+        .padding(24)
+        .into()
     }
 
     /// One role's settings row, with its rejected-edit error underneath.
@@ -604,7 +784,9 @@ impl App {
             move |value: &'static str| Message::SettingsHarnessChanged(role, value.to_string()),
         )
         .padding([4, 8])
-        .text_size(13);
+        .text_size(13)
+        .style(jg_ui::workspace_selector)
+        .menu_style(jg_ui::workspace_menu);
 
         let effort = pick_list(
             effort_options(),
@@ -612,11 +794,14 @@ impl App {
             move |value: &'static str| Message::SettingsEffortChanged(role, value.to_string()),
         )
         .padding([4, 8])
-        .text_size(13);
+        .text_size(13)
+        .style(jg_ui::workspace_selector)
+        .menu_style(jg_ui::workspace_menu);
 
         let model_input = text_input("model", model)
             .on_input(move |value| Message::SettingsModelChanged(role, value))
             .padding([4, 8])
+            .style(jg_ui::input)
             .width(Fill);
 
         let fields = row![
@@ -650,12 +835,24 @@ impl App {
 
     /// The coordinator state and the matching Start or Stop action.
     fn coordinator_control(&self) -> Element<'_, Message> {
-        let mut status = text(self.coordinator_status_line());
-        if self.coordinator_error.is_some() || self.snapshot.coordinator.last_error.is_some() {
-            status = status.style(style::error_text);
+        let failed =
+            self.coordinator_error.is_some() || self.snapshot.coordinator.last_error.is_some();
+        let theme = self.theme();
+        let color = if failed {
+            style::task_role_state_color(&theme, style::TaskRoleState::Failed)
         } else {
-            status = status.style(style::muted_text);
-        }
+            match self.snapshot.coordinator.state {
+                CoordinatorState::Running => {
+                    style::task_role_state_color(&theme, style::TaskRoleState::Running)
+                }
+                CoordinatorState::Backoff => {
+                    style::task_role_state_color(&theme, style::TaskRoleState::WaitingForUser)
+                }
+                CoordinatorState::Idle | CoordinatorState::Stopped => jg_ui::muted(&theme),
+            }
+        };
+        let status = text(self.coordinator_status_line())
+            .style(move |_| iced::widget::text::Style { color: Some(color) });
 
         let action = match self.coordinator_control_action() {
             CoordinatorAction::Start => button(text("Start"))
@@ -727,7 +924,8 @@ impl App {
             .on_input(Message::DraftChanged)
             .on_submit(Message::SendPressed)
             .padding(8)
-            .width(Fill);
+            .width(Fill)
+            .style(jg_ui::input);
 
         let send = button(text("Send")).padding([8, 16]).style(button::primary);
         let send = if self.sending {
@@ -736,10 +934,9 @@ impl App {
             send.on_press(Message::SendPressed)
         };
 
-        row![input, send]
-            .spacing(8)
-            .align_y(Alignment::Center)
+        container(row![input, send].spacing(8).align_y(Alignment::Center))
             .width(Fill)
+            .style(jg_ui::composer_box)
             .into()
     }
 
@@ -793,7 +990,11 @@ fn chat_line(line: &ChatLine) -> Element<'_, Message> {
     )
     .padding(8)
     .max_width(640.0)
-    .style(container::dark);
+    .style(if line.from_user {
+        jg_ui::bubble_user
+    } else {
+        jg_ui::bubble_agent
+    });
 
     if line.from_user {
         container(bubble).width(Fill).align_x(Alignment::End).into()
@@ -806,7 +1007,7 @@ fn chat_line(line: &ChatLine) -> Element<'_, Message> {
 }
 
 /// One provider's usage meter: name, progress bar, amounts, percent and reset label.
-fn usage_meter(row: UsageRow) -> Element<'static, Message> {
+fn usage_meter(row: UsageRow, theme: &Theme) -> Element<'static, Message> {
     let UsageRow {
         provider,
         percent,
@@ -840,7 +1041,7 @@ fn usage_meter(row: UsageRow) -> Element<'static, Message> {
     )
     .width(Fill)
     .padding([8, 10])
-    .style(container::dark)
+    .style(jg_ui::card(style::level_color(theme, level)))
     .into()
 }
 
@@ -855,7 +1056,7 @@ fn option_for(options: &'static [&'static str], value: &str) -> Option<&'static 
 }
 
 /// One Board column: its title and count over the scrollable card list.
-fn board_column(column: ColumnView) -> Element<'static, Message> {
+fn board_column(column: ColumnView, theme: &Theme) -> Element<'static, Message> {
     let count = column.cards.len();
     let header = row![
         text(column.title).size(13),
@@ -869,7 +1070,8 @@ fn board_column(column: ColumnView) -> Element<'static, Message> {
         cards = cards.push(text("empty").size(12).style(style::muted_text));
     } else {
         for card in column.cards {
-            cards = cards.push(board_card(card));
+            let state = board_task_state(column.column, card.status_note.is_some());
+            cards = cards.push(board_card(card, state, theme));
         }
     }
 
@@ -881,15 +1083,30 @@ fn board_column(column: ColumnView) -> Element<'static, Message> {
     .width(220)
     .height(Fill)
     .padding(8)
-    .style(style::board_column)
+    .style(jg_ui::board_column)
     .into()
 }
 
 /// One read-only card: project badge, key, wrapped plain title and status note.
-fn board_card(card: CardView) -> Element<'static, Message> {
+fn board_card(
+    card: CardView,
+    state: style::TaskRoleState,
+    theme: &Theme,
+) -> Element<'static, Message> {
+    let accent = style::task_role_state_color(theme, state);
+    let state_label = match state {
+        style::TaskRoleState::Running => "running",
+        style::TaskRoleState::WaitingForUser => "waiting for user",
+        style::TaskRoleState::Failed => "failed",
+        style::TaskRoleState::Done => "done",
+        style::TaskRoleState::Queued => "queued",
+    };
+    let state_badge = container(text(state_label).size(10))
+        .padding([1, 6])
+        .style(jg_ui::badge(accent));
     let badge = container(text(card.project_badge).size(10))
         .padding([1, 6])
-        .style(style::project_badge);
+        .style(jg_ui::pill);
 
     let mut body = column![
         text(card.title)
@@ -905,7 +1122,7 @@ fn board_card(card: CardView) -> Element<'static, Message> {
 
     container(
         column![
-            row![badge, text(card.key).size(11)]
+            row![state_badge, badge, text(card.key).size(11)]
                 .spacing(6)
                 .align_y(Alignment::Center),
             body,
@@ -915,8 +1132,24 @@ fn board_card(card: CardView) -> Element<'static, Message> {
     )
     .width(Fill)
     .padding(8)
-    .style(container::dark)
+    .style(jg_ui::card(accent))
     .into()
+}
+
+/// Maps Board columns and failed outcomes to the small state language used by their cards.
+fn board_task_state(column: Column, failed: bool) -> style::TaskRoleState {
+    if failed {
+        return style::TaskRoleState::Failed;
+    }
+
+    match column {
+        Column::Backlog | Column::OnQueue => style::TaskRoleState::Queued,
+        Column::Working | Column::Testing => style::TaskRoleState::Running,
+        Column::Review | Column::ToCommit | Column::ToPush | Column::ToOpenPr | Column::ToMerge => {
+            style::TaskRoleState::WaitingForUser
+        }
+        Column::Done => style::TaskRoleState::Done,
+    }
 }
 
 /// Reloads the snapshot away from the UI thread.
@@ -1118,6 +1351,74 @@ mod tests {
         assert_eq!(
             Tab::ALL.map(Tab::label),
             ["Chat", "Board", "Lab", "Settings"]
+        );
+    }
+
+    #[test]
+    fn system_theme_message_updates_the_system_mode() {
+        let mut app = App::from_snapshot(LabSnapshot::default());
+        assert!(jg_ui::ext(&app.theme()).is_dark);
+
+        let _ = app.update(Message::SystemTheme(iced::theme::Mode::Light));
+
+        assert_eq!(app.system_mode, iced::theme::Mode::Light);
+        assert!(!jg_ui::ext(&app.theme()).is_dark);
+    }
+
+    #[test]
+    fn settings_view_builds_for_each_theme_and_style() {
+        let mut app = App::from_snapshot(LabSnapshot::default());
+        app.tab = Tab::Settings;
+
+        for theme in [ThemePref::System, ThemePref::Dark, ThemePref::Light] {
+            for style in [
+                ThemeStyle::Default,
+                ThemeStyle::Violet,
+                ThemeStyle::TokyoNight,
+                ThemeStyle::Dracula,
+            ] {
+                app.theme_pref = theme;
+                app.theme_style = style;
+                let _ = app.view();
+            }
+        }
+    }
+
+    #[test]
+    fn theme_and_style_messages_update_and_persist_appearance() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let mut app = temp_app(directory.path());
+
+        let _ = app.update(Message::SetTheme(ThemePref::Light));
+        assert_eq!(app.theme_pref, ThemePref::Light);
+        let _ = app.update(Message::SetStyle(ThemeStyle::Dracula));
+
+        assert_eq!(app.theme_style, ThemeStyle::Dracula);
+        assert_eq!(
+            appearance::load(directory.path()),
+            Appearance {
+                theme: ThemePref::Light,
+                style: ThemeStyle::Dracula,
+            }
+        );
+        assert!(app.settings_error.is_none());
+    }
+
+    #[test]
+    fn appearance_save_failure_uses_the_settings_error_banner() {
+        let directory = tempfile::tempdir().expect("temporary data directory");
+        let data_path = directory.path().join("not-a-directory");
+        std::fs::write(&data_path, "file").expect("create non-directory path");
+        let mut app = temp_app(&data_path);
+
+        let _ = app.update(Message::SetTheme(ThemePref::Light));
+
+        assert_eq!(app.theme_pref, ThemePref::Light);
+        assert!(app.errors_visible);
+        assert!(
+            app.settings_error
+                .as_deref()
+                .is_some_and(|error| error.contains("appearance not saved"))
         );
     }
 

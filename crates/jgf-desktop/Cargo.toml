@@ -12,9 +12,11 @@ path = "src/main.rs"
 [dependencies]
 jgf-core.workspace = true
 jgf-hub.workspace = true
+jg-ui.workspace = true
 iced.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 

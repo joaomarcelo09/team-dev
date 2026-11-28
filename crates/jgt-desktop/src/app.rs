@@ -7,6 +7,7 @@ use iced::{
     widget::{markdown, operation, scrollable, text_editor},
     keyboard, window,
 };
+pub use jg_ui::{ThemePref, ThemeStyle};
 use jgt_core::{
     Direction, Event, Harness, Message, MessageKind, Question, ReconnectMode, Session, SessionStatus, Task as BoardTask,
     TaskEvent, TaskPriority, TaskStatus, TeamAgents,
@@ -140,43 +141,6 @@ pub struct Workspace {
 impl std::fmt::Display for Workspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.name)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ThemePref {
-    System,
-    Light,
-    Dark,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ThemeStyle {
-    #[default]
-    Violet,
-    Default,
-    TokyoNight,
-    Dracula,
-}
-
-impl ThemeStyle {
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "jg-violet" => Self::Violet,
-            "default" => Self::Default,
-            "tokyo-night" => Self::TokyoNight,
-            "dracula" => Self::Dracula,
-            _ => Self::Violet,
-        }
-    }
-
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Violet => "jg-violet",
-            Self::Default => "default",
-            Self::TokyoNight => "tokyo-night",
-            Self::Dracula => "dracula",
-        }
     }
 }
 
@@ -585,11 +549,7 @@ impl App {
         let desktop = &config.desktop;
         let text_size = desktop.text_size.clamp(TEXT_SIZE_RANGE.0, TEXT_SIZE_RANGE.1);
         crate::style::set_text_size(text_size);
-        let theme_pref = match desktop.theme.as_str() {
-            "light" => ThemePref::Light,
-            "dark" => ThemePref::Dark,
-            _ => ThemePref::System,
-        };
+        let theme_pref = ThemePref::parse(&desktop.theme);
         let theme_style = ThemeStyle::parse(&desktop.style);
         let app = App {
             conn: Conn::Connecting,
@@ -668,19 +628,11 @@ impl App {
     }
 
     pub fn theme(&self) -> Theme {
-        match self.theme_style {
-            ThemeStyle::Violet => crate::style::violet(),
-            ThemeStyle::TokyoNight => crate::style::tokyo_night(),
-            ThemeStyle::Dracula => crate::style::dracula(),
-            ThemeStyle::Default => {
-                let dark = match self.theme_pref {
-                    ThemePref::Dark => true,
-                    ThemePref::Light => false,
-                    ThemePref::System => self.system_mode != theme::Mode::Light,
-                };
-                if dark { crate::style::dark() } else { crate::style::light() }
-            }
-        }
+        jg_ui::resolve_theme(
+            self.theme_pref,
+            self.theme_style,
+            self.system_mode == theme::Mode::Light,
+        )
     }
 
     pub fn subscription(&self) -> Subscription<Msg> {
@@ -2395,12 +2347,7 @@ impl App {
     /// (other settings there are kept).
     fn save_view_settings(&self) {
         let mut config = Config::load();
-        config.desktop.theme = match self.theme_pref {
-            ThemePref::System => "system",
-            ThemePref::Dark => "dark",
-            ThemePref::Light => "light",
-        }
-        .into();
+        config.desktop.theme = self.theme_pref.as_str().into();
         config.desktop.style = self.theme_style.as_str().into();
         config.desktop.zoom = self.zoom;
         config.desktop.text_size = self.text_size;
