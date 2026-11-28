@@ -8,7 +8,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
-        fs::PermissionsExt,
+        fs::{FileTypeExt, PermissionsExt},
         net::{UnixListener, UnixStream},
     },
     path::{Path, PathBuf},
@@ -231,6 +231,7 @@ impl HubShim {
         if let Some(parent) = socket_path.parent() {
             fs::create_dir_all(parent)?;
         }
+        remove_stale_socket(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)?;
         if let Err(error) =
             fs::set_permissions(&socket_path, fs::Permissions::from_mode(SOCKET_MODE))
@@ -721,6 +722,36 @@ fn random_token() -> io::Result<String> {
     Ok(token)
 }
 
+/// Removes a socket file left behind by a shim that died without cleanup.
+///
+/// A unix socket path that still exists makes `bind` fail with
+/// `AddrInUse`, so a crashed run would block every later start. The path is
+/// removed only when it is a socket nobody accepts on; a live listener or a
+/// non-socket file is reported as `AddrInUse` and left untouched.
+fn remove_stale_socket(socket_path: &Path) -> io::Result<()> {
+    let metadata = match fs::symlink_metadata(socket_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let in_use = |reason: &str| {
+        io::Error::new(
+            io::ErrorKind::AddrInUse,
+            format!("{}: {reason}", socket_path.display()),
+        )
+    };
+    if !metadata.file_type().is_socket() {
+        return Err(in_use("path exists and is not a socket"));
+    }
+    match UnixStream::connect(socket_path) {
+        Ok(_) => Err(in_use("another hub shim is listening")),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+            fs::remove_file(socket_path)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -823,6 +854,63 @@ mod tests {
             unknown.enqueue(project("project-a")),
             Err(HubClientError::Shim(ShimError::UnknownToken))
         ));
+    }
+
+    #[test]
+    fn shim_replaces_a_stale_socket_left_by_a_dead_run() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("hub.sock");
+        drop(UnixListener::bind(&socket_path).expect("stale listener"));
+        assert!(socket_path.exists(), "stale socket file stays after drop");
+
+        let router = Router::open(temp.path().join("mail")).expect("router");
+        let shim = HubShim::start(&socket_path, router, |_| {}).expect("shim over stale socket");
+
+        assert!(UnixStream::connect(shim.socket_path()).is_ok());
+    }
+
+    #[test]
+    fn shim_refuses_a_socket_another_shim_is_listening_on() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("hub.sock");
+        let first = HubShim::start(
+            &socket_path,
+            Router::open(temp.path().join("mail")).expect("router"),
+            |_| {},
+        )
+        .expect("first shim");
+
+        let Err(error) = HubShim::start(
+            &socket_path,
+            Router::open(temp.path().join("mail2")).expect("router"),
+            |_| {},
+        ) else {
+            panic!("second shim must not steal the socket");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert!(UnixStream::connect(first.socket_path()).is_ok());
+    }
+
+    #[test]
+    fn shim_refuses_a_non_socket_file_at_its_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let socket_path = temp.path().join("hub.sock");
+        fs::write(&socket_path, "not a socket").expect("plain file");
+
+        let Err(error) = HubShim::start(
+            &socket_path,
+            Router::open(temp.path().join("mail")).expect("router"),
+            |_| {},
+        ) else {
+            panic!("plain file must not be replaced");
+        };
+
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        assert_eq!(
+            fs::read_to_string(&socket_path).expect("file"),
+            "not a socket"
+        );
     }
 
     #[test]

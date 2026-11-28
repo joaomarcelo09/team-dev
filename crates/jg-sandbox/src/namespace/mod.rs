@@ -45,9 +45,7 @@ impl NamespaceBackend {
 impl Backend for NamespaceBackend {
     fn create(&self, spec: &SandboxSpec) -> Result<SandboxHandle> {
         spec.validate()?;
-        if state::state_path(&spec.state_dir).exists() {
-            return Err(SandboxError::AlreadyExists(spec.state_dir.clone()));
-        }
+        reclaim_dead_state(&spec.state_dir)?;
 
         // The cgroup exists with its limits before the init is started at all.
         let cgroup = match &spec.limits {
@@ -103,6 +101,31 @@ impl Backend for NamespaceBackend {
         }
         state::remove_state(handle.state_dir())
     }
+}
+
+/// Clears the state of a sandbox whose init died without being destroyed.
+///
+/// A creator that is killed (crash, power loss) leaves `state.json` and the
+/// rootfs mount point behind, which would block every later `create` for the
+/// same state directory. When the recorded init is no longer alive the
+/// sandbox is already gone, so its leftovers are removed. A live init, or a
+/// state file that cannot be read, still fails closed with `AlreadyExists`.
+fn reclaim_dead_state(state_dir: &Path) -> Result<()> {
+    if !state::state_path(state_dir).exists() {
+        return Ok(());
+    }
+    let saved = match state::load_optional(state_dir) {
+        Ok(Some(saved)) => saved,
+        Ok(None) => return Ok(()),
+        Err(_) => return Err(SandboxError::AlreadyExists(state_dir.to_path_buf())),
+    };
+    if state::is_alive(saved.pid) {
+        return Err(SandboxError::AlreadyExists(state_dir.to_path_buf()));
+    }
+    if let Some(path) = &saved.cgroup {
+        cgroup::remove_quiet(path);
+    }
+    state::remove_state(state_dir)
 }
 
 impl NamespaceBackend {
